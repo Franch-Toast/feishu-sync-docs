@@ -1,0 +1,9 @@
+node_modules/
+dist/
+packages/server/public/
+.data/
+.env
+*.db
+*.db-shm
+*.db-wal
+coverage/
