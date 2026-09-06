@@ -47,6 +47,8 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private token?: string;
+  private tokenExpiresAt = 0;
+  private tokenRequest?: Promise<string>;
 
   constructor(private readonly options: FeishuOpenApiOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "https://open.feishu.cn").replace(/\/$/, "");
@@ -217,16 +219,23 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   }
 
   private async getToken(): Promise<string> {
-    if (this.token) return this.token;
-    if (!this.options.appId || !this.options.appSecret) throw new Error("Configure FEISHU_ACCESS_TOKEN or FEISHU_APP_ID/FEISHU_APP_SECRET");
+    if (this.token && Date.now() < this.tokenExpiresAt - 60_000) return this.token;
+    if (!this.tokenRequest) this.tokenRequest = this.requestToken().finally(() => { this.tokenRequest = undefined; });
+    return this.tokenRequest;
+  }
+
+  private async requestToken(): Promise<string> {
+    if (!this.options.appId || !this.options.appSecret) {
+      // User access tokens carry no expiry metadata; keep using the supplied one.
+      if (this.token) return this.token;
+      throw new Error("Configure FEISHU_ACCESS_TOKEN or FEISHU_APP_ID/FEISHU_APP_SECRET");
+    }
     const response = await this.fetchImpl(`${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ app_id: this.options.appId, app_secret: this.options.appSecret }) });
-    const envelope = await response.json() as { code?: number; msg?: string; tenant_access_token?: string };
+    const envelope = await response.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
     if (!envelope.tenant_access_token) throw new Error(`Feishu authentication failed: ${envelope.msg ?? "missing token"}`);
     this.token = envelope.tenant_access_token;
+    // Refresh one minute before the advertised expiry instead of never.
+    this.tokenExpiresAt = Date.now() + Math.max(0, envelope.expire ?? 7200) * 1000;
     return this.token;
   }
-}
-
-function blockKindFromType(blockType: number | undefined): string {
-  return ({ 1: "paragraph", 2: "heading", 3: "heading", 4: "heading", 5: "heading", 6: "heading", 7: "heading", 8: "list", 9: "list", 10: "code", 11: "blockquote", 12: "thematicBreak", 31: "image", 32: "table" } as Record<number, string>)[blockType ?? 0] ?? "paragraph";
 }

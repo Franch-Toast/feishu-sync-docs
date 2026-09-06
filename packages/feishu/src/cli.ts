@@ -76,7 +76,9 @@ export class LarkCliProvider implements RemoteProvider {
 
   private async run(args: string[]): Promise<any> {
     const { stdout, stderr } = await execFileAsync(this.executable, args, { cwd: this.options.cwd, env: { ...process.env, ...this.options.env }, maxBuffer: 32 * 1024 * 1024 });
-    if (stderr && /error|failed/i.test(stderr)) throw new Error(stderr.trim());
+    // Only treat stderr as a failure when stdout is empty and stderr clearly reports
+    // an error line; chatter like "0 errors" or progress logs must not fail the call.
+    if (stderr && !stdout.trim() && /(^|\n)\s*(error|fatal|failed)\b/i.test(stderr)) throw new Error(stderr.trim());
     try {
       const envelope = JSON.parse(stdout) as { ok?: boolean; data?: unknown; error?: { message?: string } };
       if (envelope.ok === false) throw new Error(envelope.error?.message ?? "lark-cli request failed");

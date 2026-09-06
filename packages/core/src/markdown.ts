@@ -56,14 +56,7 @@ function extractLinks(content: string): MarkdownLink[] {
     if (match.index !== undefined && isInsideFence(content, match.index)) continue;
     if (match[0]?.startsWith("!")) continue;
     const target = match[2];
-    if (!target || match.index === undefined) {
-      if (target && match.index === 0) {
-        const link: MarkdownLink = { target, start: 0, end: match[0].length };
-        if (match[1] !== undefined) link.label = match[1];
-        links.push(link);
-      }
-      continue;
-    }
+    if (!target || match.index === undefined) continue;
     const link: MarkdownLink = { target, start: match.index, end: match.index + match[0].length };
     if (match[1] !== undefined) link.label = match[1];
     links.push(link);

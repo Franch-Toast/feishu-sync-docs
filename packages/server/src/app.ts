@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { dirname, join } from "node:path";
+import { existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FilesystemProvider, SyncEngine } from "@feishu-sync/core";
 import type { RemoteProvider, StateStore } from "@feishu-sync/core";
@@ -36,13 +37,22 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     }
     const pollIntervalMs = body.pollIntervalMs ?? 15000;
     if (!Number.isFinite(pollIntervalMs) || pollIntervalMs < 1000) return reply.code(400).send({ error: "pollIntervalMs must be at least 1000ms" });
+    if (!existsSync(body.localPath) || !statSync(body.localPath).isDirectory()) {
+      return reply.code(400).send({ error: "localPath must point to an existing directory" });
+    }
     const root = await store.createRoot({ localPath: body.localPath, remoteToken: body.remoteToken, remoteType: body.remoteType ?? "folder", enabled: true, pollIntervalMs });
     runtime.startRoot(root);
     return reply.code(201).send(root);
   });
   app.post<{ Params: { id: string } }>("/api/roots/:id/scan", async (request) => runtime.scanRoot(request.params.id));
   app.post<{ Params: { id: string } }>("/api/roots/:id/sync", async (request) => runtime.syncRoot(request.params.id));
-  app.post<{ Params: { id: string }; Body: { relativePath: string; remoteToken: string } }>("/api/roots/:id/pair", async (request) => runtime.pairEntry(request.params.id, request.body.relativePath, request.body.remoteToken));
+  app.post<{ Params: { id: string }; Body: { relativePath: string; remoteToken: string } }>("/api/roots/:id/pair", async (request, reply) => {
+    const body = request.body;
+    if (!body || typeof body.relativePath !== "string" || !body.relativePath.trim() || typeof body.remoteToken !== "string" || !body.remoteToken.trim()) {
+      return reply.code(400).send({ error: "relativePath and remoteToken are required" });
+    }
+    return runtime.pairEntry(request.params.id, body.relativePath, body.remoteToken);
+  });
   app.post<{ Params: { id: string }; Body: { confirmed?: boolean } }>("/api/entries/:id/delete-remote", async (request, reply) => {
     if (request.body?.confirmed !== true) return reply.code(400).send({ error: "Remote deletion requires confirmed=true" });
     return runtime.deleteRemoteEntry(request.params.id);
@@ -63,9 +73,16 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     return conflict ? conflict : reply.code(404).send({ error: "conflict not found" });
   });
   app.post<{ Params: { id: string }; Body: { resolution: "local" | "remote" | "merged" | "abort"; mergedContent?: string } }>("/api/conflicts/:id/resolve", async (request, reply) => {
+    const body = request.body;
+    if (!body || !["local", "remote", "merged", "abort"].includes(body.resolution)) {
+      return reply.code(400).send({ error: "resolution must be one of local, remote, merged, abort" });
+    }
+    if (body.resolution === "merged" && typeof body.mergedContent !== "string") {
+      return reply.code(400).send({ error: "mergedContent is required for merged resolution" });
+    }
     const conflict = await store.getConflict(request.params.id);
     if (!conflict) return reply.code(404).send({ error: "conflict not found" });
-    const resolved = await runtime.resolveConflict(conflict, request.body);
+    const resolved = await runtime.resolveConflict(conflict, body);
     return reply.send(resolved);
   });
   app.get("/api/operations", async () => store.listOperations());

@@ -10,11 +10,9 @@
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@feishu-sync/core": "workspace:*",
-    "better-sqlite3": "^11.8.1"
+    "@feishu-sync/core": "workspace:*"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.15.0",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"

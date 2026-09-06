@@ -91,7 +91,19 @@ export class SyncRuntime {
   }
 
   async resolveConflict(conflict: ConflictRecord, input: { resolution: "local" | "remote" | "merged" | "abort"; mergedContent?: string }): Promise<ConflictRecord> {
-    if (input.resolution === "abort") return conflict;
+    if (input.resolution === "abort") {
+      // Persist the abort decision and re-arm the entry so the next scan
+      // re-evaluates it with fresh three-way data.
+      const aborted = await this.store.resolveConflict(conflict.id, "abort");
+      const abortedEntry = await this.store.getEntry(conflict.entryId);
+      if (abortedEntry) {
+        await this.store.upsertEntry({ ...abortedEntry, status: "pending", updatedAt: new Date().toISOString() });
+        const abortedRoot = await this.store.getRoot(abortedEntry.rootId);
+        if (abortedRoot) await this.enqueue(abortedRoot.id, () => this.scanAndSync(abortedRoot));
+      }
+      this.broadcast({ type: "conflict-aborted", conflict: aborted });
+      return aborted;
+    }
     const entry = await this.store.getEntry(conflict.entryId);
     if (!entry?.remoteToken) throw new Error("Conflict entry is no longer bound to a remote document");
     const root = await this.store.getRoot(entry.rootId);
@@ -136,8 +148,13 @@ export class SyncRuntime {
           await this.engine.syncEntry(entry, root);
           await this.store.updateOperation(operation.id, { status: "succeeded", completedAt: new Date().toISOString() });
         } catch (error) {
-          if (operation) await this.store.updateOperation(operation.id, { status: "failed", error: error instanceof Error ? error.message : String(error), completedAt: new Date().toISOString() });
-          this.broadcast({ type: "error", rootId: root.id, entryId: entry.id, error: error instanceof Error ? error.message : String(error) });
+          const message = error instanceof Error ? error.message : String(error);
+          if (operation) await this.store.updateOperation(operation.id, { status: "failed", error: message, completedAt: new Date().toISOString() });
+          this.broadcast({ type: "error", rootId: root.id, entryId: entry.id, error: message });
+          // Surface the failure on the entry itself; the next scan resets
+          // "error" entries to "pending" so they are retried.
+          const failed = await this.store.getEntry(entry.id);
+          if (failed) await this.store.upsertEntry({ ...failed, status: "error", updatedAt: new Date().toISOString() });
         }
       }
     }

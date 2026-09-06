@@ -10,7 +10,14 @@
 - 将目录内已绑定的 Markdown 文档链接改写为飞书文档引用，将图片改写为远端资源引用，拉回本地时恢复为相对路径；
 - 远端目录中新建的文档会按云盘相对目录导入本地；同名但未绑定的本地文件不会被静默覆盖，而是进入冲突工作台；
 - 图片单独变化会使引用它的文档重新同步；远端图片变更会先下载到本地，再纳入文档比较；
-- 同时修改同一块内容时不覆盖任一侧，冲突会在网页工作台中保留 base/local/remote 三个版本；解决前会再次校验远端 revision，避免使用过期内容覆盖新修改。
+- 同时修改同一块内容时不覆盖任一侧，冲突会在网页工作台中保留 base/local/remote 三个版本；解决前会再次校验远端 revision，避免使用过期内容覆盖新修改；
+- 冲突支持"暂不处理"：决定会持久化到状态库，条目重新进入待评估队列，后续轮询基于最新三方数据重新判断；
+- 同步失败的条目会标记为 error 并在操作日志中留痕，后续轮询会自动重试。
+
+## 环境要求
+
+- Node.js >= 23.4：状态存储使用 Node 内置 `node:sqlite` 模块，安装依赖无需编译任何原生模块；
+- pnpm：可通过 `corepack enable` 启用。
 
 ## 当前范围
 
@@ -39,16 +46,18 @@ export FEISHU_APP_ID="..."
 export FEISHU_APP_SECRET="..."
 ```
 
-默认使用原生 OpenAPI provider。也可以设置 `FEISHU_PROVIDER=cli` 使用本地 `lark-cli`：
+默认使用原生 OpenAPI provider：基于飞书新版文档 Markdown API（docs_ai，与官方 lark-cli v2 一致）提供整篇 Markdown 的原子读写、revision 并发控制和块级命令；应用身份（`FEISHU_APP_ID`/`FEISHU_APP_SECRET`）下 tenant_access_token 会在过期前自动刷新。也可以设置 `FEISHU_PROVIDER=cli` 使用本地 `lark-cli`：
 
 ```bash
 export FEISHU_PROVIDER=cli
 export LARK_CLI_BIN=lark-cli
 ```
 
+CLI 路径支持 `LARK_CLI_BIN`（优先）或旧名 `LARK_CLI_PATH`。
+
 当前本地 CLI 适配器兼容旧版 CLI 的整篇 Markdown 更新；只有安装了支持 v2 文档命令的 CLI 时才设置 `LARK_CLI_API_VERSION=v2`，并由 CLI 适配器尝试块级命令。图片上传和远端目录遍历优先使用 OpenAPI provider。
 
-在网页中添加本地目录和云盘文件夹 token。也可以直接调用 API：
+在网页中添加本地目录和云盘文件夹 token，本地路径必须真实存在，否则 API 返回 400。也可以直接调用 API：
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/roots \
@@ -76,7 +85,7 @@ local watcher + poller       web UI / REST / WebSocket
                          Feishu OpenAPI   lark-cli
 ```
 
-`packages/core` 不依赖飞书 SDK，负责规范化、哈希、三方合并、资源引用和块补丁规划。`packages/storage` 负责 SQLite 持久化。`packages/feishu` 只实现远端能力。`packages/server` 负责常驻进程、文件监听、任务串行化、API 和冲突生命周期。后续增加其他远端或本地来源时，优先新增 provider，不修改同步核心。
+`packages/core` 不依赖飞书 SDK，负责规范化、哈希、三方合并、资源引用和块补丁规划。`packages/storage` 负责基于 Node 内置 `node:sqlite` 的 SQLite 持久化。`packages/feishu` 只实现远端能力。`packages/server` 负责常驻进程（支持 SIGINT/SIGTERM 优雅退出）、文件监听、任务串行化、API 和冲突生命周期。后续增加其他远端或本地来源时，优先新增 provider，不修改同步核心。
 
 ## Development
 

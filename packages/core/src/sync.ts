@@ -116,6 +116,8 @@ export class SyncEngine {
     }
 
     const { reverseMap } = await this.buildLinkMaps(root.id);
+    // Load open conflicts once for the whole loop instead of querying per entry.
+    const openConflicts = await this.store.listConflicts("open");
     for (const entry of await this.store.listEntries(root.id)) {
       if (entry.kind !== "document" || !entry.remoteToken || !localByPath.has(entry.relativePath)) continue;
       let remote;
@@ -136,7 +138,7 @@ export class SyncEngine {
       const remoteChanged = entry.remoteHash !== undefined && remoteHash !== entry.remoteHash;
       const localContent = entry.status === "conflict" ? await this.local.readText(root, entry.relativePath) : undefined;
       const openConflict = entry.status === "conflict"
-        ? (await this.store.listConflicts("open")).find((conflict) => conflict.entryId === entry.id)
+        ? openConflicts.find((conflict) => conflict.entryId === entry.id)
         : undefined;
       if (openConflict && (remoteChanged || openConflict.remoteRevision !== remote.revisionId || openConflict.localContent !== localContent)) {
         await this.store.updateConflict(openConflict.id, { localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
@@ -352,6 +354,8 @@ export class SyncEngine {
     const reverseMap = new Map<string, string>();
     const bindings: Array<{ documentEntryId: string; assetEntryId: string; token: string; contentHash: string }> = [];
     const tokens = [...content.matchAll(/<img\s+[^>]*?(?:src|token)="([^"]+)"/g)].map((match) => match[1]).filter((token): token is string => Boolean(token));
+    // Scan the local directory once; per-token scans would walk the whole tree for every image.
+    const localFiles = new Map((await this.local.scan(root)).map((file) => [file.relativePath, file]));
     for (const token of tokens) {
       const relativePath = remoteAssetPaths.get(token);
       if (!relativePath || reverseMap.has(token)) continue;
@@ -363,7 +367,7 @@ export class SyncEngine {
       }
       const hash = sha256(binary);
       const existing = await this.store.findEntry(root.id, relativePath);
-      const localFile = (await this.local.scan(root)).find((file) => file.relativePath === relativePath);
+      const localFile = localFiles.get(relativePath);
       if (localFile && localFile.contentHash !== hash) continue;
       if (!localFile) await this.local.writeBinary(root, relativePath, binary);
       const assetEntry = existing ?? { id: randomUUID(), rootId: root.id, relativePath, kind: "asset" as const, status: "clean" as const, updatedAt: new Date().toISOString() };

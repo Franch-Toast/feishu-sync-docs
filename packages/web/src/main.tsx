@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { markdown } from "@codemirror/lang-markdown";
 import { oneDark } from "@codemirror/theme-one-dark";
@@ -11,6 +11,7 @@ type Root = { id: string; localPath: string; remoteToken: string; enabled: boole
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { headers: { "content-type": "application/json" }, ...init });
   if (!response.ok) throw new Error((await response.json()).error ?? response.statusText);
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
@@ -23,13 +24,23 @@ function App(): React.JSX.Element {
   const [newLocalPath, setNewLocalPath] = useState("");
   const [newRemoteToken, setNewRemoteToken] = useState("");
 
+  // Keep the latest selection in a ref so `refresh` stays referentially stable;
+  // depending on `selected` directly recreated the callback on every poll and
+  // tore down/reopened the WebSocket (a reconnect storm).
+  const selectedRef = useRef<Conflict | undefined>(undefined);
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
+
   const refresh = useCallback(async () => {
     try {
       const [nextRoots, nextConflicts] = await Promise.all([json<Root[]>("/api/roots"), json<Conflict[]>("/api/conflicts")]);
       setRoots(nextRoots); setConflicts(nextConflicts); setMessage("服务正常");
-      if (selected) setSelected(nextConflicts.find((item) => item.id === selected.id));
+      const current = selectedRef.current;
+      if (current) {
+        const stillOpen = nextConflicts.find((item) => item.id === current.id);
+        setSelected(stillOpen);
+      }
     } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-  }, [selected]);
+  }, []);
   useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 5000); return () => window.clearInterval(timer); }, [refresh]);
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";

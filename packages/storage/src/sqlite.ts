@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -10,18 +10,32 @@ import type {
 type Row = Record<string, unknown>;
 
 export class SqliteStateStore implements StateStore {
-  private readonly db: Database.Database;
+  private readonly db: DatabaseSync;
 
   constructor(path = ":memory:") {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
+    // node:sqlite is used instead of better-sqlite3: the native cleanup hooks of
+    // better-sqlite3 abort the process (SIGABRT) during teardown whenever Fastify
+    // is loaded in the same process. The built-in module has no such hooks.
+    this.db = new DatabaseSync(path);
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA busy_timeout = 5000");
     this.migrate();
   }
 
   close(): void {
     this.db.close();
+  }
+
+  private withTransaction(callback: () => void): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      callback();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async createRoot(input: Omit<SyncRoot, "id">): Promise<SyncRoot> {
@@ -32,7 +46,7 @@ export class SqliteStateStore implements StateStore {
   }
 
   async listRoots(): Promise<SyncRoot[]> {
-    return (this.db.prepare("SELECT * FROM roots ORDER BY local_path").all() as Row[]).map(readRoot);
+    return (this.db.prepare("SELECT * FROM roots ORDER BY local_path").all() as unknown as Row[]).map(readRoot);
   }
 
   async getRoot(id: string): Promise<SyncRoot | undefined> {
@@ -50,7 +64,7 @@ export class SqliteStateStore implements StateStore {
   }
 
   async deleteRoot(id: string): Promise<void> {
-    const transaction = this.db.transaction(() => {
+    this.withTransaction(() => {
       this.db.prepare("DELETE FROM blocks WHERE entry_id IN (SELECT id FROM entries WHERE root_id=?)").run(id);
       this.db.prepare("DELETE FROM snapshots WHERE entry_id IN (SELECT id FROM entries WHERE root_id=?)").run(id);
       this.db.prepare("DELETE FROM asset_bindings WHERE document_entry_id IN (SELECT id FROM entries WHERE root_id=?) OR asset_entry_id IN (SELECT id FROM entries WHERE root_id=?)").run(id, id);
@@ -60,7 +74,6 @@ export class SqliteStateStore implements StateStore {
       this.db.prepare("DELETE FROM entries WHERE root_id=?").run(id);
       this.db.prepare("DELETE FROM roots WHERE id=?").run(id);
     });
-    transaction();
   }
 
   async upsertEntry(entry: SyncEntry): Promise<void> {
@@ -95,14 +108,23 @@ export class SqliteStateStore implements StateStore {
   }
 
   async listEntries(rootId: string): Promise<SyncEntry[]> {
-    return (this.db.prepare("SELECT * FROM entries WHERE root_id = ? ORDER BY relative_path").all(rootId) as Row[]).map(readEntry);
+    return (this.db.prepare("SELECT * FROM entries WHERE root_id = ? ORDER BY relative_path").all(rootId) as unknown as Row[]).map(readEntry);
   }
 
   async saveSnapshot(snapshot: SyncSnapshot): Promise<void> {
     this.db.prepare(`INSERT INTO snapshots (entry_id, base_content, local_content, remote_content, base_hash, local_hash, remote_hash, created_at)
       VALUES (@entryId,@baseContent,@localContent,@remoteContent,@baseHash,@localHash,@remoteHash,@createdAt)
       ON CONFLICT(entry_id) DO UPDATE SET base_content=excluded.base_content, local_content=excluded.local_content, remote_content=excluded.remote_content, base_hash=excluded.base_hash, local_hash=excluded.local_hash, remote_hash=excluded.remote_hash, created_at=excluded.created_at`)
-      .run(snapshot);
+      .run({
+        entryId: snapshot.entryId,
+        baseContent: snapshot.baseContent,
+        localContent: snapshot.localContent,
+        remoteContent: snapshot.remoteContent,
+        baseHash: snapshot.baseHash,
+        localHash: snapshot.localHash,
+        remoteHash: snapshot.remoteHash,
+        createdAt: snapshot.createdAt
+      });
   }
 
   async getSnapshot(entryId: string): Promise<SyncSnapshot | undefined> {
@@ -111,16 +133,15 @@ export class SqliteStateStore implements StateStore {
   }
 
   async saveBlocks(entryId: string, blocks: BlockMapping[]): Promise<void> {
-    const transaction = this.db.transaction(() => {
+    this.withTransaction(() => {
       this.db.prepare("DELETE FROM blocks WHERE entry_id = ?").run(entryId);
       const insert = this.db.prepare("INSERT INTO blocks (entry_id, stable_id, block_id, kind, content_hash, position) VALUES (?, ?, ?, ?, ?, ?)");
       for (const block of blocks) insert.run(entryId, block.stableId, block.blockId, block.kind, block.contentHash, block.position);
     });
-    transaction();
   }
 
   async getBlocks(entryId: string): Promise<BlockMapping[]> {
-    return (this.db.prepare("SELECT * FROM blocks WHERE entry_id = ? ORDER BY position").all(entryId) as Row[]).map((row) => ({
+    return (this.db.prepare("SELECT * FROM blocks WHERE entry_id = ? ORDER BY position").all(entryId) as unknown as Row[]).map((row) => ({
       entryId: String(row.entry_id), stableId: String(row.stable_id), blockId: String(row.block_id), kind: String(row.kind), contentHash: String(row.content_hash), position: Number(row.position)
     }));
   }
@@ -153,13 +174,13 @@ export class SqliteStateStore implements StateStore {
   async listConflicts(status?: ConflictStatus): Promise<ConflictRecord[]> {
     const rows = (status
       ? this.db.prepare("SELECT * FROM conflicts WHERE status = ? ORDER BY created_at DESC").all(status)
-      : this.db.prepare("SELECT * FROM conflicts ORDER BY created_at DESC").all()) as Row[];
+      : this.db.prepare("SELECT * FROM conflicts ORDER BY created_at DESC").all()) as unknown as Row[];
     return rows.map(readConflict);
   }
 
   async updateConflict(id: string, patch: Partial<Pick<ConflictRecord, "baseContent" | "localContent" | "remoteContent" | "mergedContent" | "remoteRevision" | "remoteContentHash">>): Promise<ConflictRecord> {
     const fields: string[] = [];
-    const values: unknown[] = [];
+    const values: Array<string | number | null> = [];
     const updates: Array<[keyof typeof patch, string]> = [
       ["baseContent", "base_content"],
       ["localContent", "local_content"],
@@ -183,7 +204,7 @@ export class SqliteStateStore implements StateStore {
     const status: ConflictStatus = resolution === "abort" ? "aborted" : "resolved";
     const resolvedAt = new Date().toISOString();
     this.db.prepare("UPDATE conflicts SET status=?, resolution=?, merged_content=?, resolved_at=? WHERE id=?")
-      .run(status, resolution, mergedContent ?? null, resolvedAt, id);
+      .run(status, resolution ?? null, mergedContent ?? null, resolvedAt, id);
     const result = await this.getConflict(id);
     if (!result) throw new Error(`Conflict not found: ${id}`);
     return result;
@@ -217,34 +238,32 @@ export class SqliteStateStore implements StateStore {
   }
 
   async listOperations(limit = 100): Promise<OperationRecord[]> {
-    return (this.db.prepare("SELECT * FROM operations ORDER BY created_at DESC LIMIT ?").all(limit) as Row[]).map(readOperation);
+    return (this.db.prepare("SELECT * FROM operations ORDER BY created_at DESC LIMIT ?").all(limit) as unknown as Row[]).map(readOperation);
   }
 
   async saveAssetReferences(rootId: string, assetPath: string, entryIds: string[]): Promise<void> {
-    const transaction = this.db.transaction(() => {
+    this.withTransaction(() => {
       this.db.prepare("DELETE FROM asset_references WHERE root_id=? AND asset_path=?").run(rootId, assetPath);
       const insert = this.db.prepare("INSERT OR IGNORE INTO asset_references (root_id, asset_path, entry_id) VALUES (?, ?, ?)");
       for (const entryId of entryIds) insert.run(rootId, assetPath, entryId);
     });
-    transaction();
   }
 
   async listAssetReferences(rootId: string, assetPath: string): Promise<string[]> {
-    return (this.db.prepare("SELECT entry_id FROM asset_references WHERE root_id=? AND asset_path=? ORDER BY entry_id").all(rootId, assetPath) as Row[])
+    return (this.db.prepare("SELECT entry_id FROM asset_references WHERE root_id=? AND asset_path=? ORDER BY entry_id").all(rootId, assetPath) as unknown as Row[])
       .map((row) => String(row.entry_id));
   }
 
   async saveAssetBindings(documentEntryId: string, bindings: AssetBinding[]): Promise<void> {
-    const transaction = this.db.transaction(() => {
+    this.withTransaction(() => {
       this.db.prepare("DELETE FROM asset_bindings WHERE document_entry_id=?").run(documentEntryId);
       const insert = this.db.prepare("INSERT INTO asset_bindings (document_entry_id, asset_entry_id, token, content_hash) VALUES (?, ?, ?, ?)");
       for (const binding of bindings) insert.run(documentEntryId, binding.assetEntryId, binding.token, binding.contentHash);
     });
-    transaction();
   }
 
   async getAssetBindings(documentEntryId: string): Promise<AssetBinding[]> {
-    return (this.db.prepare("SELECT * FROM asset_bindings WHERE document_entry_id=? ORDER BY asset_entry_id").all(documentEntryId) as Row[])
+    return (this.db.prepare("SELECT * FROM asset_bindings WHERE document_entry_id=? ORDER BY asset_entry_id").all(documentEntryId) as unknown as Row[])
       .map((row) => ({ documentEntryId: String(row.document_entry_id), assetEntryId: String(row.asset_entry_id), token: String(row.token), contentHash: String(row.content_hash) }));
   }
 
@@ -323,3 +342,4 @@ function optionalString(value: unknown): string | undefined {
 function optionalNumber(value: unknown): number | undefined {
   return value === null || value === undefined ? undefined : Number(value);
 }
+
