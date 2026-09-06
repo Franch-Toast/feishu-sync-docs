@@ -213,6 +213,19 @@ export interface SyncDecision {
   mergedContent?: string;
 }
 
+export interface PruneHistoryOptions {
+  /** Keep at most this many most-recent operation records. */
+  keepOperations?: number;
+  /** Delete resolved/aborted conflicts resolved more than this many days ago. */
+  resolvedConflictDays?: number;
+}
+
+export interface PruneHistoryResult {
+  operations: number;
+  conflicts: number;
+  snapshots: number;
+}
+
 export interface StateStore {
   createRoot(input: Omit<SyncRoot, "id">): Promise<SyncRoot>;
   listRoots(): Promise<SyncRoot[]>;
@@ -239,4 +252,6 @@ export interface StateStore {
   listAssetReferences(rootId: string, assetPath: string): Promise<string[]>;
   saveAssetBindings(documentEntryId: string, bindings: AssetBinding[]): Promise<void>;
   getAssetBindings(documentEntryId: string): Promise<AssetBinding[]>;
+  /** Enforce retention policies on append-only history tables. */
+  pruneHistory(options?: PruneHistoryOptions): Promise<PruneHistoryResult>;
 }

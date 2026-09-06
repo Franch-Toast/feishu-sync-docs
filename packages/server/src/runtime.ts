@@ -3,7 +3,7 @@ import { watch, type FSWatcher } from "chokidar";
 import { randomUUID } from "node:crypto";
 import { SyncEngine } from "@feishu-sync/core";
 import { sha256 } from "@feishu-sync/core";
-import type { ConflictRecord, LocalProvider, RemoteProvider, StateStore, SyncRoot } from "@feishu-sync/core";
+import type { ConflictRecord, LocalProvider, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, StateStore, SyncRoot } from "@feishu-sync/core";
 
 export class SyncRuntime {
   private readonly watchers = new Map<string, FSWatcher>();
@@ -11,6 +11,7 @@ export class SyncRuntime {
   private readonly clients = new Set<WebSocket>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly engine: SyncEngine;
+  private maintenanceTimer?: NodeJS.Timeout;
 
   constructor(private readonly store: StateStore, private readonly local: LocalProvider, private readonly remote: RemoteProvider) {
     this.engine = new SyncEngine(store, local, remote);
@@ -18,6 +19,7 @@ export class SyncRuntime {
 
   async start(): Promise<void> {
     for (const root of await this.store.listRoots()) if (root.enabled) this.startRoot(root);
+    this.scheduleMaintenance();
   }
 
   stop(): void {
@@ -25,6 +27,27 @@ export class SyncRuntime {
     for (const timer of this.timers.values()) clearInterval(timer);
     for (const client of this.clients) client.close();
     this.watchers.clear(); this.timers.clear(); this.clients.clear();
+    if (this.maintenanceTimer) { clearInterval(this.maintenanceTimer); this.maintenanceTimer = undefined; }
+  }
+
+  /** Enforce retention policies; defaults configurable via SYNC_RETENTION_* env vars. */
+  async pruneHistory(options: PruneHistoryOptions = {}): Promise<PruneHistoryResult> {
+    const result = await this.store.pruneHistory({
+      keepOperations: options.keepOperations ?? numberFromEnv("SYNC_RETENTION_OPERATIONS", 1000),
+      resolvedConflictDays: options.resolvedConflictDays ?? numberFromEnv("SYNC_RETENTION_CONFLICT_DAYS", 30)
+    });
+    if (result.operations + result.conflicts + result.snapshots > 0) {
+      this.broadcast({ type: "maintenance-pruned", ...result });
+    }
+    return result;
+  }
+
+  private scheduleMaintenance(): void {
+    if (this.maintenanceTimer) return;
+    const intervalMs = numberFromEnv("SYNC_MAINTENANCE_INTERVAL_MS", 3_600_000);
+    if (intervalMs <= 0) return;
+    this.maintenanceTimer = setInterval(() => void this.pruneHistory().catch(() => undefined), intervalMs);
+    this.maintenanceTimer.unref();
   }
 
   startRoot(root: SyncRoot): void {
@@ -173,4 +196,9 @@ export class SyncRuntime {
     const payload = JSON.stringify(event);
     for (const client of this.clients) if (client.readyState === 1) client.send(payload);
   }
+}
+
+function numberFromEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
 }

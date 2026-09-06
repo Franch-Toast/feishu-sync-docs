@@ -86,6 +86,10 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     return reply.send(resolved);
   });
   app.get("/api/operations", async () => store.listOperations());
+  app.post<{ Body: { keepOperations?: number; resolvedConflictDays?: number } }>("/api/maintenance/prune", async (request) => {
+    const body = request.body ?? {};
+    return runtime.pruneHistory({ keepOperations: body.keepOperations, resolvedConflictDays: body.resolvedConflictDays });
+  });
   app.route({
     method: "GET",
     url: "/api/events",

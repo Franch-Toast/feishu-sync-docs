@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
 import type {
-  AssetBinding, BlockMapping, ConflictRecord, ConflictStatus, OperationRecord, StateStore, SyncEntry,
+  AssetBinding, BlockMapping, ConflictRecord, ConflictStatus, OperationRecord, PruneHistoryOptions, PruneHistoryResult, StateStore, SyncEntry,
   SyncRoot, SyncSnapshot
 } from "@feishu-sync/core";
 
@@ -265,6 +265,28 @@ export class SqliteStateStore implements StateStore {
   async getAssetBindings(documentEntryId: string): Promise<AssetBinding[]> {
     return (this.db.prepare("SELECT * FROM asset_bindings WHERE document_entry_id=? ORDER BY asset_entry_id").all(documentEntryId) as unknown as Row[])
       .map((row) => ({ documentEntryId: String(row.document_entry_id), assetEntryId: String(row.asset_entry_id), token: String(row.token), contentHash: String(row.content_hash) }));
+  }
+
+  async pruneHistory(options: PruneHistoryOptions = {}): Promise<PruneHistoryResult> {
+    const keepOperations = Math.max(0, options.keepOperations ?? 1000);
+    const resolvedConflictDays = Math.max(0, options.resolvedConflictDays ?? 30);
+    const cutoff = new Date(Date.now() - resolvedConflictDays * 86_400_000).toISOString();
+    let operations = 0;
+    let conflicts = 0;
+    let snapshots = 0;
+    this.withTransaction(() => {
+      operations = Number(this.db.prepare(
+        "DELETE FROM operations WHERE id NOT IN (SELECT id FROM operations ORDER BY created_at DESC LIMIT ?)"
+      ).run(keepOperations).changes);
+      conflicts = Number(this.db.prepare(
+        "DELETE FROM conflicts WHERE status IN ('resolved','aborted') AND resolved_at IS NOT NULL AND resolved_at < ?"
+      ).run(cutoff).changes);
+      // Defensive cleanup: deleteRoot already removes snapshots with their entries.
+      snapshots = Number(this.db.prepare(
+        "DELETE FROM snapshots WHERE entry_id NOT IN (SELECT id FROM entries)"
+      ).run().changes);
+    });
+    return { operations, conflicts, snapshots };
   }
 
   private migrate(): void {

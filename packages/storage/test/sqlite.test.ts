@@ -25,3 +25,34 @@ test("persists roots, snapshots and conflicts", async () => {
   assert.equal((await store.getAssetBindings("entry"))[0]?.token, "asset-token");
   store.close();
 });
+
+test("pruneHistory keeps recent operations and drops expired conflicts and orphan snapshots", async () => {
+  const store = new SqliteStateStore();
+  const root = await store.createRoot({ localPath: "/tmp/prune", remoteToken: "folder", remoteType: "folder", enabled: false, pollIntervalMs: 5000 });
+  await store.upsertEntry({ id: "entry-1", rootId: root.id, relativePath: "a.md", kind: "document", status: "clean", updatedAt: new Date().toISOString() });
+  await store.saveSnapshot({ entryId: "entry-1", baseContent: "base", localContent: "local", remoteContent: "remote", baseHash: "b", localHash: "l", remoteHash: "r", createdAt: new Date().toISOString() });
+  // Orphan snapshot: its entry no longer exists, so retention must reclaim it.
+  await store.saveSnapshot({ entryId: "ghost", baseContent: "base", localContent: "local", remoteContent: "remote", baseHash: "b", localHash: "l", remoteHash: "r", createdAt: new Date().toISOString() });
+
+  // Five operations with deterministic created_at ordering (oldest first).
+  const raw = store as unknown as { db: { prepare(sql: string): { run(...values: unknown[]): unknown } } };
+  for (let index = 0; index < 5; index += 1) {
+    const operation = await store.addOperation({ entryId: "entry-1", direction: "push", operation: "op" });
+    raw.db.prepare("UPDATE operations SET created_at=? WHERE id=?").run(new Date(Date.UTC(2026, 0, index + 1)).toISOString(), operation.id);
+  }
+
+  // A resolved conflict older than the retention window, plus an open conflict that must survive.
+  const stale = await store.createConflict({ entryId: "entry-1", baseContent: "b", localContent: "l", remoteContent: "r" });
+  await store.resolveConflict(stale.id, "merged", "m");
+  raw.db.prepare("UPDATE conflicts SET resolved_at=? WHERE id=?").run(new Date(Date.now() - 40 * 86_400_000).toISOString(), stale.id);
+  await store.createConflict({ entryId: "entry-1", baseContent: "b2", localContent: "l2", remoteContent: "r2" });
+
+  const result = await store.pruneHistory({ keepOperations: 2, resolvedConflictDays: 30 });
+  assert.deepEqual(result, { operations: 3, conflicts: 1, snapshots: 1 });
+  assert.equal((await store.listOperations()).length, 2);
+  assert.equal((await store.listConflicts("open")).length, 1);
+  assert.equal((await store.listConflicts()).length, 1);
+  assert.ok(await store.getSnapshot("entry-1"));
+  assert.equal(await store.getSnapshot("ghost"), undefined);
+  store.close();
+});
