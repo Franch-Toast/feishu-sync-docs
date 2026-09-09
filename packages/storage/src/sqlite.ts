@@ -111,6 +111,26 @@ export class SqliteStateStore implements StateStore {
     return (this.db.prepare("SELECT * FROM entries WHERE root_id = ? ORDER BY relative_path").all(rootId) as unknown as Row[]).map(readEntry);
   }
 
+  async findEntryByRemoteToken(remoteToken: string): Promise<SyncEntry | undefined> {
+    const row = this.db.prepare("SELECT * FROM entries WHERE remote_token = ? LIMIT 1").get(remoteToken) as Row | undefined;
+    return row ? readEntry(row) : undefined;
+  }
+
+  async getSetting(key: string): Promise<string | undefined> {
+    const row = this.db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as Row | undefined;
+    return row ? String(row.value) : undefined;
+  }
+
+  async getSettings(): Promise<Record<string, string>> {
+    const rows = this.db.prepare("SELECT key, value FROM settings").all() as unknown as Row[];
+    return Object.fromEntries(rows.map((row) => [String(row.key), String(row.value)]));
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    this.db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
+      .run(key, value, new Date().toISOString());
+  }
+
   async saveSnapshot(snapshot: SyncSnapshot): Promise<void> {
     this.db.prepare(`INSERT INTO snapshots (entry_id, base_content, local_content, remote_content, base_hash, local_hash, remote_hash, created_at)
       VALUES (@entryId,@baseContent,@localContent,@remoteContent,@baseHash,@localHash,@remoteHash,@createdAt)
@@ -269,15 +289,19 @@ export class SqliteStateStore implements StateStore {
 
   async pruneHistory(options: PruneHistoryOptions = {}): Promise<PruneHistoryResult> {
     const keepOperations = Math.max(0, options.keepOperations ?? 1000);
+    const keepOperationHours = Math.max(0, options.keepOperationHours ?? 24);
     const resolvedConflictDays = Math.max(0, options.resolvedConflictDays ?? 30);
     const cutoff = new Date(Date.now() - resolvedConflictDays * 86_400_000).toISOString();
+    // Time-based LRU for operations; the record-count cap stays as a second
+    // safety net (the 24h success/failure stats window is never touched).
+    const operationCutoff = new Date(Date.now() - keepOperationHours * 3_600_000).toISOString();
     let operations = 0;
     let conflicts = 0;
     let snapshots = 0;
     this.withTransaction(() => {
       operations = Number(this.db.prepare(
-        "DELETE FROM operations WHERE id NOT IN (SELECT id FROM operations ORDER BY created_at DESC LIMIT ?)"
-      ).run(keepOperations).changes);
+        "DELETE FROM operations WHERE created_at < ? OR id NOT IN (SELECT id FROM operations ORDER BY created_at DESC LIMIT ?)"
+      ).run(operationCutoff, keepOperations).changes);
       conflicts = Number(this.db.prepare(
         "DELETE FROM conflicts WHERE status IN ('resolved','aborted') AND resolved_at IS NOT NULL AND resolved_at < ?"
       ).run(cutoff).changes);
@@ -331,6 +355,10 @@ export class SqliteStateStore implements StateStore {
         document_entry_id TEXT NOT NULL, asset_entry_id TEXT NOT NULL, token TEXT NOT NULL,
         content_hash TEXT NOT NULL, PRIMARY KEY(document_entry_id, asset_entry_id)
       );
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS entries_remote_token_idx ON entries(remote_token);
     `);
     try { this.db.exec("ALTER TABLE conflicts ADD COLUMN remote_revision INTEGER"); } catch { /* existing schema already migrated */ }
     try { this.db.exec("ALTER TABLE conflicts ADD COLUMN remote_content_hash TEXT"); } catch { /* existing schema already migrated */ }

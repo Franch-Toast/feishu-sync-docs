@@ -26,6 +26,23 @@ test("persists roots, snapshots and conflicts", async () => {
   store.close();
 });
 
+test("persists key/value settings and finds entries by remote token", async () => {
+  const store = new SqliteStateStore();
+  assert.equal(await store.getSetting("feishu.mode"), undefined);
+  await store.setSetting("feishu.mode", "user");
+  await store.setSetting("feishu.accessToken", "tok-123");
+  await store.setSetting("feishu.mode", "tenant");
+  assert.equal(await store.getSetting("feishu.mode"), "tenant");
+  assert.deepEqual(await store.getSettings(), { "feishu.mode": "tenant", "feishu.accessToken": "tok-123" });
+
+  const root = await store.createRoot({ localPath: "/tmp/docs", remoteToken: "folder", remoteType: "folder", enabled: false, pollIntervalMs: 5000 });
+  await store.upsertEntry({ id: "entry-remote", rootId: root.id, relativePath: "b.md", kind: "document", status: "clean", remoteToken: "doc-token-9", updatedAt: new Date().toISOString() });
+  const found = await store.findEntryByRemoteToken("doc-token-9");
+  assert.equal(found?.id, "entry-remote");
+  assert.equal(await store.findEntryByRemoteToken("missing-token"), undefined);
+  store.close();
+});
+
 test("pruneHistory keeps recent operations and drops expired conflicts and orphan snapshots", async () => {
   const store = new SqliteStateStore();
   const root = await store.createRoot({ localPath: "/tmp/prune", remoteToken: "folder", remoteType: "folder", enabled: false, pollIntervalMs: 5000 });

@@ -1,6 +1,6 @@
 # Feishu Local Sync
 
-一个本地优先的后台服务，将本地 Markdown 目录与飞书/Lark 云文档目录双向同步，并提供浏览器冲突处理界面。
+一个本地优先的后台服务，将本地 Markdown 目录与飞书/Lark 云文档目录双向同步，并提供浏览器工作台：凭证设置、联通测试、git 式冲突解决、Markdown 渲染预览与同步历史管理都在网页中完成。
 
 当前实现的核心行为：
 
@@ -12,7 +12,9 @@
 - 图片单独变化会使引用它的文档重新同步；远端图片变更会先下载到本地，再纳入文档比较；
 - 同时修改同一块内容时不覆盖任一侧，冲突会在网页工作台中保留 base/local/remote 三个版本；解决前会再次校验远端 revision，避免使用过期内容覆盖新修改；
 - 冲突支持"暂不处理"：决定会持久化到状态库，条目重新进入待评估队列，后续轮询基于最新三方数据重新判断；
-- 同步失败的条目会标记为 error 并在操作日志中留痕，后续轮询会自动重试。
+- 同步失败的条目会标记为 error 并在操作日志中留痕，后续轮询会自动重试；
+- 凭证保存在本地 SQLite 中并在浏览器设置页管理（用户 Token / 应用凭证 / lark-cli 三种模式），保存后 provider 热重建立即生效，支持一键联通测试；
+- 飞书返回认证错误时自动暂停同步：顶栏徽章告警、WebSocket 广播并弹出修复引导，按认证方式深链到 API 调试台或开发者后台，粘贴新 Token 保存后自动重测并恢复。
 
 ## 环境要求
 
@@ -37,19 +39,32 @@ pnpm --filter @feishu-sync/server dev
 
 打开 <http://127.0.0.1:8787>。服务默认只监听本机。
 
-配置飞书访问方式：
+### 配置飞书凭证（推荐在浏览器完成）
+
+打开页面右上角徽章或「设置」页：
+
+1. 选择认证方式：**用户 Token**（个人授权，粘贴 user_access_token）、**应用凭证**（App ID + App Secret，tenant_access_token 自动刷新）或 **lark-cli**（复用本地登录态）；
+2. 点击「测试联通」验证凭证，返回身份与延迟；
+3. 点击「保存并生效」，服务端重建 provider 并自动重测，无需重启进程。
+
+环境变量仍然可用作为 fallback（优先级：数据库设置 > 环境变量）：
 
 ```bash
 export FEISHU_ACCESS_TOKEN="..."
 # 或使用应用身份
 export FEISHU_APP_ID="..."
 export FEISHU_APP_SECRET="..."
+
+
+export PATH=/sandbox/.tools/node-v24.10.0-linux-x64/bin:$PATH
 ```
 
-默认使用原生 OpenAPI provider：基于飞书新版文档 Markdown API（docs_ai，与官方 lark-cli v2 一致）提供整篇 Markdown 的原子读写、revision 并发控制和块级命令；应用身份（`FEISHU_APP_ID`/`FEISHU_APP_SECRET`）下 tenant_access_token 会在过期前自动刷新。也可以设置 `FEISHU_PROVIDER=cli` 使用本地 `lark-cli`：
+Token 失效时同步自动暂停：顶栏徽章变红并弹出修复引导，按认证方式深链到飞书 API 调试台（user）或开发者后台凭证页（tenant），粘贴新 Token 保存后自动重测并恢复同步。引导链接可在设置中自定义。
+
+默认使用原生 OpenAPI provider：基于飞书新版文档 Markdown API（docs_ai，与官方 lark-cli v2 一致）提供整篇 Markdown 的原子读写、revision 并发控制和块级命令。也可以选择 lark-cli 模式：
 
 ```bash
-export FEISHU_PROVIDER=cli
+# 设置页选择「lark-cli」并填写可执行文件路径
 export LARK_CLI_BIN=lark-cli
 ```
 
@@ -65,11 +80,31 @@ curl -X POST http://127.0.0.1:8787/api/roots \
   -d '{"localPath":"/absolute/path/to/docs","remoteToken":"feishu-folder-token","remoteType":"folder","pollIntervalMs":15000}'
 ```
 
+### 浏览器工作台
+
+侧边栏五页：**仪表盘** / **文档** / **冲突工作台** / **历史** / **设置**，顶栏常驻连接状态、凭证徽章与全局「立即同步」。
+
+- **仪表盘**：健康统计（上次同步时间、下次自动同步倒计时、24h 成功/失败数）与条目状态表，可直接跳转预览；
+- **文档**：同步条目浏览与文件名搜索，Markdown 文档在浏览器内渲染（代码高亮、表格、引用；文档内相对路径图片通过 `GET /api/roots/:id/file` 代理展示），图片资源直接预览；非干净条目可一键**恢复到基线版本**；
+- **冲突工作台**：git 式分栏对比 —— LOCAL/REMOTE 双栏（可展开 BASE 基线列），行级差异着色 + 词级高亮；按变更块（hunk）逐一「采用/撤回」，与另一侧重叠的块会警示覆盖关系；也可切换到编辑模式手动合并或预览渲染结果；已解决冲突保留完整历史可回溯；
+- **历史**：按状态/方向/根目录过滤操作记录，失败操作一键重试；支持清理过期历史；
+- **设置**：凭证管理与联通测试；同步计划可视管理（启停、轮询间隔热生效，无需重启）；浏览器通知开关（冲突与失败时系统提醒）；维护操作与安全提示。
+
 运行时配置：
 
 - `SYNC_DB_PATH`：SQLite 状态库路径，默认 `.data/sync.db`；
 - `FEISHU_BASE_URL`：飞书或 Lark API 地址，默认 `https://open.feishu.cn`；
-- `HOST`、`PORT`：服务监听地址和端口，默认 `127.0.0.1:8787`。
+- `HOST`、`PORT`：服务监听地址和端口，默认 `127.0.0.1:8787`；
+- 凭证类环境变量（`FEISHU_ACCESS_TOKEN`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`LARK_CLI_BIN` 及旧名 `LARK_CLI_PATH`）仍作为 fallback 生效，浏览器设置页保存的数据库配置优先于环境变量。
+
+## 安全与数据
+
+- 凭证（user token、app secret）以明文保存在本地 SQLite（默认 `.data/sync.db`）中，这是本地优先设计的取舍：请确保该文件仅当前用户可读，必要时通过 `SYNC_DB_PATH` 将其置于用户私有目录；
+- 所有 API 返回的凭证均为脱敏形式（token 仅显示前 6 后 4 位），完整凭证不会回显到浏览器，也不会写入日志；
+- 服务默认只监听 `127.0.0.1:8787`，如需局域网访问请自行置于反向代理并增加认证；
+- 本地文件端点 `GET /api/roots/:id/file` 严格防路径穿越：resolve 后必须仍在对应根目录内，否则返回 403；
+- 远端资产代理端点 `GET /api/assets/:token` 只接受已绑定条目中登记过的资源 token；
+- Markdown 渲染默认转义内嵌 HTML（markdown-it `html:false`），文档内相对路径图片经服务端代理展示。
 
 ## Architecture
 
@@ -85,7 +120,7 @@ local watcher + poller       web UI / REST / WebSocket
                          Feishu OpenAPI   lark-cli
 ```
 
-`packages/core` 不依赖飞书 SDK，负责规范化、哈希、三方合并、资源引用和块补丁规划。`packages/storage` 负责基于 Node 内置 `node:sqlite` 的 SQLite 持久化。`packages/feishu` 只实现远端能力。`packages/server` 负责常驻进程（支持 SIGINT/SIGTERM 优雅退出）、文件监听、任务串行化、API 和冲突生命周期。后续增加其他远端或本地来源时，优先新增 provider，不修改同步核心。
+`packages/core` 不依赖飞书 SDK，负责规范化、哈希、三方合并、资源引用和块补丁规划。`packages/storage` 负责基于 Node 内置 `node:sqlite` 的 SQLite 持久化。`packages/feishu` 只实现远端能力。`packages/server` 负责常驻进程（支持 SIGINT/SIGTERM 优雅退出）、文件监听、任务串行化、API 和冲突生命周期；凭证由 `CredentialStore` 统一管理（数据库设置优先于环境变量），远端 provider 经由注册表按需热重建，设置变更后无需重启进程。后续增加其他远端或本地来源时，优先新增 provider，不修改同步核心。
 
 ## Development
 
@@ -95,4 +130,4 @@ pnpm typecheck
 pnpm build
 ```
 
-测试覆盖 Markdown 解析和引用改写、三方合并和块补丁规划、SQLite 状态迁移、OpenAPI 请求与 revision 校验、CLI 适配器、资源绑定、同步运行时和 HTTP API。生产环境还应补充飞书租户权限、限流、超大文档和复杂富文本的集成测试。
+测试覆盖 Markdown 解析和引用改写、三方合并和块补丁规划、SQLite 状态迁移（含 settings KV 表）、OpenAPI 请求与 revision 校验、飞书错误码到 `FeishuApiError` 的语义分类（auth/permission/rate_limit/network）、CLI 适配器、资源绑定、同步运行时和 HTTP API（含设置读写与脱敏、联通测试、根目录 PATCH 热生效、本地文件端点路径穿越拒绝、资产代理、统计与基线恢复）。浏览器端使用 vitest 覆盖 diff 封装（行级/词级分块、hunk 合并与重叠检测）和 Markdown 渲染（代码高亮、相对图片代理重写）。生产环境还应补充飞书租户权限、限流、超大文档和复杂富文本的集成测试。

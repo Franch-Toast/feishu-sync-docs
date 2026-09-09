@@ -4,10 +4,17 @@ import { buildBlockPatch, decideSync } from "./merge.js";
 import { parseMarkdown, restoreAssetReferences, restoreInternalLinks, rewriteAssetReferences, rewriteInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
 import type {
-  LocalProvider, RemoteDocument, RemoteNode, RemoteProvider, StateStore, SyncEntry, SyncRoot
+  LocalProvider, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, StateStore, SyncEntry, SyncRoot
 } from "./types.js";
 
 export class SyncEngine {
+  /** Remote-tree cache keyed by root id. A scan refreshes it once and the
+   *  sync-entry loop it triggers reuses the same listing; repeated per-entry
+   *  drive walks were slow and allowed duplicate-folder creation races. */
+  private readonly remoteTreeCache = new Map<string, { tree: RemoteTree; at: number }>();
+  private readonly remoteTreeJobs = new Map<string, Promise<RemoteTree>>();
+  private static readonly REMOTE_TREE_TTL_MS = 60_000;
+
   constructor(
     private readonly store: StateStore,
     private readonly local: LocalProvider,
@@ -48,7 +55,7 @@ export class SyncEngine {
       if (file.kind === "asset" && changed && existing?.remoteToken) changedAssets.push(file.relativePath);
     }
 
-    const remoteTree = await this.remote.listTree(root);
+    const remoteTree = await this.refreshRemoteTree(root);
     const remoteNodesByToken = new Map(remoteTree.nodes.map((node) => [node.token, node]));
     const remoteDocumentPaths = new Map<string, string>();
     const remoteAssetPaths = new Map<string, string>();
@@ -178,8 +185,40 @@ export class SyncEngine {
     let assetMaps = await this.prepareAssets(root, entry, localContent, remote?.token, false);
     if (!remote) {
       const parent = await this.ensureRemoteParent(root, entry.relativePath);
+      // Feishu derives the drive-visible title from the markdown H1, so two
+      // local files sharing a first heading would push two identically named
+      // documents into the same folder. Adopt an unbound same-name document
+      // (e.g. this entry's own earlier creation after a partial failure)
+      // instead of creating another copy; block on same-name documents that
+      // are already bound elsewhere.
+      const tree = await this.loadRemoteTree(root);
+      const expectedTitle = parseMarkdown(localContent).title ?? documentTitle(entry.relativePath);
+      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && (node.name === expectedTitle || node.name === documentTitle(entry.relativePath)));
+      if (duplicate) {
+        const bound = await this.store.findEntryByRemoteToken(duplicate.token);
+        if (bound && bound.id !== entry.id) {
+          throw new Error(`Remote folder already has a document named "${duplicate.name}" bound to ${bound.relativePath}; rename one side, then retry sync`);
+        }
+        remote = await this.remote.getDocument(duplicate.token);
+        const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, entry.relativePath), assetMaps.reverseMap, entry.relativePath);
+        if (sha256(canonicalRemote) === sha256(localContent) || sha256(remote.content) === sha256(localContent)) {
+          // The existing copy matches the local file (most likely this
+          // entry's own earlier creation); rebind and sync as usual.
+          const adopted: SyncEntry = { ...entry, remoteToken: remote.token, remoteParentToken: parent, status: "pending", updatedAt: new Date().toISOString() };
+          await this.store.upsertEntry(adopted);
+          return this.syncEntry(adopted, root);
+        }
+        // Same name but different content: let the user decide instead of
+        // silently overwriting either side.
+        const conflicting: SyncEntry = { ...entry, remoteToken: remote.token, remoteParentToken: parent, remoteHash: sha256(canonicalRemote), remoteRevision: remote.revisionId, status: "conflict", updatedAt: new Date().toISOString() };
+        await this.store.upsertEntry(conflicting);
+        const snapshot = await this.store.getSnapshot(entry.id);
+        await this.store.createConflict({ entryId: entry.id, baseContent: snapshot?.baseContent ?? "", localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+        return conflicting;
+      }
       let remoteContent = this.renderRemoteContent(localContent, entry.relativePath, forwardMap, assetMaps.forwardMap);
       let created = await this.remote.createDocument(parent, documentTitle(entry.relativePath), remoteContent);
+      this.cacheRemoteNode(root, created);
       if (assetMaps.hasLocalAssets && this.remote.uploadInlineAsset) {
         const inlineAssets = await this.prepareAssets(root, entry, localContent, created.token, true);
         assetMaps = inlineAssets;
@@ -294,7 +333,7 @@ export class SyncEngine {
     let remoteToken = entry.remoteToken;
     if (!remoteToken || entry.remoteHash !== entry.localHash) {
       const uploaded = await this.remote.uploadAsset(parent, posix.basename(entry.relativePath), content, mimeType(entry.relativePath));
-      if (remoteToken && remoteToken !== uploaded.token) await this.remote.softDelete(remoteToken);
+      if (remoteToken && remoteToken !== uploaded.token) await this.remote.softDelete(remoteToken, "file");
       remoteToken = uploaded.token;
     }
     const next = { ...entry, remoteToken, remoteParentToken: parent, remoteHash: entry.localHash, baseHash: entry.localHash, status: "clean" as const, updatedAt: new Date().toISOString() };
@@ -472,13 +511,50 @@ export class SyncEngine {
     return { forwardMap, reverseMap };
   }
 
+  /** Force-refresh the cached remote tree for a root; used at scan start so
+   *  the engine works on a consistent snapshot. */
+  private async refreshRemoteTree(root: SyncRoot): Promise<RemoteTree> {
+    this.remoteTreeCache.delete(root.id);
+    return this.loadRemoteTree(root);
+  }
+
+  /** Return the cached remote tree, fetching it once per TTL window and
+   *  de-duplicating concurrent fetches. */
+  private async loadRemoteTree(root: SyncRoot): Promise<RemoteTree> {
+    const cached = this.remoteTreeCache.get(root.id);
+    if (cached && Date.now() - cached.at < SyncEngine.REMOTE_TREE_TTL_MS) return cached.tree;
+    const pending = this.remoteTreeJobs.get(root.id);
+    if (pending) return pending;
+    const job = this.remote.listTree(root).then((tree) => {
+      this.remoteTreeCache.set(root.id, { tree, at: Date.now() });
+      return tree;
+    }).finally(() => { this.remoteTreeJobs.delete(root.id); });
+    this.remoteTreeJobs.set(root.id, job);
+    return job;
+  }
+
+  /** Register a newly created remote node in the cached tree so subsequent
+   *  lookups in this round see it even if the drive listing lags behind. */
+  private cacheRemoteNode(root: SyncRoot, node: RemoteNode): void {
+    const cached = this.remoteTreeCache.get(root.id);
+    if (cached) cached.tree.nodes.push(node);
+  }
+
   private async ensureRemoteParent(root: SyncRoot, relativePath: string): Promise<string> {
     const directories = posix.dirname(relativePath).split("/").filter(Boolean);
     let parentToken = root.remoteToken;
+    const tree = await this.loadRemoteTree(root);
     for (const name of directories) {
-      const tree = await this.remote.listTree(root);
       const existing = tree.nodes.find((node) => node.type === "folder" && node.parentToken === parentToken && node.name === name);
-      parentToken = existing?.token ?? (await this.remote.createFolder(parentToken, name)).token;
+      if (existing) {
+        parentToken = existing.token;
+        continue;
+      }
+      const created = await this.remote.createFolder(parentToken, name);
+      // Register before returning: drive listings may lag behind creation
+      // and a retry in that window would otherwise create a duplicate folder.
+      tree.nodes.push(created);
+      parentToken = created.token;
     }
     return parentToken;
   }

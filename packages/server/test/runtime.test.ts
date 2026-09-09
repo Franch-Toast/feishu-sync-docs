@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FilesystemProvider } from "@feishu-sync/core";
-import type { SyncRoot } from "@feishu-sync/core";
+import type { RemoteTree, SyncRoot } from "@feishu-sync/core";
+import { FeishuApiError } from "@feishu-sync/feishu";
 import { SqliteStateStore } from "@feishu-sync/storage";
 import { SyncRuntime } from "../src/runtime.js";
+import type { WebSocket } from "ws";
 import { FakeRemote } from "./helpers/fake-remote.js";
 
 interface Scenario {
@@ -190,6 +192,91 @@ test("serializes work per root through the internal queue", async () => {
       const current = finished[index]!;
       assert.ok(previous.end <= current.end, `task ${current.id} overlapped with task ${previous.id}`);
     }
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+/** FakeRemote whose listTree can simulate an expired/invalid token. */
+class AuthFlippingRemote extends FakeRemote {
+  failAuth = false;
+  listTree(root: SyncRoot): Promise<RemoteTree> {
+    if (this.failAuth) return Promise.reject(new FeishuApiError("auth", "simulated invalid token"));
+    return super.listTree(root);
+  }
+}
+
+/** Minimal WebSocket stand-in that records every broadcast payload. */
+function createFakeSocket(): { socket: WebSocket; messages: string[] } {
+  const messages: string[] = [];
+  const socket = {
+    readyState: 1,
+    send: (payload: string) => messages.push(payload),
+    on: () => undefined,
+    close: () => undefined
+  } as unknown as WebSocket;
+  return { socket, messages };
+}
+
+function broadcastTypes(messages: string[]): string[] {
+  return messages.map((payload) => {
+    try { return (JSON.parse(payload) as { type?: string }).type ?? ""; } catch { return ""; }
+  });
+}
+
+test("auth failures flag the credential state and recovery clears it", async () => {
+  const store = new SqliteStateStore();
+  const remote = new AuthFlippingRemote();
+  const runtime = new SyncRuntime(store, new FilesystemProvider(), remote);
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-runtime-auth-"));
+  const { socket, messages } = createFakeSocket();
+  runtime.addClient(socket);
+  try {
+    writeFileSync(join(directory, "notes.md"), "shared line\n", "utf8");
+    const root = await store.createRoot({ localPath: directory, remoteToken: "root-token", remoteType: "folder", enabled: false, pollIntervalMs: 60_000 });
+
+    // A healthy round never touches the auth state.
+    await runtime.syncRoot(root.id);
+    assert.equal(await store.getSetting("feishu.authStatus"), undefined);
+    assert.ok(!broadcastTypes(messages).includes("auth-invalid"));
+
+    // An auth error flags the credentials once and short-circuits the round.
+    remote.failAuth = true;
+    const failed = (await runtime.syncRoot(root.id)) as { authInvalid?: boolean };
+    assert.equal(failed.authInvalid, true);
+    assert.equal(await store.getSetting("feishu.authStatus"), "invalid");
+    assert.equal(broadcastTypes(messages).filter((type) => type === "auth-invalid").length, 1);
+
+    // Repeated failures stay quiet: the flag is broadcast once, not per sync.
+    await runtime.syncRoot(root.id);
+    assert.equal(await store.getSetting("feishu.authStatus"), "invalid");
+    assert.equal(broadcastTypes(messages).filter((type) => type === "auth-invalid").length, 1);
+
+    // A healthy round restores the credential state and announces it.
+    remote.failAuth = false;
+    await runtime.syncRoot(root.id);
+    assert.equal(await store.getSetting("feishu.authStatus"), "ok");
+    assert.ok(broadcastTypes(messages).includes("auth-restored"), "expected an auth-restored broadcast");
+  } finally {
+    runtime.stop();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("plain remote errors never flag the credential state", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const token = result.entries[0]!.remoteToken!;
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    scenario.remote.failNextWrite();
+    const failed = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(failed.entries[0]?.status, "error");
+    assert.equal(scenario.remote.documents.get(token)?.content, "shared line\n");
+    const authStatus = await scenario.store.getSetting("feishu.authStatus");
+    assert.ok(authStatus !== "invalid", "a plain write failure must not flag the credentials");
   } finally {
     cleanup(scenario);
   }

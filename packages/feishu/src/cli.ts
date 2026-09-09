@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { parseMarkdown } from "@feishu-sync/core";
 import type { DocumentPatch, MutationResult, ProviderCapabilities, RemoteAsset, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, SyncRoot } from "@feishu-sync/core";
+import { FeishuApiError, classifyCliMessage } from "./errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -72,22 +73,28 @@ export class LarkCliProvider implements RemoteProvider {
 
   async uploadAsset(_parentToken: string, _name: string, _content: Uint8Array, _mimeType: string): Promise<RemoteAsset> { throw new Error("The CLI adapter does not expose resource upload; use the OpenAPI provider"); }
   async downloadAsset(_token: string): Promise<Uint8Array> { throw new Error("Use the OpenAPI provider for asset download"); }
-  async softDelete(_token: string): Promise<void> { throw new Error("Deletion is intentionally not hidden behind the CLI adapter"); }
+  async softDelete(_token: string, _type?: "docx" | "folder" | "file"): Promise<void> { throw new Error("Deletion is intentionally not hidden behind the CLI adapter"); }
 
   private async run(args: string[]): Promise<any> {
     const { stdout, stderr } = await execFileAsync(this.executable, args, { cwd: this.options.cwd, env: { ...process.env, ...this.options.env }, maxBuffer: 32 * 1024 * 1024 });
     // Only treat stderr as a failure when stdout is empty and stderr clearly reports
     // an error line; chatter like "0 errors" or progress logs must not fail the call.
-    if (stderr && !stdout.trim() && /(^|\n)\s*(error|fatal|failed)\b/i.test(stderr)) throw new Error(stderr.trim());
+    if (stderr && !stdout.trim() && /(^|\n)\s*(error|fatal|failed)\b/i.test(stderr)) throw toCliError(stderr.trim());
     try {
       const envelope = JSON.parse(stdout) as { ok?: boolean; data?: unknown; error?: { message?: string } };
-      if (envelope.ok === false) throw new Error(envelope.error?.message ?? "lark-cli request failed");
+      if (envelope.ok === false) throw toCliError(envelope.error?.message ?? "lark-cli request failed");
       return envelope.ok === true && "data" in envelope ? envelope.data : envelope;
     } catch (error) {
+      if (error instanceof FeishuApiError) throw error;
       if (error instanceof Error && /lark-cli request failed|CLI|API|failed/i.test(error.message)) throw error;
       throw new Error(`lark-cli returned non-JSON output: ${stdout.slice(0, 500)}`);
     }
   }
+}
+
+/** Classify free-form CLI errors so the runtime can flag credential problems. */
+function toCliError(message: string): Error {
+  return new FeishuApiError(classifyCliMessage(message), message);
 }
 
 function numberOrUndefined(value: unknown): number | undefined { return typeof value === "number" ? value : undefined; }

@@ -134,7 +134,9 @@ export interface RemoteProvider {
   uploadAsset(parentToken: string, name: string, content: Uint8Array, mimeType: string): Promise<RemoteAsset>;
   uploadInlineAsset?(documentToken: string, name: string, content: Uint8Array, mimeType: string): Promise<RemoteAsset>;
   downloadAsset(token: string): Promise<Uint8Array>;
-  softDelete(token: string): Promise<void>;
+  /** Move a remote file to the drive trash. The Feishu endpoint requires the
+   *  file type as a query parameter (docx/folder/file). */
+  softDelete(token: string, type?: "docx" | "folder" | "file"): Promise<void>;
 }
 
 export interface ProviderCapabilities {
@@ -216,6 +218,8 @@ export interface SyncDecision {
 export interface PruneHistoryOptions {
   /** Keep at most this many most-recent operation records. */
   keepOperations?: number;
+  /** Delete operations created more than this many hours ago (time-based LRU). */
+  keepOperationHours?: number;
   /** Delete resolved/aborted conflicts resolved more than this many days ago. */
   resolvedConflictDays?: number;
 }
@@ -235,7 +239,11 @@ export interface StateStore {
   upsertEntry(entry: SyncEntry): Promise<void>;
   getEntry(id: string): Promise<SyncEntry | undefined>;
   findEntry(rootId: string, relativePath: string): Promise<SyncEntry | undefined>;
+  findEntryByRemoteToken(remoteToken: string): Promise<SyncEntry | undefined>;
   listEntries(rootId: string): Promise<SyncEntry[]>;
+  getSetting(key: string): Promise<string | undefined>;
+  getSettings(): Promise<Record<string, string>>;
+  setSetting(key: string, value: string): Promise<void>;
   saveSnapshot(snapshot: SyncSnapshot): Promise<void>;
   getSnapshot(entryId: string): Promise<SyncSnapshot | undefined>;
   saveBlocks(entryId: string, blocks: BlockMapping[]): Promise<void>;

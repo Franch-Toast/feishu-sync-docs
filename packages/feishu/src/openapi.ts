@@ -4,13 +4,36 @@ import type {
   DocumentPatch, MutationResult, ProviderCapabilities, RemoteAsset, RemoteDocument,
   RemoteNode, RemoteProvider, RemoteTree, SyncRoot
 } from "@feishu-sync/core";
+import { FeishuApiError, FeishuOAuthError, PERMANENT_REFRESH_OAUTH_CODES, classifyFeishuFailure, networkError } from "./errors.js";
+
+/** Refresh the user access token this long before its advertised expiry. */
+const USER_TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
+/** After a transient refresh failure, wait this long before retrying so that
+ *  sequential calls during an outage do not hammer the token endpoint. */
+const REFRESH_RETRY_COOLDOWN_MS = 60_000;
+
+export interface UserTokenUpdate {
+  accessToken: string;
+  refreshToken?: string;
+  tokenExpiresAt: number;
+  refreshTokenExpiresAt?: number;
+}
 
 export interface FeishuOpenApiOptions {
   baseUrl?: string;
   accessToken?: string;
   appId?: string;
   appSecret?: string;
+  /** Refresh token obtained from the OAuth v3 flow; enables automatic renewal
+   *  of the user access token when paired with appId/appSecret. */
+  refreshToken?: string;
   fetchImpl?: typeof fetch;
+  /** Invoked after a successful token rotation. Must persist the new refresh
+   *  token promptly: the previous one is already invalidated server-side. */
+  onTokenRefresh?: (update: UserTokenUpdate) => void | Promise<void>;
+  /** Invoked when the refresh token becomes permanently unusable and the user
+   *  must re-authorize the app. */
+  onRefreshInvalid?: (reason: string) => void | Promise<void>;
 }
 
 interface FeishuEnvelope<T> {
@@ -47,13 +70,25 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private token?: string;
-  private tokenExpiresAt = 0;
+  /** Epoch ms when the current token expires; Infinity for opaque tokens. */
+  private tokenExpiresAt: number;
+  private refreshToken?: string;
+  private refreshTokenExpiresAt?: number;
+  private refreshCooldownUntil = 0;
   private tokenRequest?: Promise<string>;
 
   constructor(private readonly options: FeishuOpenApiOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "https://open.feishu.cn").replace(/\/$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.token = options.accessToken;
+    this.refreshToken = options.refreshToken;
+    this.tokenExpiresAt = options.accessToken ? parseJwtExpiresAt(options.accessToken) : 0;
+  }
+
+  /** Resolve a currently-valid access token, transparently refreshing the
+   *  user token via its refresh token when it is about to expire. */
+  async getAccessToken(): Promise<string> {
+    return this.getToken();
   }
 
   async listTree(root: SyncRoot): Promise<RemoteTree> {
@@ -67,7 +102,8 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   async getDocument(token: string): Promise<RemoteDocument> {
     const response = await this.request<DocumentResponse>("POST", `/open-apis/docs_ai/v1/documents/${encodeURIComponent(token)}/fetch`, {
       format: "markdown",
-      extra_param: { enable_user_cite_reference_map: true },
+      // Feishu expects extra_param as a JSON string; passing an object fails schema validation with code 9499.
+      extra_param: JSON.stringify({ enable_user_cite_reference_map: true }),
       export_option: { export_block_id: true, export_cite_extra_data: true }
     });
     const document = response.document ?? { document_id: token };
@@ -89,8 +125,11 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   }
 
   async createFolder(parentToken: string, name: string): Promise<RemoteNode> {
-    const data = await this.request<{ file?: { token?: string; name?: string } }>("POST", "/open-apis/drive/v1/files/create_folder", { name, folder_token: parentToken });
-    const token = data.file?.token;
+    // The create_folder endpoint returns the token at data.token (data.file
+    // does not exist despite what older docs suggested); parsing data.file
+    // made every successful creation throw and retry, creating duplicates.
+    const data = await this.request<{ file?: { token?: string; name?: string }; token?: string }>("POST", "/open-apis/drive/v1/files/create_folder", { name, folder_token: parentToken });
+    const token = data.file?.token ?? data.token;
     if (!token) throw new Error("Feishu did not return the created folder token");
     return { token, name: data.file?.name ?? name, type: "folder", parentToken };
   }
@@ -99,7 +138,25 @@ export class FeishuOpenApiProvider implements RemoteProvider {
     const data = await this.request<{ document?: { document_id?: string; revision_id?: number; title?: string } }>("POST", "/open-apis/docs_ai/v1/documents", { format: "markdown", content, parent_token: parentToken });
     const token = data.document?.document_id;
     if (!token) throw new Error("Feishu did not return the created document token");
-    return this.getDocument(token);
+    try {
+      return await this.getDocument(token);
+    } catch {
+      // The document was created but the follow-up read failed (e.g. schema
+      // errors like code 9499). Returning a stub lets the caller persist the
+      // binding; throwing here would re-create the document on retry and
+      // leave an orphaned duplicate in the drive. The next scan refreshes
+      // the stub's content/hash through getDocument.
+      return {
+        token,
+        name: data.document?.title ?? name,
+        type: "document",
+        parentToken,
+        content: "",
+        blocks: [],
+        contentHash: createHash("sha256").update("").digest("hex"),
+        revisionId: data.document?.revision_id
+      };
+    }
   }
 
   async applyPatch(token: string, patch: DocumentPatch): Promise<MutationResult> {
@@ -153,8 +210,8 @@ export class FeishuOpenApiProvider implements RemoteProvider {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  async softDelete(token: string): Promise<void> {
-    await this.request("DELETE", `/open-apis/drive/v1/files/${encodeURIComponent(token)}`);
+  async softDelete(token: string, type: "docx" | "folder" | "file" = "docx"): Promise<void> {
+    await this.request("DELETE", `/open-apis/drive/v1/files/${encodeURIComponent(token)}?type=${encodeURIComponent(type)}`);
   }
 
   private async walkDrive(folderToken: string, output: RemoteNode[]): Promise<void> {
@@ -200,7 +257,9 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const response = await this.rawRequest(method, path, body);
     const envelope = await response.json() as FeishuEnvelope<T>;
-    if (envelope.code !== undefined && envelope.code !== 0) throw new Error(`Feishu API ${envelope.code}: ${envelope.msg ?? "request failed"}`);
+    if (envelope.code !== undefined && envelope.code !== 0) {
+      throw new FeishuApiError(classifyFeishuFailure(envelope.code), `Feishu API ${envelope.code}: ${envelope.msg ?? "request failed"}`, envelope.code);
+    }
     return envelope.data ?? (envelope as unknown as T);
   }
 
@@ -213,29 +272,149 @@ export class FeishuOpenApiProvider implements RemoteProvider {
       headers.set("Content-Type", "application/json");
       requestBody = JSON.stringify(body);
     }
-    const response = await this.fetchImpl(`${this.baseUrl}${path}`, { method, headers, body: requestBody });
-    if (!response.ok) throw new Error(`Feishu HTTP ${response.status}: ${await response.text()}`);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, { method, headers, body: requestBody });
+    } catch (error) {
+      throw networkError(error);
+    }
+    if (!response.ok) {
+      throw new FeishuApiError(classifyFeishuFailure(undefined, response.status), `Feishu HTTP ${response.status}: ${await response.text()}`, undefined, response.status);
+    }
     return response;
   }
 
   private async getToken(): Promise<string> {
-    if (this.token && Date.now() < this.tokenExpiresAt - 60_000) return this.token;
-    if (!this.tokenRequest) this.tokenRequest = this.requestToken().finally(() => { this.tokenRequest = undefined; });
+    if (this.token !== undefined && Date.now() < this.tokenDeadline()) return this.token;
+    if (!this.tokenRequest) this.tokenRequest = this.obtainToken().finally(() => { this.tokenRequest = undefined; });
     return this.tokenRequest;
   }
 
-  private async requestToken(): Promise<string> {
-    if (!this.options.appId || !this.options.appSecret) {
-      // User access tokens carry no expiry metadata; keep using the supplied one.
-      if (this.token) return this.token;
-      throw new Error("Configure FEISHU_ACCESS_TOKEN or FEISHU_APP_ID/FEISHU_APP_SECRET");
+  /** Expiry minus the safety margin used to decide whether the token is usable.
+   *  During the post-failure cooldown the still-valid token is kept in use. */
+  private tokenDeadline(): number {
+    if (this.tokenExpiresAt === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
+    const deadline = this.tokenExpiresAt - USER_TOKEN_REFRESH_MARGIN_MS;
+    if (Date.now() < this.refreshCooldownUntil) return Math.max(deadline, this.tokenExpiresAt);
+    return deadline;
+  }
+
+  /** Single-flight token acquisition: refresh user tokens when possible,
+   *  fall back to the tenant token flow, or reuse a static token. */
+  private async obtainToken(): Promise<string> {
+    if (this.refreshToken && this.options.appId && this.options.appSecret) {
+      try {
+        return await this.refreshUserAccessToken();
+      } catch (error) {
+        if (error instanceof FeishuOAuthError && error.permanent) {
+          this.refreshToken = undefined;
+          await this.options.onRefreshInvalid?.(error.message);
+          throw new FeishuApiError("auth", `Feishu refresh token is no longer usable, re-authorization required: ${error.message}`, error.code);
+        }
+        // Transient failure (network, 5xx): the old token may still be inside
+        // its own validity window, so prefer it over failing the caller, and
+        // back off before attempting the next refresh.
+        if (this.token !== undefined && Date.now() < this.tokenExpiresAt) {
+          this.refreshCooldownUntil = Date.now() + REFRESH_RETRY_COOLDOWN_MS;
+          return this.token;
+        }
+        throw error;
+      }
     }
-    const response = await this.fetchImpl(`${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ app_id: this.options.appId, app_secret: this.options.appSecret }) });
+    if (!this.options.appId || !this.options.appSecret) {
+      // Static user access tokens carry no refresh capability; keep using the
+      // supplied one until Feishu rejects it.
+      if (this.token) return this.token;
+      throw new FeishuApiError("auth", "No Feishu credentials configured: provide a user access token or app id/secret");
+    }
+    return this.requestTenantToken();
+  }
+
+  /** Rotate the user access token via the OAuth v3 refresh endpoint. The old
+   *  refresh token dies server-side the moment this succeeds, so the new one
+   *  is persisted through onTokenRefresh before the promise resolves. */
+  private async refreshUserAccessToken(): Promise<string> {
+    const previousRefreshToken = this.refreshToken!;
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.accountsBaseUrl()}/oauth/v3/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: this.options.appId!,
+          client_secret: this.options.appSecret!,
+          refresh_token: previousRefreshToken
+        })
+      });
+    } catch (error) {
+      throw new FeishuOAuthError(networkError(error).message);
+    }
+    let body: { code?: number; access_token?: string; expires_in?: number; refresh_token?: string; refresh_token_expires_in?: number; error?: string; error_description?: string };
+    try {
+      body = await response.json() as typeof body;
+    } catch {
+      body = { error: `HTTP ${response.status}` };
+    }
+    if (!response.ok || body.code !== 0 || !body.access_token) {
+      const description = body.error_description ?? body.error ?? `HTTP ${response.status}`;
+      const permanent = body.code !== undefined && PERMANENT_REFRESH_OAUTH_CODES.has(body.code);
+      throw new FeishuOAuthError(description, body.code, permanent);
+    }
+    const tokenExpiresAt = Date.now() + Math.max(1, body.expires_in ?? 7200) * 1000;
+    const nextRefreshToken = body.refresh_token ?? previousRefreshToken;
+    const refreshTokenExpiresAt = body.refresh_token_expires_in !== undefined
+      ? Date.now() + body.refresh_token_expires_in * 1000
+      : this.refreshTokenExpiresAt;
+    this.token = body.access_token;
+    this.tokenExpiresAt = tokenExpiresAt;
+    this.refreshToken = nextRefreshToken;
+    this.refreshTokenExpiresAt = refreshTokenExpiresAt;
+    await this.options.onTokenRefresh?.({
+      accessToken: this.token,
+      refreshToken: nextRefreshToken,
+      tokenExpiresAt,
+      refreshTokenExpiresAt
+    });
+    return this.token;
+  }
+
+  /** The OAuth v3 token endpoint lives on the accounts host, not the API host:
+   *  open.feishu.cn -> accounts.feishu.cn, open.larksuite.com -> accounts.larksuite.com. */
+  private accountsBaseUrl(): string {
+    const mapped = this.baseUrl.replace(/^https:\/\/open\./, "https://accounts.");
+    return mapped === this.baseUrl ? "https://accounts.feishu.cn" : mapped;
+  }
+
+  private async requestTenantToken(): Promise<string> {
+    // Callers guarantee appId/appSecret exist; this is the tenant-token flow.
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ app_id: this.options.appId, app_secret: this.options.appSecret }) });
+    } catch (error) {
+      throw networkError(error);
+    }
     const envelope = await response.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
-    if (!envelope.tenant_access_token) throw new Error(`Feishu authentication failed: ${envelope.msg ?? "missing token"}`);
+    if (!envelope.tenant_access_token) {
+      throw new FeishuApiError(classifyFeishuFailure(envelope.code), `Feishu authentication failed: ${envelope.msg ?? "missing token"}`, envelope.code);
+    }
     this.token = envelope.tenant_access_token;
-    // Refresh one minute before the advertised expiry instead of never.
+    // Refresh five minutes before the advertised expiry instead of never.
     this.tokenExpiresAt = Date.now() + Math.max(0, envelope.expire ?? 7200) * 1000;
     return this.token;
+  }
+}
+
+/** Derive the expiry of a JWT user access token from its `exp` claim; opaque
+ *  (u-/t- style) tokens are treated as never expiring so the provider keeps
+ *  the legacy "use until Feishu rejects it" behavior. */
+function parseJwtExpiresAt(token: string): number {
+  const parts = token.split(".");
+  if (parts.length !== 3) return Number.POSITIVE_INFINITY;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as { exp?: number };
+    return typeof payload.exp === "number" && payload.exp > 0 ? payload.exp * 1000 : Number.POSITIVE_INFINITY;
+  } catch {
+    return Number.POSITIVE_INFINITY;
   }
 }

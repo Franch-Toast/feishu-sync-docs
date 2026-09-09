@@ -14,6 +14,12 @@ export class FakeRemote implements RemoteProvider {
   readonly name = "fake";
   readonly capabilities: ProviderCapabilities = { blockPatch: true, revisionGuard: true, assetUpload: true, remoteEvents: false };
   readonly documents = new Map<string, RemoteDocument>();
+  readonly folders = new Map<string, RemoteNode>();
+  /** Mirrors Feishu's behaviour of deriving the drive-visible title from the
+   *  markdown H1 instead of keeping the file name passed to createDocument. */
+  simulateH1Title = false;
+  listTreeCalls = 0;
+  createFolderCalls = 0;
   private revision = 0;
   private pendingWriteError?: Error;
 
@@ -30,7 +36,8 @@ export class FakeRemote implements RemoteProvider {
   }
 
   async listTree(root: SyncRoot): Promise<RemoteTree> {
-    return { root: { token: root.remoteToken, name: "root", type: "folder", parentToken: "" }, nodes: [...this.documents.values()] };
+    this.listTreeCalls += 1;
+    return { root: { token: root.remoteToken, name: "root", type: "folder", parentToken: "" }, nodes: [...this.folders.values(), ...this.documents.values()] };
   }
 
   async getDocument(token: string): Promise<RemoteDocument> {
@@ -40,7 +47,10 @@ export class FakeRemote implements RemoteProvider {
   }
 
   async createFolder(parentToken: string, name: string): Promise<RemoteNode> {
-    return { token: `${parentToken}/${name}`, name, type: "folder", parentToken };
+    this.createFolderCalls += 1;
+    const node = { token: `${parentToken}/${name}`, name, type: "folder" as const, parentToken };
+    this.folders.set(node.token, node);
+    return node;
   }
 
   async createDocument(parentToken: string, name: string, content: string): Promise<RemoteDocument> {
@@ -83,9 +93,10 @@ export class FakeRemote implements RemoteProvider {
 
   private makeDocument(token: string, parentToken: string, name: string, content: string): RemoteDocument {
     const parsed = parseMarkdown(content);
+    const displayName = this.simulateH1Title ? parsed.title ?? name : name;
     return {
       token,
-      name,
+      name: displayName,
       type: "document",
       parentToken,
       content,
