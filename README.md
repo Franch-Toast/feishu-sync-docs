@@ -13,12 +13,12 @@
 - 同时修改同一块内容时不覆盖任一侧，冲突会在网页工作台中保留 base/local/remote 三个版本；解决前会再次校验远端 revision，避免使用过期内容覆盖新修改；
 - 冲突支持"暂不处理"：决定会持久化到状态库，条目重新进入待评估队列，后续轮询基于最新三方数据重新判断；
 - 同步失败的条目会标记为 error 并在操作日志中留痕，后续轮询会自动重试；
-- 凭证保存在本地 SQLite 中并在浏览器设置页管理（用户 Token / 应用凭证 / lark-cli 三种模式），保存后 provider 热重建立即生效，支持一键联通测试；
+- 凭证保存在本地配置文件中并在浏览器设置页管理（用户 Token / 应用凭证 / lark-cli 三种模式），保存后 provider 热重建立即生效，支持一键联通测试；
 - 飞书返回认证错误时自动暂停同步：顶栏徽章告警、WebSocket 广播并弹出修复引导，按认证方式深链到 API 调试台或开发者后台，粘贴新 Token 保存后自动重测并恢复。
 
 ## 环境要求
 
-- Node.js >= 23.4：状态存储使用 Node 内置 `node:sqlite` 模块，安装依赖无需编译任何原生模块；
+- Node.js >= 20：存储层使用 `isomorphic-git`（纯 JS）+ JSON 文件，安装依赖无需编译任何原生模块；
 - pnpm：可通过 `corepack enable` 启用。
 
 ## 当前范围
@@ -27,7 +27,7 @@
 
 内容模型聚焦常见 Markdown 段落、标题、列表、引用、代码块、链接和图片。复杂富文本、表格、画板等结构如果不能安全映射，会采用整篇更新或产生错误，不会静默伪造块 ID。删除采用保守策略：本地或远端缺失先标记为 orphan；真正删除远端对象需要通过带确认字段的 API 操作。
 
-远端实时事件接口暂未接入，服务目前使用本地文件事件加定时轮询；因此 `pollIntervalMs` 是必要的容错机制。远端连续修改不会让本地反复覆盖：每次同步都基于持久化基线做三方判断，冲突则暂停该文档，直到网页端解决。
+远端实时事件推送已接入：服务通过飞书开放平台 SDK 的 WebSocket 长连接订阅云盘文件事件，远端文档变更即时触发同步；定时轮询保留作为兜底，`pollIntervalMs` 仍是网络抖动下的容错机制。远端连续修改不会让本地反复覆盖：每次同步都基于持久化基线做三方判断，冲突则暂停该文档，直到网页端解决。
 
 ## Quick start
 
@@ -70,6 +70,18 @@ export LARK_CLI_BIN=lark-cli
 
 CLI 路径支持 `LARK_CLI_BIN`（优先）或旧名 `LARK_CLI_PATH`。
 
+### 实时事件推送配置
+
+配置应用凭证（App ID + App Secret）后，服务会自动尝试与飞书建立长连接订阅云盘文件事件；连接状态显示在设置页与 `/api/health` 中。完整分步指引也可在「设置 → 飞书凭证」的事件通道提示区点击「查看配置指引」打开：
+
+1. **创建企业自建应用**：在 [飞书开发者后台](https://open.feishu.cn/app) 创建企业自建应用，记录 App ID / App Secret；
+2. **开通云空间文档权限**：在「权限管理」中申请云文档读写权限（如 `docx:document`、`drive:drive`）；
+3. **事件订阅选「长连接」并订阅 drive 文件事件**：在「事件与回调」页将接收方式切换为「使用长连接接收事件」，订阅云文档 drive 文件事件（`drive.file.*` 系列），无需公网回调地址；
+4. **发布版本**：在「版本管理与发布」中创建版本并发布应用，事件订阅只有发布后才会生效；
+5. **回填 App ID / App Secret**：回到设置页填写并保存，服务自动建立长连接；状态变为「已连接」即成功，轮询仍作为兜底继续运行。
+
+事件通道异常时（状态 `error`），设置页会按错误内容给出排查建议：常见原因包括事件未订阅、应用版本未发布、云文档权限未开通与服务器网络受限。未配置应用凭证或选择 lark-cli 模式时事件通道保持 `disabled`，同步完全由文件监听与轮询驱动，不影响功能。
+
 当前本地 CLI 适配器兼容旧版 CLI 的整篇 Markdown 更新；只有安装了支持 v2 文档命令的 CLI 时才设置 `LARK_CLI_API_VERSION=v2`，并由 CLI 适配器尝试块级命令。图片上传和远端目录遍历优先使用 OpenAPI provider。
 
 在网页中添加本地目录和云盘文件夹 token，本地路径必须真实存在，否则 API 返回 400。也可以直接调用 API：
@@ -92,14 +104,17 @@ curl -X POST http://127.0.0.1:8787/api/roots \
 
 运行时配置：
 
-- `SYNC_DB_PATH`：SQLite 状态库路径，默认 `.data/sync.db`；
+- `SYNC_CONFIG_PATH`：全局配置文件（凭证 + 偏好）路径，默认 `~/.feishu-sync-docs/config.json`；
+- `SYNC_LOG_LEVEL`：日志级别（`debug`/`info`/`warn`/`error`），优先于设置页中保存的全局偏好；
 - `FEISHU_BASE_URL`：飞书或 Lark API 地址，默认 `https://open.feishu.cn`；
 - `HOST`、`PORT`：服务监听地址和端口，默认 `127.0.0.1:8787`；
-- 凭证类环境变量（`FEISHU_ACCESS_TOKEN`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`LARK_CLI_BIN` 及旧名 `LARK_CLI_PATH`）仍作为 fallback 生效，浏览器设置页保存的数据库配置优先于环境变量。
+- 凭证类环境变量（`FEISHU_ACCESS_TOKEN`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`LARK_CLI_BIN` 及旧名 `LARK_CLI_PATH`）仍作为 fallback 生效，浏览器设置页保存的配置优先于环境变量。
+
+每个绑定的本地目录会被初始化为一个 Git 仓库（`.git/`），文档内容与版本历史存储在 Git 中；同步元数据（bindings、blocks、operations、conflicts）保存在同目录下的 `.feishu-sync/` JSON 文件中，`.gitignore` 会自动忽略该目录。
 
 ## 安全与数据
 
-- 凭证（user token、app secret）以明文保存在本地 SQLite（默认 `.data/sync.db`）中，这是本地优先设计的取舍：请确保该文件仅当前用户可读，必要时通过 `SYNC_DB_PATH` 将其置于用户私有目录；
+- 凭证（user token、app secret）以明文保存在本地配置文件 `~/.feishu-sync-docs/config.json` 中（权限 0600），这是本地优先设计的取舍：请确保该目录仅当前用户可读，必要时通过 `SYNC_CONFIG_PATH` 将其置于用户私有目录；
 - 所有 API 返回的凭证均为脱敏形式（token 仅显示前 6 后 4 位），完整凭证不会回显到浏览器，也不会写入日志；
 - 服务默认只监听 `127.0.0.1:8787`，如需局域网访问请自行置于反向代理并增加认证；
 - 本地文件端点 `GET /api/roots/:id/file` 严格防路径穿越：resolve 后必须仍在对应根目录内，否则返回 403；
@@ -114,13 +129,13 @@ local watcher + poller       web UI / REST / WebSocket
              sync runtime queue
                       |
        core: model, Markdown, hash, merge, policy
-             /                         \\
-   filesystem + SQLite          RemoteProvider
-                                  /          \\
+             /                         \
+   filesystem + GitStorage      RemoteProvider
+   (isomorphic-git + JSON)       /          \
                          Feishu OpenAPI   lark-cli
 ```
 
-`packages/core` 不依赖飞书 SDK，负责规范化、哈希、三方合并、资源引用和块补丁规划。`packages/storage` 负责基于 Node 内置 `node:sqlite` 的 SQLite 持久化。`packages/feishu` 只实现远端能力。`packages/server` 负责常驻进程（支持 SIGINT/SIGTERM 优雅退出）、文件监听、任务串行化、API 和冲突生命周期；凭证由 `CredentialStore` 统一管理（数据库设置优先于环境变量），远端 provider 经由注册表按需热重建，设置变更后无需重启进程。后续增加其他远端或本地来源时，优先新增 provider，不修改同步核心。
+`packages/core` 不依赖飞书 SDK，负责规范化、哈希、三方合并、资源引用和块补丁规划。`packages/storage` 基于 `isomorphic-git` 管理文档内容与版本历史（GitStorage），并以 JSON 文件存储 bindings、blocks、operations、conflicts 等同步元数据（MetaStorage）。`packages/feishu` 只实现远端能力。`packages/server` 负责常驻进程（支持 SIGINT/SIGTERM 优雅退出）、文件监听、任务串行化、API 和冲突生命周期；凭证由 `CredentialStore` 统一管理（配置文件优先于环境变量），远端 provider 经由注册表按需热重建，设置变更后无需重启进程。后续增加其他远端或本地来源时，优先新增 provider，不修改同步核心。
 
 ## Development
 
@@ -130,4 +145,4 @@ pnpm typecheck
 pnpm build
 ```
 
-测试覆盖 Markdown 解析和引用改写、三方合并和块补丁规划、SQLite 状态迁移（含 settings KV 表）、OpenAPI 请求与 revision 校验、飞书错误码到 `FeishuApiError` 的语义分类（auth/permission/rate_limit/network）、CLI 适配器、资源绑定、同步运行时和 HTTP API（含设置读写与脱敏、联通测试、根目录 PATCH 热生效、本地文件端点路径穿越拒绝、资产代理、统计与基线恢复）。浏览器端使用 vitest 覆盖 diff 封装（行级/词级分块、hunk 合并与重叠检测）和 Markdown 渲染（代码高亮、相对图片代理重写）。生产环境还应补充飞书租户权限、限流、超大文档和复杂富文本的集成测试。
+测试覆盖 Markdown 解析和引用改写、三方合并和块补丁规划、GitStorage/MetaStorage 持久化、OpenAPI 请求与 revision 校验、飞书错误码到 `FeishuApiError` 的语义分类（auth/permission/rate_limit/network）、CLI 适配器、资源绑定、同步运行时和 HTTP API（含设置读写与脱敏、联通测试、根目录 PATCH 热生效、本地文件端点路径穿越拒绝、资产代理、统计与基线恢复）。浏览器端使用 vitest 覆盖 diff 封装（行级/词级分块、hunk 合并与重叠检测）和 Markdown 渲染（代码高亮、相对图片代理重写）。生产环境还应补充飞书租户权限、限流、超大文档和复杂富文本的集成测试。

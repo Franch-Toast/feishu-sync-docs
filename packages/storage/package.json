@@ -10,7 +10,8 @@
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@feishu-sync/core": "workspace:*"
+    "@feishu-sync/core": "workspace:*",
+    "isomorphic-git": "^1.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FilesystemProvider, SyncEngine } from "@feishu-sync/core";
 import type { DocumentPatch, MutationResult, ProviderCapabilities, RemoteAsset, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, SyncRoot } from "@feishu-sync/core";
-import { SqliteStateStore } from "@feishu-sync/storage";
+import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
 
 class InlineRemote implements RemoteProvider {
   readonly name = "inline-memory";
@@ -27,17 +27,23 @@ class InlineRemote implements RemoteProvider {
 
 test("uploads relative images as document resources and stores bindings", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-assets-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-assets-global-"));
   await writeFile(join(directory, "image.png"), Buffer.from("image"));
   await writeFile(join(directory, "notes.md"), "# Notes\n\n![diagram](image.png)");
-  const store = new SqliteStateStore();
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new InlineRemote();
-  const root = await store.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
-  const engine = new SyncEngine(store, new FilesystemProvider(), remote);
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
   const scan = await engine.scan(root);
   const documentEntry = scan.entries.find((entry) => entry.kind === "document")!;
   await engine.syncEntry(documentEntry, root);
-  const bindings = await store.getAssetBindings(documentEntry.id);
+  const bindings = await metaStorage.getAssetBindings(documentEntry.entryId);
   assert.equal(bindings.length, 1);
-  assert.match(remote.get((await store.getEntry(documentEntry.id))!.remoteToken!)?.content ?? "", /inline-/);
-  store.close();
+  const updatedBinding = await metaStorage.findBindingById(documentEntry.entryId);
+  assert.match(remote.get(updatedBinding!.remoteToken!)?.content ?? "", /inline-/);
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
 });

@@ -1,1 +1,2 @@
-export * from "./sqlite.js";
+export * from "./git.js";
+export * from "./meta.js";

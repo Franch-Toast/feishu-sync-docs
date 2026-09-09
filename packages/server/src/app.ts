@@ -4,26 +4,26 @@ import fastifyWebsocket from "@fastify/websocket";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { FilesystemProvider, SyncEngine } from "@feishu-sync/core";
-import type { RemoteProvider, StateStore } from "@feishu-sync/core";
-import { SqliteStateStore } from "@feishu-sync/storage";
-import { createRemoteProvider, ProviderRegistry } from "./provider.js";
+import { FilesystemProvider } from "@feishu-sync/core";
+import type { GitStorage, MetaStorage, RemoteProvider } from "@feishu-sync/core";
+import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
+import { ProviderRegistry } from "./provider.js";
 import { CredentialStore, type CredentialInput } from "./credentials.js";
-import { AppConfigStore, migrateLegacyDatabase, resolveDatabasePath, resolveLegacyDatabasePath, type LogLevel } from "./appconfig.js";
+import { AppConfigStore, type LogLevel } from "./appconfig.js";
 import { SyncRuntime } from "./runtime.js";
 import { EventChannelService } from "./eventchannel.js";
 
 export interface AppOptions {
-  store?: StateStore;
+  gitStorage?: GitStorage;
+  metaStorage?: MetaStorage;
   remote?: RemoteProvider;
   credentials?: CredentialStore;
   publicDir?: string;
-  databasePath?: string;
   /** Injected by tests/embedding; defaults to ~/.feishu-sync-docs/config.json. */
   appConfig?: AppConfigStore;
 }
 
-export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime: SyncRuntime; store: StateStore; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore } {
+export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime: SyncRuntime; gitStorage: GitStorage; metaStorage: MetaStorage; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore } {
   const appConfig = options.appConfig ?? new AppConfigStore();
   const app = Fastify({ logger: process.env.NODE_ENV === "test" ? false : { level: process.env.SYNC_LOG_LEVEL ?? appConfig.preferences.logLevel } });
   // Tolerate body-less requests that still carry the JSON content-type (e.g.
@@ -33,20 +33,19 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (body === "" || body === undefined) return done(null, undefined);
     try { done(null, JSON.parse(body)); } catch (error) { done(error as Error); }
   });
-  const databasePath = options.databasePath ?? process.env.SYNC_DB_PATH ?? resolveDatabasePath();
-  // Default-path deployments adopt the legacy <cwd>/.data/sync.db exactly once:
-  // only when no explicit store/path was requested and the target is still empty.
-  if (!options.store && !options.databasePath && migrateLegacyDatabase(databasePath)) {
-    app.log.info({ from: resolveLegacyDatabasePath(), to: databasePath }, "migrated legacy sync.db into the new default data directory");
-  }
-  const store = options.store ?? new SqliteStateStore(databasePath);
+  
+  // Initialize storage layers
+  const gitStorage = options.gitStorage ?? new GitStorageImpl();
+  const metaStorage = options.metaStorage ?? new JsonMetaStorage(appConfig.configPath.replace('/config.json', ''));
+  
   const credentials = options.credentials ?? new CredentialStore(appConfig, undefined, undefined, app.log);
   // When a remote is injected (tests/embedding) it is used as-is; otherwise a
   // registry rebuilds the provider from stored credentials on every save.
   const registry = options.remote ? undefined : new ProviderRegistry(credentials);
   const remote = options.remote ?? registry!;
   const runtime = new SyncRuntime(
-    store,
+    gitStorage,
+    metaStorage,
     new FilesystemProvider(),
     remote,
     registry ? () => registry.rebuild().then(() => undefined) : undefined,
@@ -57,8 +56,8 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     appConfig
   );
   // Long-lived drive event subscription; polling stays enabled as the fallback.
-  const eventChannel = new EventChannelService(credentials, store, runtime, app.log);
-  Object.assign(app, { runtime, store, credentials, registry, eventChannel, appConfig });
+  const eventChannel = new EventChannelService(credentials, metaStorage, runtime, app.log);
+  Object.assign(app, { runtime, gitStorage, metaStorage, credentials, registry, eventChannel, appConfig });
 
   void app.register(fastifyWebsocket);
   const defaultPublicDir = join(dirname(fileURLToPath(import.meta.url)), "../public");
@@ -93,17 +92,17 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
   // ---- Global preferences (config.json; never exposes credential fields) --
   app.get("/api/app-config", async () => ({
     preferences: appConfig.preferences,
-    paths: { config: appConfig.configPath, database: databasePath }
+    paths: { config: appConfig.configPath }
   }));
   app.put<{ Body: { defaultPollIntervalMs?: number; logLevel?: LogLevel } }>("/api/app-config", async (request) => {
     const preferences = await appConfig.setPreferences(request.body ?? {});
     // Apply the new verbosity live unless the env override wins.
     if (process.env.SYNC_LOG_LEVEL === undefined) app.log.level = preferences.logLevel;
     runtime.broadcastEvent({ type: "settings-updated" });
-    return { preferences, paths: { config: appConfig.configPath, database: databasePath } };
+    return { preferences, paths: { config: appConfig.configPath } };
   });
 
-  app.get("/api/roots", async () => store.listRoots());
+  app.get("/api/roots", async () => metaStorage.listRoots());
   app.post<{ Body: { localPath: string; remoteToken: string; remoteType?: "folder" | "wiki"; pollIntervalMs?: number } }>("/api/roots", async (request, reply) => {
     const body = request.body;
     if (!body || typeof body.localPath !== "string" || !body.localPath.trim() || typeof body.remoteToken !== "string" || !body.remoteToken.trim()) {
@@ -114,7 +113,10 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (!existsSync(body.localPath) || !statSync(body.localPath).isDirectory()) {
       return reply.code(400).send({ error: "localPath must point to an existing directory" });
     }
-    const root = await store.createRoot({ localPath: body.localPath, remoteToken: body.remoteToken, remoteType: body.remoteType ?? "folder", enabled: true, pollIntervalMs });
+    const root = await metaStorage.createRoot({ localPath: body.localPath, remoteToken: body.remoteToken, remoteType: body.remoteType ?? "folder", enabled: true, pollIntervalMs });
+    // Initialize Git repo and meta storage for the new root
+    await gitStorage.initRoot(root);
+    await metaStorage.initRootMeta(root.id, root.localPath);
     runtime.startRoot(root);
     runtime.broadcastEvent({ type: "root-updated", rootId: root.id });
     return reply.code(201).send(root);
@@ -136,15 +138,16 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     // Broadcast before the removal so subscribers can drop the root while its
     // id is still resolvable (design contract: root created/updated/deleted
     // events all emit root-updated).
-    const root = await store.getRoot(request.params.id);
+    const root = await metaStorage.getRoot(request.params.id);
     runtime.stopRoot(request.params.id);
-    await store.deleteRoot(request.params.id);
+    await metaStorage.deleteRoot(request.params.id);
+    await gitStorage.deleteRoot(request.params.id);
     if (root) runtime.broadcastEvent({ type: "root-updated", rootId: root.id });
     return reply.code(204).send();
   });
   app.patch<{ Params: { id: string }; Body: { localPath?: string; remoteToken?: string; enabled?: boolean; pollIntervalMs?: number } }>("/api/roots/:id", async (request, reply) => {
     const body = request.body ?? {};
-    const current = await store.getRoot(request.params.id);
+    const current = await metaStorage.getRoot(request.params.id);
     if (!current) return reply.code(404).send({ error: "root not found" });
     if (body.pollIntervalMs !== undefined && (!Number.isFinite(body.pollIntervalMs) || body.pollIntervalMs < 1000)) {
       return reply.code(400).send({ error: "pollIntervalMs must be at least 1000ms" });
@@ -152,7 +155,7 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (body.localPath !== undefined && (!existsSync(body.localPath) || !statSync(body.localPath).isDirectory())) {
       return reply.code(400).send({ error: "localPath must point to an existing directory" });
     }
-    const next = await store.updateRoot(request.params.id, body);
+    const next = await metaStorage.updateRoot(request.params.id, body);
     // Hot-apply interval/enabled changes to the watcher and poll timer.
     runtime.restartRoot(next);
     runtime.broadcastEvent({ type: "root-updated", rootId: next.id });
@@ -160,23 +163,22 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
   });
   app.get<{ Params: { id: string } }> ("/api/roots/:id/tree", async (request) => runtime.getTree(request.params.id));
   app.get<{ Params: { id: string } }>("/api/roots/:id/stats", async (request, reply) => {
-    const root = await store.getRoot(request.params.id);
+    const root = await metaStorage.getRoot(request.params.id);
     if (!root) return reply.code(404).send({ error: "root not found" });
-    const entries = await store.listEntries(root.id);
-    const entryRoot = new Map(entries.map((entry) => [entry.id, entry.rootId]));
-    const operations = (await store.listOperations(500)).filter((operation) => operation.entryId !== undefined && entryRoot.get(operation.entryId) === root.id);
+    const bindings = await metaStorage.listBindings(root.id);
+    const operations = (await metaStorage.listOperations(500)).filter((operation) => operation.rootId === root.id);
     const dayAgo = Date.now() - 86_400_000;
     const succeeded24h = operations.filter((operation) => operation.status === "succeeded" && Date.parse(operation.createdAt) >= dayAgo).length;
     const failed24h = operations.filter((operation) => operation.status === "failed" && Date.parse(operation.createdAt) >= dayAgo).length;
     const lastSuccess = operations.find((operation) => operation.status === "succeeded" && operation.completedAt);
     const counts: Record<string, number> = {};
-    for (const entry of entries) counts[entry.status] = (counts[entry.status] ?? 0) + 1;
+    for (const binding of bindings) counts[binding.status] = (counts[binding.status] ?? 0) + 1;
     return reply.send({
       lastSyncAt: lastSuccess?.completedAt,
       succeeded24h,
       failed24h,
-      conflicts: (await store.listConflicts("open")).length,
-      entriesTotal: entries.length,
+      conflicts: (await metaStorage.listConflicts("open")).length,
+      entriesTotal: bindings.length,
       entriesByStatus: counts
     });
   });
@@ -186,7 +188,7 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     ".pdf": "application/pdf", ".mp4": "video/mp4", ".mp3": "audio/mpeg", ".txt": "text/plain; charset=utf-8"
   };
   app.get<{ Params: { id: string }; Querystring: { path?: string } }>("/api/roots/:id/file", async (request, reply) => {
-    const root = await store.getRoot(request.params.id);
+    const root = await metaStorage.getRoot(request.params.id);
     if (!root) return reply.code(404).send({ error: "root not found" });
     const relative = request.query.path;
     if (!relative) return reply.code(400).send({ error: "path query parameter is required" });
@@ -202,10 +204,19 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
   app.get<{ Params: { token: string } }>("/api/assets/:token", async (request, reply) => {
     // Only entries registered as synced assets may be proxied (design §6);
     // document tokens must not be downloadable through this endpoint.
-    const entry = await store.findEntryByRemoteToken(request.params.token);
-    if (!entry || entry.kind !== "asset") return reply.code(404).send({ error: "unknown asset token" });
+    // Search all roots for the asset binding
+    const roots = await metaStorage.listRoots();
+    let foundBinding;
+    for (const root of roots) {
+      const binding = await metaStorage.findBindingByToken(root.id, request.params.token);
+      if (binding && binding.kind === "asset") {
+        foundBinding = binding;
+        break;
+      }
+    }
+    if (!foundBinding) return reply.code(404).send({ error: "unknown asset token" });
     const content = await remote.downloadAsset(request.params.token);
-    reply.header("content-type", MIME_TYPES[extname(entry.relativePath).toLowerCase()] ?? "application/octet-stream");
+    reply.header("content-type", MIME_TYPES[extname(foundBinding.relativePath).toLowerCase()] ?? "application/octet-stream");
     reply.header("cache-control", "public, max-age=300");
     return reply.send(Buffer.from(content));
   });
@@ -218,23 +229,23 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     return runtime.setEntryIgnored(request.params.id, request.body.ignored);
   });
   app.post<{ Params: { id: string } }>("/api/roots/:id/sync-missing", async (request, reply) => {
-    const root = await store.getRoot(request.params.id);
+    const root = await metaStorage.getRoot(request.params.id);
     if (!root) return reply.code(404).send({ error: "root not found" });
     return runtime.syncMissingEntries(request.params.id);
   });
   app.get<{ Querystring: { status?: string } }>("/api/conflicts", async (request) => {
     const status = request.query.status;
     const list = status === "all"
-      ? await store.listConflicts()
-      : await store.listConflicts(status === "resolved" || status === "aborted" ? status : "open");
+      ? await metaStorage.listConflicts()
+      : await metaStorage.listConflicts(status === "resolved" || status === "aborted" ? status : "open");
     return Promise.all(list.map(async (conflict) => {
-      const entry = await store.getEntry(conflict.entryId);
-      const root = entry ? await store.getRoot(entry.rootId) : undefined;
-      return { ...conflict, relativePath: entry?.relativePath, localRoot: root?.localPath, rootId: entry?.rootId };
+      const binding = await metaStorage.findBindingById(conflict.entryId);
+      const root = binding ? await metaStorage.getRoot(binding.rootId) : undefined;
+      return { ...conflict, relativePath: binding?.relativePath, localRoot: root?.localPath, rootId: binding?.rootId };
     }));
   });
   app.get<{ Params: { id: string } }>("/api/conflicts/:id", async (request, reply) => {
-    const conflict = await store.getConflict(request.params.id);
+    const conflict = await metaStorage.getConflict(request.params.id);
     return conflict ? conflict : reply.code(404).send({ error: "conflict not found" });
   });
   app.post<{ Params: { id: string }; Body: { resolution: "local" | "remote" | "merged" | "abort"; mergedContent?: string } }>("/api/conflicts/:id/resolve", async (request, reply) => {
@@ -245,17 +256,17 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (body.resolution === "merged" && typeof body.mergedContent !== "string") {
       return reply.code(400).send({ error: "mergedContent is required for merged resolution" });
     }
-    const conflict = await store.getConflict(request.params.id);
+    const conflict = await metaStorage.getConflict(request.params.id);
     if (!conflict) return reply.code(404).send({ error: "conflict not found" });
     const resolved = await runtime.resolveConflict(conflict, body);
     return reply.send(resolved);
   });
   app.get("/api/operations", async () => {
-    const operations = await store.listOperations();
+    const operations = await metaStorage.listOperations();
     // Join entry/root info so the history view can filter by root and retry.
     return Promise.all(operations.map(async (operation) => {
-      const entry = operation.entryId ? await store.getEntry(operation.entryId) : undefined;
-      return { ...operation, rootId: entry?.rootId, relativePath: entry?.relativePath };
+      const binding = operation.entryId ? await metaStorage.findBindingById(operation.entryId) : undefined;
+      return { ...operation, rootId: operation.rootId ?? binding?.rootId, relativePath: binding?.relativePath };
     }));
   });
   app.post<{ Body: { keepOperations?: number; keepOperationHours?: number; resolvedConflictDays?: number } }>("/api/maintenance/prune", async (request) => {
@@ -276,8 +287,6 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
   app.addHook("onClose", async () => {
     runtime.stop();
     eventChannel.stop();
-    const close = (store as StateStore & { close?: () => void }).close;
-    close?.call(store);
   });
-  return app as unknown as FastifyInstance & { runtime: SyncRuntime; store: StateStore; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore };
+  return app as unknown as FastifyInstance & { runtime: SyncRuntime; gitStorage: GitStorage; metaStorage: MetaStorage; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore };
 }

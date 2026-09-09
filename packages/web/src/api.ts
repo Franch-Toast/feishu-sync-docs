@@ -142,7 +142,7 @@ export interface AppConfigPreferences {
 /** GET /api/app-config: global preferences plus the resolved storage paths. */
 export interface AppConfigView {
   preferences: AppConfigPreferences;
-  paths: { config: string; database: string };
+  paths: { config: string };
 }
 
 export interface AppConfigPatch {

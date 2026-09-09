@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -12,7 +12,7 @@ export interface AppConfigPreferences {
 }
 
 /** Full config.json shape. Credentials live next to the global preferences so
- *  sync.db stays a pure sync-state database (user decision: "并入 config.json"). */
+ *  the config file stays the single source of truth (user decision: "并入 config.json"). */
 export interface AppConfigDocument {
   version: 1;
   credentials: Record<string, string>;
@@ -33,33 +33,6 @@ export function resolveAppDataDir(): string {
   return join(homedir(), ".feishu-sync-docs");
 }
 
-/** sync.db location: SYNC_DB_PATH wins, else <app data dir>/sync.db. */
-export function resolveDatabasePath(): string {
-  if (process.env.SYNC_DB_PATH) return resolve(process.env.SYNC_DB_PATH);
-  return join(resolveAppDataDir(), "sync.db");
-}
-
-/** Database location used before the central data directory existed. */
-export function resolveLegacyDatabasePath(): string {
-  return resolve(process.cwd(), ".data", "sync.db");
-}
-
-/** Copy the legacy <cwd>/.data/sync.db (plus wal/shm sidecars) to the new
- *  default location. Only meant for default-path deployments: an explicit
- *  SYNC_DB_PATH means the operator manages their own layout and nothing is
- *  moved. Returns true when a migration happened. */
-export function migrateLegacyDatabase(targetPath: string): boolean {
-  if (process.env.SYNC_DB_PATH) return false;
-  const legacy = resolveLegacyDatabasePath();
-  if (!existsSync(legacy) || existsSync(targetPath)) return false;
-  mkdirSync(dirname(targetPath), { recursive: true });
-  for (const suffix of ["", "-wal", "-shm"]) {
-    const source = legacy + suffix;
-    if (existsSync(source)) copyFileSync(source, targetPath + suffix);
-  }
-  return true;
-}
-
 /** Auth flag storage consumed by the runtime (previously the settings table;
  *  now part of config.json credentials). */
 export interface AuthStateStore {
@@ -69,8 +42,7 @@ export interface AuthStateStore {
 
 /** Read-write view over config.json: global preferences plus Feishu
  *  credentials. Writes are atomic (tmp file + rename) and the file is chmod
- *  0600 because it stores tokens in plain text — the same trade-off as the
- *  previous SQLite storage, documented in the README. */
+ *  0600 because it stores tokens in plain text, documented in the README. */
 export class AppConfigStore implements AuthStateStore {
   readonly configPath: string;
   private cache: AppConfigDocument | undefined;

@@ -301,7 +301,7 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
             {LOG_LEVELS.map((level) => <option key={level} value={level}>{LOG_LEVEL_LABELS[level]}</option>)}
           </select>
         </label>
-        <p className="muted form-hint">SYNC_LOG_LEVEL 环境变量优先于这里的日志级别；绑定根目录时留空轮询间隔将使用默认值。配置文件：{appConfig?.paths.config ?? "~/.feishu-sync-docs/config.json"}；数据库：{appConfig?.paths.database ?? "~/.feishu-sync-docs/sync.db"}。</p>
+        <p className="muted form-hint">SYNC_LOG_LEVEL 环境变量优先于这里的日志级别；绑定根目录时留空轮询间隔将使用默认值。配置文件：{appConfig?.paths.config ?? "~/.feishu-sync-docs/config.json"}。</p>
         <div className="form-actions">
           <button className="primary" disabled={prefBusy} onClick={() => void savePreferences()}>保存偏好</button>
         </div>

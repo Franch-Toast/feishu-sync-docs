@@ -7,7 +7,7 @@ await app.eventChannel.start();
 await app.listen({ host: process.env.HOST ?? "127.0.0.1", port });
 console.log(`Feishu Local Sync listening on http://${process.env.HOST ?? "127.0.0.1"}:${port}`);
 
-// Graceful shutdown: close the HTTP server, stop watchers/timers and flush the SQLite store.
+// Graceful shutdown: close the HTTP server and stop watchers/timers.
 let shuttingDown = false;
 async function shutdown(): Promise<void> {
   if (shuttingDown) return;

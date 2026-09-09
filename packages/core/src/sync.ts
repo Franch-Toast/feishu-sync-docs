@@ -4,7 +4,7 @@ import { buildBlockPatch, decideSync } from "./merge.js";
 import { parseMarkdown, restoreAssetReferences, restoreInternalLinks, rewriteAssetReferences, rewriteInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
 import type {
-  LocalProvider, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, StateStore, SyncEntry, SyncRoot
+  EntryBinding, GitStorage, LocalProvider, MetaStorage, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, SyncRoot, SyncTrigger
 } from "./types.js";
 
 export class SyncEngine {
@@ -16,15 +16,16 @@ export class SyncEngine {
   private static readonly REMOTE_TREE_TTL_MS = 60_000;
 
   constructor(
-    private readonly store: StateStore,
+    private readonly gitStorage: GitStorage,
+    private readonly metaStorage: MetaStorage,
     private readonly local: LocalProvider,
     private readonly remote: RemoteProvider
   ) {}
 
-  async scan(root: SyncRoot): Promise<{ entries: SyncEntry[]; conflicts: number }> {
+  async scan(root: SyncRoot, trigger: SyncTrigger = 'manual'): Promise<{ entries: EntryBinding[]; conflicts: number }> {
     let files = await this.local.scan(root);
-    const initialEntries = await this.store.listEntries(root.id);
-    const existingByPath = new Map(initialEntries.map((entry) => [entry.relativePath, entry]));
+    const initialBindings = await this.metaStorage.listBindings(root.id);
+    const existingByPath = new Map(initialBindings.map((binding) => [binding.relativePath, binding]));
     let localByPath = new Map(files.map((file) => [file.relativePath, file]));
     const changedAssets: string[] = [];
 
@@ -33,28 +34,27 @@ export class SyncEngine {
       // Ignored entries keep their single-side state: neither hashes nor
       // status are re-evaluated until the user restores them.
       if (existing?.ignoredAt) continue;
-      const changed = existing?.localHash !== file.contentHash;
+      const changed = existing?.remoteContentHash !== file.contentHash;
       const status = existing?.status === "conflict"
         ? "conflict"
         : changed || existing?.status === "error"
           ? "pending"
           : existing?.status ?? "pending";
-      const entry: SyncEntry = {
-        id: existing?.id ?? randomUUID(),
+      const binding: EntryBinding = {
+        entryId: existing?.entryId ?? randomUUID(),
         rootId: root.id,
         relativePath: file.relativePath,
         kind: file.kind,
         remoteToken: existing?.remoteToken,
         remoteParentToken: existing?.remoteParentToken,
         status,
-        localHash: file.contentHash,
-        remoteHash: existing?.remoteHash,
-        baseHash: existing?.baseHash,
-        localRevision: existing?.localRevision,
         remoteRevision: existing?.remoteRevision,
+        remoteContentHash: file.contentHash,
+        ignoredAt: existing?.ignoredAt,
+        lastSyncCommit: existing?.lastSyncCommit,
         updatedAt: new Date().toISOString()
       };
-      await this.store.upsertEntry(entry);
+      await this.metaStorage.setBinding(root.id, file.relativePath, binding);
       if (file.kind === "asset" && changed && existing?.remoteToken) changedAssets.push(file.relativePath);
     }
 
@@ -66,13 +66,13 @@ export class SyncEngine {
     for (const node of remoteTree.nodes.filter((item) => item.type === "document")) {
       const relativePath = remoteDocumentPaths.get(node.token);
       if (!relativePath) continue;
-      const alreadyBound = initialEntries.some((entry) => entry.remoteToken === node.token);
+      const alreadyBound = initialBindings.some((binding) => binding.remoteToken === node.token);
       if (alreadyBound) continue;
-      const existing = await this.store.findEntry(root.id, relativePath);
+      const existing = await this.metaStorage.getBinding(root.id, relativePath);
       if (existing?.remoteToken && existing.remoteToken !== node.token) continue;
       if (existing && existing.kind === "document" && localByPath.has(relativePath)) {
         if (!existing.remoteToken) await this.recordRemoteCollision(root, existing, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents);
-        else await this.store.upsertEntry({ ...existing, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, status: "pending", updatedAt: new Date().toISOString() });
+        else await this.metaStorage.setBinding(root.id, relativePath, { ...existing, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, status: "pending", updatedAt: new Date().toISOString() });
         continue;
       }
       if (!localByPath.has(relativePath)) {
@@ -84,112 +84,112 @@ export class SyncEngine {
       localByPath = new Map(files.map((file) => [file.relativePath, file]));
     }
 
-    for (const entry of initialEntries) {
+    for (const binding of initialBindings) {
       // Ignored entries are frozen as-is; legacy "orphan" entries get
       // reclassified here into local-missing when their local file is gone.
-      if (entry.ignoredAt) continue;
-      if (!localByPath.has(entry.relativePath) && entry.remoteToken) {
-        await this.store.upsertEntry({ ...entry, status: "local-missing", updatedAt: new Date().toISOString() });
+      if (binding.ignoredAt) continue;
+      if (!localByPath.has(binding.relativePath) && binding.remoteToken) {
+        await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "local-missing", updatedAt: new Date().toISOString() });
       }
     }
 
-    const entriesAfterFiles = await this.store.listEntries(root.id);
-    const entryByPath = new Map(entriesAfterFiles.map((entry) => [entry.relativePath, entry]));
+    const bindingsAfterFiles = await this.metaStorage.listBindings(root.id);
+    const bindingByPath = new Map(bindingsAfterFiles.map((binding) => [binding.relativePath, binding]));
     const referencesByAsset = new Map<string, string[]>();
     for (const file of files.filter((item) => item.kind === "document")) {
       const content = await this.local.readText(root, file.relativePath);
-      const documentEntry = entryByPath.get(file.relativePath);
-      if (!documentEntry) continue;
+      const documentBinding = bindingByPath.get(file.relativePath);
+      if (!documentBinding) continue;
       for (const reference of parseMarkdown(content).assets) {
         const assetPath = resolveRelativePath(file.relativePath, reference.target);
-        const asset = entryByPath.get(assetPath);
-        if (asset?.kind === "asset") referencesByAsset.set(assetPath, [...(referencesByAsset.get(assetPath) ?? []), documentEntry.id]);
+        const asset = bindingByPath.get(assetPath);
+        if (asset?.kind === "asset") referencesByAsset.set(assetPath, [...(referencesByAsset.get(assetPath) ?? []), documentBinding.entryId]);
       }
     }
-    for (const asset of entriesAfterFiles.filter((entry) => entry.kind === "asset")) {
-      await this.store.saveAssetReferences(root.id, asset.relativePath, referencesByAsset.get(asset.relativePath) ?? []);
+    for (const asset of bindingsAfterFiles.filter((binding) => binding.kind === "asset")) {
+      await this.metaStorage.saveAssetReferences(root.id, asset.relativePath, referencesByAsset.get(asset.relativePath) ?? []);
     }
 
     for (const assetPath of changedAssets) {
-      for (const entryId of await this.store.listAssetReferences(root.id, assetPath)) {
-        const entry = await this.store.getEntry(entryId);
-        if (entry && !entry.ignoredAt && entry.status !== "conflict") {
-          await this.store.upsertEntry({ ...entry, status: "pending", updatedAt: new Date().toISOString() });
+      for (const entryId of await this.metaStorage.listAssetReferences(root.id, assetPath)) {
+        const binding = await this.metaStorage.findBindingById(entryId);
+        if (binding && !binding.ignoredAt && binding.status !== "conflict") {
+          await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "pending", updatedAt: new Date().toISOString() });
         }
       }
     }
 
     const { reverseMap } = await this.buildLinkMaps(root.id);
     // Load open conflicts once for the whole loop instead of querying per entry.
-    const openConflicts = await this.store.listConflicts("open");
-    for (const entry of await this.store.listEntries(root.id)) {
+    const openConflicts = await this.metaStorage.listConflicts("open");
+    for (const binding of await this.metaStorage.listBindings(root.id)) {
       // Ignored entries are never probed against the remote side.
-      if (entry.ignoredAt) continue;
-      if (entry.kind !== "document" || !entry.remoteToken || !localByPath.has(entry.relativePath)) continue;
+      if (binding.ignoredAt) continue;
+      if (binding.kind !== "document" || !binding.remoteToken || !localByPath.has(binding.relativePath)) continue;
       let remote;
       try {
-        remote = await this.remote.getDocument(entry.remoteToken);
+        remote = await this.remote.getDocument(binding.remoteToken);
       } catch (error) {
         if (!isRemoteNotFound(error)) throw error;
         // The remote document is gone: the local copy is the only survivor.
-        await this.store.upsertEntry({ ...entry, status: "remote-missing", updatedAt: new Date().toISOString() });
+        await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "remote-missing", updatedAt: new Date().toISOString() });
         continue;
       }
       const assetReverseMap = new Map<string, string>();
-      for (const binding of await this.store.getAssetBindings(entry.id)) {
-        const asset = await this.store.getEntry(binding.assetEntryId);
-        if (asset) assetReverseMap.set(binding.token, asset.relativePath);
+      for (const assetBinding of await this.metaStorage.getAssetBindings(binding.entryId)) {
+        const asset = await this.metaStorage.findBindingById(assetBinding.assetEntryId);
+        if (asset) assetReverseMap.set(assetBinding.token, asset.relativePath);
       }
-      const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, entry.relativePath), assetReverseMap, entry.relativePath);
+      const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetReverseMap, binding.relativePath);
       const remoteHash = sha256(canonicalRemote);
-      const remoteChanged = entry.remoteHash !== undefined && remoteHash !== entry.remoteHash;
-      const localContent = entry.status === "conflict" ? await this.local.readText(root, entry.relativePath) : undefined;
-      const openConflict = entry.status === "conflict"
-        ? openConflicts.find((conflict) => conflict.entryId === entry.id)
+      const remoteChanged = binding.remoteContentHash !== undefined && remoteHash !== binding.remoteContentHash;
+      const localContent = binding.status === "conflict" ? await this.local.readText(root, binding.relativePath) : undefined;
+      const openConflict = binding.status === "conflict"
+        ? openConflicts.find((conflict) => conflict.entryId === binding.entryId)
         : undefined;
       if (openConflict && (remoteChanged || openConflict.remoteRevision !== remote.revisionId || openConflict.localContent !== localContent)) {
-        await this.store.updateConflict(openConflict.id, { localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+        await this.metaStorage.updateConflict(openConflict.id, { localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
       }
-      await this.store.upsertEntry({
-        ...entry,
+      await this.metaStorage.setBinding(root.id, binding.relativePath, {
+        ...binding,
         // Legacy "orphan" entries whose local file and remote document both
         // exist are re-armed for a fresh evaluation instead of staying stuck.
-        status: entry.status === "conflict" ? "conflict" : entry.status === "orphan" || remoteChanged ? "pending" : entry.status,
-        remoteHash,
+        status: binding.status === "conflict" ? "conflict" : binding.status === "orphan" || remoteChanged ? "pending" : binding.status,
+        remoteContentHash: remoteHash,
         remoteRevision: remote.revisionId,
         updatedAt: new Date().toISOString()
       });
     }
 
-    const entries = await this.store.listEntries(root.id);
+    const entries = await this.metaStorage.listBindings(root.id);
     return {
       entries,
-      conflicts: (await this.store.listConflicts("open")).filter((conflict) => entries.some((entry) => entry.id === conflict.entryId)).length
+      conflicts: (await this.metaStorage.listConflicts("open")).filter((conflict) => entries.some((entry) => entry.entryId === conflict.entryId)).length
     };
   }
 
-  async syncEntry(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry> {
+  async syncEntry(binding: EntryBinding, root: SyncRoot): Promise<EntryBinding> {
     // Ignored entries are never evaluated until the user restores them.
-    if (entry.ignoredAt) return entry;
-    if (entry.kind === "asset") return this.syncAsset(entry, root);
+    if (binding.ignoredAt) return binding;
+    if (binding.kind === "asset") return this.syncAsset(binding, root);
 
-    const localContent = await this.local.readText(root, entry.relativePath);
+    const localContent = await this.local.readText(root, binding.relativePath);
     const { forwardMap, reverseMap } = await this.buildLinkMaps(root.id);
     let remote;
-    if (entry.remoteToken) {
+    if (binding.remoteToken) {
       try {
-        remote = await this.remote.getDocument(entry.remoteToken);
+        remote = await this.remote.getDocument(binding.remoteToken);
       } catch (error) {
         if (!isRemoteNotFound(error)) throw error;
         // Remote 404 while a local file exists: the remote side is missing.
-        const missing = { ...entry, status: "remote-missing" as const, updatedAt: new Date().toISOString() };
-        await this.store.upsertEntry(missing);
+        const missing: EntryBinding = { ...binding, status: "remote-missing", updatedAt: new Date().toISOString() };
+        await this.metaStorage.setBinding(root.id, binding.relativePath, missing);
         return missing;
       }
     }
-    let assetMaps = await this.prepareAssets(root, entry, localContent, remote?.token, false);
+    let assetMaps = await this.prepareAssets(root, binding, localContent, remote?.token, false);
     if (!remote) {
-      const parent = await this.ensureRemoteParent(root, entry.relativePath);
+      const parent = await this.ensureRemoteParent(root, binding.relativePath);
       // Feishu derives the drive-visible title from the markdown H1, so two
       // local files sharing a first heading would push two identically named
       // documents into the same folder. Adopt an unbound same-name document
@@ -197,93 +197,90 @@ export class SyncEngine {
       // instead of creating another copy; block on same-name documents that
       // are already bound elsewhere.
       const tree = await this.loadRemoteTree(root);
-      const expectedTitle = parseMarkdown(localContent).title ?? documentTitle(entry.relativePath);
-      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && (node.name === expectedTitle || node.name === documentTitle(entry.relativePath)));
+      const expectedTitle = parseMarkdown(localContent).title ?? documentTitle(binding.relativePath);
+      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && (node.name === expectedTitle || node.name === documentTitle(binding.relativePath)));
       if (duplicate) {
-        const bound = await this.store.findEntryByRemoteToken(duplicate.token);
-        if (bound && bound.id !== entry.id) {
+        const bound = await this.metaStorage.findBindingByToken(root.id, duplicate.token);
+        if (bound && bound.entryId !== binding.entryId) {
           throw new Error(`Remote folder already has a document named "${duplicate.name}" bound to ${bound.relativePath}; rename one side, then retry sync`);
         }
         remote = await this.remote.getDocument(duplicate.token);
-        const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, entry.relativePath), assetMaps.reverseMap, entry.relativePath);
+        const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
         if (sha256(canonicalRemote) === sha256(localContent) || sha256(remote.content) === sha256(localContent)) {
           // The existing copy matches the local file (most likely this
           // entry's own earlier creation); rebind and sync as usual.
-          const adopted: SyncEntry = { ...entry, remoteToken: remote.token, remoteParentToken: parent, status: "pending", updatedAt: new Date().toISOString() };
-          await this.store.upsertEntry(adopted);
+          const adopted: EntryBinding = { ...binding, remoteToken: remote.token, remoteParentToken: parent, status: "pending", updatedAt: new Date().toISOString() };
+          await this.metaStorage.setBinding(root.id, binding.relativePath, adopted);
           return this.syncEntry(adopted, root);
         }
         // Same name but different content: let the user decide instead of
         // silently overwriting either side.
-        const conflicting: SyncEntry = { ...entry, remoteToken: remote.token, remoteParentToken: parent, remoteHash: sha256(canonicalRemote), remoteRevision: remote.revisionId, status: "conflict", updatedAt: new Date().toISOString() };
-        await this.store.upsertEntry(conflicting);
-        const snapshot = await this.store.getSnapshot(entry.id);
-        await this.store.createConflict({ entryId: entry.id, baseContent: snapshot?.baseContent ?? "", localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+        const conflicting: EntryBinding = { ...binding, remoteToken: remote.token, remoteParentToken: parent, remoteContentHash: sha256(canonicalRemote), remoteRevision: remote.revisionId, status: "conflict", updatedAt: new Date().toISOString() };
+        await this.metaStorage.setBinding(root.id, binding.relativePath, conflicting);
+        const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
+        await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent: baselineContent ?? "", localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
         return conflicting;
       }
-      let remoteContent = this.renderRemoteContent(localContent, entry.relativePath, forwardMap, assetMaps.forwardMap);
-      let created = await this.remote.createDocument(parent, documentTitle(entry.relativePath), remoteContent);
+      let remoteContent = this.renderRemoteContent(localContent, binding.relativePath, forwardMap, assetMaps.forwardMap);
+      let created = await this.remote.createDocument(parent, documentTitle(binding.relativePath), remoteContent);
       this.cacheRemoteNode(root, created);
       if (assetMaps.hasLocalAssets && this.remote.uploadInlineAsset) {
-        const inlineAssets = await this.prepareAssets(root, entry, localContent, created.token, true);
+        const inlineAssets = await this.prepareAssets(root, binding, localContent, created.token, true);
         assetMaps = inlineAssets;
-        remoteContent = this.renderRemoteContent(localContent, entry.relativePath, forwardMap, inlineAssets.forwardMap);
+        remoteContent = this.renderRemoteContent(localContent, binding.relativePath, forwardMap, inlineAssets.forwardMap);
         if (remoteContent !== created.content) created = (await this.remote.applyPatch(created.token, { operations: [{ type: "overwrite", content: remoteContent }], expectedRevisionId: created.revisionId })).document;
       }
-      const canonicalRemote = restoreAssetReferences(restoreInternalLinks(created.content, reverseMap, entry.relativePath), assetMaps.reverseMap, entry.relativePath);
+      const canonicalRemote = restoreAssetReferences(restoreInternalLinks(created.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
       const hash = sha256(localContent);
-      const next: SyncEntry = {
-        ...entry,
+      const next: EntryBinding = {
+        ...binding,
         remoteToken: created.token,
         remoteParentToken: parent,
-        localHash: hash,
-        remoteHash: sha256(canonicalRemote),
-        baseHash: hash,
+        remoteContentHash: sha256(canonicalRemote),
         status: "clean",
         remoteRevision: created.revisionId,
         updatedAt: new Date().toISOString()
       };
-      await this.store.upsertEntry(next);
-      await this.store.saveSnapshot({ entryId: entry.id, baseContent: localContent, localContent, remoteContent: canonicalRemote, baseHash: hash, localHash: hash, remoteHash: sha256(canonicalRemote), createdAt: new Date().toISOString() });
-      await this.saveBlockMapping(entry.id, localContent, created);
-      await this.markDocumentReferences(root, entry.relativePath);
+      await this.metaStorage.setBinding(root.id, binding.relativePath, next);
+      await this.saveBlockMapping(binding.entryId, localContent, created);
+      await this.markDocumentReferences(root, binding.relativePath);
       return next;
     }
 
-    const assetConflict = await this.hydrateChangedRemoteAssets(root, entry, localContent, remote.content);
-    assetMaps = await this.prepareAssets(root, entry, localContent, remote.token, false);
+    const assetConflict = await this.hydrateChangedRemoteAssets(root, binding, localContent, remote.content);
+    assetMaps = await this.prepareAssets(root, binding, localContent, remote.token, false);
     if (assetConflict) {
-      const snapshot = await this.store.getSnapshot(entry.id);
-      const base = snapshot?.baseContent ?? localContent;
-      const remoteConflictContent = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, entry.relativePath), assetMaps.reverseMap, entry.relativePath);
-      const open = (await this.store.listConflicts("open")).find((conflict) => conflict.entryId === entry.id);
-      if (open) await this.store.updateConflict(open.id, { localContent, remoteContent: remoteConflictContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-      else await this.store.createConflict({ entryId: entry.id, baseContent: base, localContent, remoteContent: remoteConflictContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-      const next = { ...entry, status: "conflict" as const, remoteRevision: remote.revisionId, updatedAt: new Date().toISOString() };
-      await this.store.upsertEntry(next);
+      const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
+      const base = baselineContent ?? localContent;
+      const remoteConflictContent = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
+      const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
+      if (open) await this.metaStorage.updateConflict(open.id, { localContent, remoteContent: remoteConflictContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+      else await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent: base, localContent, remoteContent: remoteConflictContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+      const next: EntryBinding = { ...binding, status: "conflict", remoteRevision: remote.revisionId, updatedAt: new Date().toISOString() };
+      await this.metaStorage.setBinding(root.id, binding.relativePath, next);
       return next;
     }
-    const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, entry.relativePath), assetMaps.reverseMap, entry.relativePath);
-    const snapshot = await this.store.getSnapshot(entry.id);
-    const base = snapshot?.baseContent ?? localContent;
+    const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
+    const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
+    const base = baselineContent ?? localContent;
     const decision = decideSync(base, localContent, canonicalRemote);
     const action = decision.action === "noop" && assetMaps.changed ? "push" as const : decision.action;
     if (action === "conflict") {
-      const open = (await this.store.listConflicts("open")).find((conflict) => conflict.entryId === entry.id);
-      if (open) await this.store.updateConflict(open.id, { localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-      else await this.store.createConflict({ entryId: entry.id, baseContent: base, localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-      const next = { ...entry, status: "conflict" as const, remoteHash: sha256(canonicalRemote), remoteRevision: remote.revisionId, updatedAt: new Date().toISOString() };
-      await this.store.upsertEntry(next);
+      const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
+      if (open) await this.metaStorage.updateConflict(open.id, { localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+      else await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent: base, localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+      const next: EntryBinding = { ...binding, status: "conflict", remoteContentHash: sha256(canonicalRemote), remoteRevision: remote.revisionId, updatedAt: new Date().toISOString() };
+      await this.metaStorage.setBinding(root.id, binding.relativePath, next);
       return next;
     }
 
     const content = action === "pull" ? canonicalRemote : action === "merge" ? decision.mergedContent ?? localContent : localContent;
-    if (action === "pull") await this.local.writeText(root, entry.relativePath, content);
+    if (action === "pull") await this.local.writeText(root, binding.relativePath, content);
 
     let remoteAfter = remote;
     if (action === "push" || action === "merge") {
-      assetMaps = await this.prepareAssets(root, entry, content, remote.token, true);
-      const remoteContent = this.renderRemoteContent(content, entry.relativePath, forwardMap, assetMaps.forwardMap);
+      assetMaps = await this.prepareAssets(root, binding, content, remote.token, true);
+      const remoteContent = this.renderRemoteContent(content, binding.relativePath, forwardMap, assetMaps.forwardMap);
       const patch = this.remote.capabilities.blockPatch && remote.blocks.length > 0
         ? buildBlockPatch(base, remoteContent, remote.blocks, remote.rootBlockId).operations
         : [{ type: "overwrite" as const, content: remoteContent }];
@@ -291,60 +288,57 @@ export class SyncEngine {
     }
 
     const hash = sha256(content);
-    const canonicalRemoteAfter = restoreAssetReferences(restoreInternalLinks(remoteAfter.content, reverseMap, entry.relativePath), assetMaps.reverseMap, entry.relativePath);
-    const next: SyncEntry = {
-      ...entry,
+    const canonicalRemoteAfter = restoreAssetReferences(restoreInternalLinks(remoteAfter.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
+    const next: EntryBinding = {
+      ...binding,
       status: "clean",
-      localHash: hash,
-      remoteHash: sha256(canonicalRemoteAfter),
-      baseHash: hash,
+      remoteContentHash: sha256(canonicalRemoteAfter),
       remoteRevision: remoteAfter.revisionId,
       updatedAt: new Date().toISOString()
     };
-    await this.store.upsertEntry(next);
-    await this.store.saveSnapshot({ entryId: entry.id, baseContent: content, localContent: content, remoteContent: canonicalRemoteAfter, baseHash: hash, localHash: hash, remoteHash: sha256(canonicalRemoteAfter), createdAt: new Date().toISOString() });
-    await this.saveBlockMapping(entry.id, content, remoteAfter);
+    await this.metaStorage.setBinding(root.id, binding.relativePath, next);
+    await this.saveBlockMapping(binding.entryId, content, remoteAfter);
     return next;
   }
 
-  async applyResolvedContent(entry: SyncEntry, root: SyncRoot, content: string, expectedRemote?: RemoteDocument): Promise<SyncEntry> {
-    if (!entry.remoteToken) throw new Error("Resolved content requires a bound remote document");
-    const remote = expectedRemote ?? await this.remote.getDocument(entry.remoteToken);
+  async applyResolvedContent(binding: EntryBinding, root: SyncRoot, content: string, expectedRemote?: RemoteDocument): Promise<EntryBinding> {
+    if (!binding.remoteToken) throw new Error("Resolved content requires a bound remote document");
+    const remote = expectedRemote ?? await this.remote.getDocument(binding.remoteToken);
     const { forwardMap, reverseMap } = await this.buildLinkMaps(root.id);
-    const assetMaps = await this.prepareAssets(root, entry, content, remote.token, true);
-    const remoteContent = this.renderRemoteContent(content, entry.relativePath, forwardMap, assetMaps.forwardMap);
+    const assetMaps = await this.prepareAssets(root, binding, content, remote.token, true);
+    const remoteContent = this.renderRemoteContent(content, binding.relativePath, forwardMap, assetMaps.forwardMap);
     const remoteAfter = (await this.remote.applyPatch(remote.token, {
       operations: [{ type: "overwrite", content: remoteContent }],
       expectedRevisionId: remote.revisionId,
       expectedContentHash: remote.contentHash
     })).document;
     const hash = sha256(content);
-    const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remoteAfter.content, reverseMap, entry.relativePath), assetMaps.reverseMap, entry.relativePath);
-    const next = { ...entry, status: "clean" as const, localHash: hash, remoteHash: sha256(canonicalRemote), baseHash: hash, remoteRevision: remoteAfter.revisionId, updatedAt: new Date().toISOString() };
-    await this.store.upsertEntry(next);
-    await this.store.saveSnapshot({ entryId: entry.id, baseContent: content, localContent: content, remoteContent: canonicalRemote, baseHash: hash, localHash: hash, remoteHash: sha256(canonicalRemote), createdAt: new Date().toISOString() });
-    await this.saveBlockMapping(entry.id, content, remoteAfter);
+    const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remoteAfter.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
+    const next: EntryBinding = { ...binding, status: "clean", remoteContentHash: sha256(canonicalRemote), remoteRevision: remoteAfter.revisionId, updatedAt: new Date().toISOString() };
+    await this.metaStorage.setBinding(root.id, binding.relativePath, next);
+    await this.saveBlockMapping(binding.entryId, content, remoteAfter);
     return next;
   }
 
-  private async syncAsset(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry> {
-    if (entry.ignoredAt) return entry;
+  private async syncAsset(binding: EntryBinding, root: SyncRoot): Promise<EntryBinding> {
+    if (binding.ignoredAt) return binding;
     if (!this.remote.capabilities.assetUpload) {
-      const error = { ...entry, status: "error" as const, updatedAt: new Date().toISOString() };
-      await this.store.upsertEntry(error);
+      const error: EntryBinding = { ...binding, status: "error", updatedAt: new Date().toISOString() };
+      await this.metaStorage.setBinding(root.id, binding.relativePath, error);
       return error;
     }
-    const content = await this.local.readBinary(root, entry.relativePath);
-    const parent = await this.ensureRemoteParent(root, entry.relativePath);
-    let remoteToken = entry.remoteToken;
-    if (!remoteToken || entry.remoteHash !== entry.localHash) {
-      const uploaded = await this.remote.uploadAsset(parent, posix.basename(entry.relativePath), content, mimeType(entry.relativePath));
+    const content = await this.local.readBinary(root, binding.relativePath);
+    const parent = await this.ensureRemoteParent(root, binding.relativePath);
+    let remoteToken = binding.remoteToken;
+    const contentHash = sha256(content);
+    if (!remoteToken || binding.remoteContentHash !== contentHash) {
+      const uploaded = await this.remote.uploadAsset(parent, posix.basename(binding.relativePath), content, mimeType(binding.relativePath));
       if (remoteToken && remoteToken !== uploaded.token) await this.remote.softDelete(remoteToken, "file");
       remoteToken = uploaded.token;
     }
-    const next = { ...entry, remoteToken, remoteParentToken: parent, remoteHash: entry.localHash, baseHash: entry.localHash, status: "clean" as const, updatedAt: new Date().toISOString() };
-    await this.store.upsertEntry(next);
-    if (entry.remoteToken !== remoteToken) await this.markDocumentReferences(root, entry.relativePath);
+    const next: EntryBinding = { ...binding, remoteToken, remoteParentToken: parent, remoteContentHash: contentHash, status: "clean", updatedAt: new Date().toISOString() };
+    await this.metaStorage.setBinding(root.id, binding.relativePath, next);
+    if (binding.remoteToken !== remoteToken) await this.markDocumentReferences(root, binding.relativePath);
     return next;
   }
 
@@ -352,52 +346,52 @@ export class SyncEngine {
    *  Documents go through the same import path as a fresh remote import;
    *  assets are simply downloaded back into place. When the remote side is
    *  also gone the entry is reclassified as remote-missing. */
-  async pullRemoteEntry(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry | undefined> {
-    if (entry.ignoredAt) throw Object.assign(new Error("Entry is ignored; restore it before syncing"), { statusCode: 400 });
-    if (!entry.remoteToken) throw Object.assign(new Error("Entry is not bound to a remote resource"), { statusCode: 400 });
-    if (entry.kind === "asset") {
+  async pullRemoteEntry(binding: EntryBinding, root: SyncRoot): Promise<EntryBinding | undefined> {
+    if (binding.ignoredAt) throw Object.assign(new Error("Entry is ignored; restore it before syncing"), { statusCode: 400 });
+    if (!binding.remoteToken) throw Object.assign(new Error("Entry is not bound to a remote resource"), { statusCode: 400 });
+    if (binding.kind === "asset") {
       let binary: Uint8Array;
       try {
-        binary = await this.remote.downloadAsset(entry.remoteToken);
+        binary = await this.remote.downloadAsset(binding.remoteToken);
       } catch (error) {
         if (!isRemoteNotFound(error)) throw error;
-        const missing = { ...entry, status: "remote-missing" as const, updatedAt: new Date().toISOString() };
-        await this.store.upsertEntry(missing);
+        const missing: EntryBinding = { ...binding, status: "remote-missing", updatedAt: new Date().toISOString() };
+        await this.metaStorage.setBinding(root.id, binding.relativePath, missing);
         return missing;
       }
-      await this.local.writeBinary(root, entry.relativePath, binary);
-      const restored = { ...entry, status: "clean" as const, updatedAt: new Date().toISOString() };
-      await this.store.upsertEntry(restored);
+      await this.local.writeBinary(root, binding.relativePath, binary);
+      const restored: EntryBinding = { ...binding, status: "clean", updatedAt: new Date().toISOString() };
+      await this.metaStorage.setBinding(root.id, binding.relativePath, restored);
       return restored;
     }
     // Force a fresh listing: the cached tree may predate a remote rename/delete.
     const tree = await this.refreshRemoteTree(root);
-    const node = tree.nodes.find((item) => item.token === entry.remoteToken);
+    const node = tree.nodes.find((item) => item.token === binding.remoteToken);
     if (!node || node.type !== "document") {
-      const missing = { ...entry, status: "remote-missing" as const, updatedAt: new Date().toISOString() };
-      await this.store.upsertEntry(missing);
+      const missing: EntryBinding = { ...binding, status: "remote-missing", updatedAt: new Date().toISOString() };
+      await this.metaStorage.setBinding(root.id, binding.relativePath, missing);
       return missing;
     }
     const maps = this.buildRemotePathMaps(root.remoteToken, tree);
-    await this.importRemoteDocument(root, node, entry.relativePath, maps.documents, maps.assets, maps.assetParents);
-    return this.store.getEntry(entry.id);
+    await this.importRemoteDocument(root, node, binding.relativePath, maps.documents, maps.assets, maps.assetParents);
+    return this.metaStorage.getBinding(root.id, binding.relativePath);
   }
 
   /** Re-create the remote side of an entry whose remote resource disappeared
    *  (remote-missing): the binding is cleared so syncEntry walks the creation
    *  branch and pushes the surviving local content as a new remote document. */
-  async recreateRemoteEntry(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry> {
-    if (entry.ignoredAt) throw Object.assign(new Error("Entry is ignored; restore it before syncing"), { statusCode: 400 });
-    const rearmed: SyncEntry = {
-      ...entry,
+  async recreateRemoteEntry(binding: EntryBinding, root: SyncRoot): Promise<EntryBinding> {
+    if (binding.ignoredAt) throw Object.assign(new Error("Entry is ignored; restore it before syncing"), { statusCode: 400 });
+    const rearmed: EntryBinding = {
+      ...binding,
       remoteToken: undefined,
       remoteParentToken: undefined,
-      remoteHash: undefined,
+      remoteContentHash: undefined,
       remoteRevision: undefined,
       status: "pending",
       updatedAt: new Date().toISOString()
     };
-    await this.store.upsertEntry(rearmed);
+    await this.metaStorage.setBinding(root.id, binding.relativePath, rearmed);
     return this.syncEntry(rearmed, root);
   }
 
@@ -428,43 +422,41 @@ export class SyncEngine {
       if (isRemoteNotFound(error)) return;
       throw error;
     }
-    const entry = await this.store.findEntry(root.id, relativePath) ?? {
-      id: randomUUID(), rootId: root.id, relativePath, kind: "document" as const, status: "pending" as const, updatedAt: new Date().toISOString()
-    };
-    const assetImport = await this.importRemoteAssets(root, entry.id, remote.content, remoteAssetPaths, remoteAssetParents);
+    const existingBinding = await this.metaStorage.getBinding(root.id, relativePath);
+    const entryId = existingBinding?.entryId ?? randomUUID();
+    const assetImport = await this.importRemoteAssets(root, entryId, remote.content, remoteAssetPaths, remoteAssetParents);
     const canonicalContent = restoreAssetReferences(restoreInternalLinks(remote.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
     await this.local.writeText(root, relativePath, canonicalContent);
     const hash = sha256(canonicalContent);
-    const next: SyncEntry = {
-      ...entry,
+    const next: EntryBinding = {
+      entryId,
+      rootId: root.id,
+      relativePath,
       kind: "document",
       remoteToken: remote.token,
       remoteParentToken: node.parentToken || root.remoteToken,
-      localHash: hash,
-      remoteHash: hash,
-      baseHash: hash,
+      remoteContentHash: hash,
       remoteRevision: remote.revisionId,
       status: "clean",
       updatedAt: new Date().toISOString()
     };
-    await this.store.upsertEntry(next);
-    await this.store.saveAssetBindings(entry.id, assetImport.bindings);
-    await this.store.saveSnapshot({ entryId: entry.id, baseContent: canonicalContent, localContent: canonicalContent, remoteContent: canonicalContent, baseHash: hash, localHash: hash, remoteHash: hash, createdAt: new Date().toISOString() });
-    await this.saveBlockMapping(entry.id, canonicalContent, remote);
+    await this.metaStorage.setBinding(root.id, relativePath, next);
+    await this.metaStorage.saveAssetBindings(entryId, assetImport.bindings);
+    await this.saveBlockMapping(entryId, canonicalContent, remote);
   }
 
-  private async recordRemoteCollision(root: SyncRoot, entry: SyncEntry, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>): Promise<void> {
+  private async recordRemoteCollision(root: SyncRoot, binding: EntryBinding, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>): Promise<void> {
     const localContent = await this.local.readText(root, relativePath);
     const remote = await this.remote.getDocument(node.token);
-    const assetImport = await this.importRemoteAssets(root, entry.id, remote.content, remoteAssetPaths, remoteAssetParents);
+    const assetImport = await this.importRemoteAssets(root, binding.entryId, remote.content, remoteAssetPaths, remoteAssetParents);
     const remoteContent = restoreAssetReferences(restoreInternalLinks(remote.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
-    const snapshot = await this.store.getSnapshot(entry.id);
-    const baseContent = snapshot?.baseContent ?? "";
-    await this.store.upsertEntry({ ...entry, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, remoteHash: sha256(remoteContent), remoteRevision: remote.revisionId, status: "conflict", updatedAt: new Date().toISOString() });
-    const open = (await this.store.listConflicts("open")).find((conflict) => conflict.entryId === entry.id);
-    if (open) await this.store.updateConflict(open.id, { localContent, remoteContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-    else await this.store.createConflict({ entryId: entry.id, baseContent, localContent, remoteContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-    await this.store.saveAssetBindings(entry.id, assetImport.bindings);
+    const baselineContent = await this.gitStorage.getBaseline(root.id, relativePath);
+    const baseContent = baselineContent ?? "";
+    await this.metaStorage.setBinding(root.id, relativePath, { ...binding, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, remoteContentHash: sha256(remoteContent), remoteRevision: remote.revisionId, status: "conflict", updatedAt: new Date().toISOString() });
+    const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
+    if (open) await this.metaStorage.updateConflict(open.id, { localContent, remoteContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+    else await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent, localContent, remoteContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
+    await this.metaStorage.saveAssetBindings(binding.entryId, assetImport.bindings);
   }
 
   private async importRemoteAssets(root: SyncRoot, documentEntryId: string, content: string, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>): Promise<{ reverseMap: Map<string, string>; bindings: Array<{ documentEntryId: string; assetEntryId: string; token: string; contentHash: string }> }> {
@@ -483,41 +475,52 @@ export class SyncEngine {
         continue;
       }
       const hash = sha256(binary);
-      const existing = await this.store.findEntry(root.id, relativePath);
+      const existing = await this.metaStorage.getBinding(root.id, relativePath);
       const localFile = localFiles.get(relativePath);
       if (localFile && localFile.contentHash !== hash) continue;
       if (!localFile) await this.local.writeBinary(root, relativePath, binary);
-      const assetEntry = existing ?? { id: randomUUID(), rootId: root.id, relativePath, kind: "asset" as const, status: "clean" as const, updatedAt: new Date().toISOString() };
-      await this.store.upsertEntry({ ...assetEntry, kind: "asset", remoteToken: token, remoteParentToken: remoteAssetParents.get(token) ?? root.remoteToken, localHash: hash, remoteHash: hash, baseHash: hash, status: "clean", updatedAt: new Date().toISOString() });
+      const assetEntryId = existing?.entryId ?? randomUUID();
+      const assetBinding: EntryBinding = {
+        entryId: assetEntryId,
+        rootId: root.id,
+        relativePath,
+        kind: "asset",
+        remoteToken: token,
+        remoteParentToken: remoteAssetParents.get(token) ?? root.remoteToken,
+        remoteContentHash: hash,
+        status: "clean",
+        updatedAt: new Date().toISOString()
+      };
+      await this.metaStorage.setBinding(root.id, relativePath, assetBinding);
       reverseMap.set(token, relativePath);
-      bindings.push({ documentEntryId, assetEntryId: assetEntry.id, token, contentHash: hash });
+      bindings.push({ documentEntryId, assetEntryId, token, contentHash: hash });
     }
     return { reverseMap, bindings };
   }
 
-  private async hydrateChangedRemoteAssets(root: SyncRoot, documentEntry: SyncEntry, localContent: string, remoteContent: string): Promise<boolean> {
+  private async hydrateChangedRemoteAssets(root: SyncRoot, documentBinding: EntryBinding, localContent: string, remoteContent: string): Promise<boolean> {
     const references = parseMarkdown(localContent).assets;
     if (references.length === 0) return false;
     const remoteTokens = [...remoteContent.matchAll(/<img\s+[^>]*?(?:src|token)="([^"]+)"/g)].map((match) => match[1]).filter((token): token is string => Boolean(token));
     if (remoteTokens.length === 0) return false;
-    const bindings = await this.store.getAssetBindings(documentEntry.id);
+    const bindings = await this.metaStorage.getAssetBindings(documentBinding.entryId);
     let conflict = false;
     for (let index = 0; index < Math.min(references.length, remoteTokens.length); index += 1) {
-      const assetPath = resolveRelativePath(documentEntry.relativePath, references[index]!.target);
-      const assetEntry = await this.store.findEntry(root.id, assetPath);
-      const binding = assetEntry ? bindings.find((item) => item.assetEntryId === assetEntry.id) : undefined;
+      const assetPath = resolveRelativePath(documentBinding.relativePath, references[index]!.target);
+      const assetBinding = await this.metaStorage.getBinding(root.id, assetPath);
+      const binding = assetBinding ? bindings.find((item) => item.assetEntryId === assetBinding.entryId) : undefined;
       const remoteToken = remoteTokens[index]!;
-      if (!assetEntry || !binding || binding.token === remoteToken) continue;
+      if (!assetBinding || !binding || binding.token === remoteToken) continue;
       try {
         const binary = await this.remote.downloadAsset(remoteToken);
         const hash = sha256(binary);
-        if (assetEntry.localHash !== binding.contentHash && assetEntry.localHash !== hash) {
+        if (assetBinding.remoteContentHash !== binding.contentHash && assetBinding.remoteContentHash !== hash) {
           conflict = true;
           continue;
         }
         await this.local.writeBinary(root, assetPath, binary);
-        await this.store.upsertEntry({ ...assetEntry, localHash: hash, remoteHash: hash, baseHash: hash, status: "clean", updatedAt: new Date().toISOString() });
-        await this.store.saveAssetBindings(documentEntry.id, bindings.map((item) => item.assetEntryId === assetEntry.id ? { ...item, token: remoteToken, contentHash: hash } : item));
+        await this.metaStorage.setBinding(root.id, assetPath, { ...assetBinding, remoteContentHash: hash, status: "clean", updatedAt: new Date().toISOString() });
+        await this.metaStorage.saveAssetBindings(documentBinding.entryId, bindings.map((item) => item.assetEntryId === assetBinding.entryId ? { ...item, token: remoteToken, contentHash: hash } : item));
       } catch {
         conflict = true;
       }
@@ -529,20 +532,20 @@ export class SyncEngine {
     return rewriteAssetReferences(rewriteInternalLinks(content, currentPath, linkMap), currentPath, assetMap);
   }
 
-  private async prepareAssets(root: SyncRoot, documentEntry: SyncEntry, content: string, documentToken?: string, uploadInline = false): Promise<{ forwardMap: Map<string, string>; reverseMap: Map<string, string>; hasLocalAssets: boolean; changed: boolean }> {
+  private async prepareAssets(root: SyncRoot, documentBinding: EntryBinding, content: string, documentToken?: string, uploadInline = false): Promise<{ forwardMap: Map<string, string>; reverseMap: Map<string, string>; hasLocalAssets: boolean; changed: boolean }> {
     const forwardMap = new Map<string, string>();
     const reverseMap = new Map<string, string>();
-    for (const asset of await this.store.listEntries(root.id)) {
-      if (asset.kind === "asset" && asset.remoteToken) {
-        forwardMap.set(asset.relativePath, asset.remoteToken);
-        reverseMap.set(asset.remoteToken, asset.relativePath);
+    for (const binding of await this.metaStorage.listBindings(root.id)) {
+      if (binding.kind === "asset" && binding.remoteToken) {
+        forwardMap.set(binding.relativePath, binding.remoteToken);
+        reverseMap.set(binding.remoteToken, binding.relativePath);
       }
     }
-    for (const binding of await this.store.getAssetBindings(documentEntry.id)) {
-      const asset = await this.store.getEntry(binding.assetEntryId);
+    for (const assetBinding of await this.metaStorage.getAssetBindings(documentBinding.entryId)) {
+      const asset = await this.metaStorage.findBindingById(assetBinding.assetEntryId);
       if (asset) {
-        reverseMap.set(binding.token, asset.relativePath);
-        forwardMap.set(asset.relativePath, binding.token);
+        reverseMap.set(assetBinding.token, asset.relativePath);
+        forwardMap.set(asset.relativePath, assetBinding.token);
       }
     }
 
@@ -550,13 +553,13 @@ export class SyncEngine {
     let changed = false;
     const references = parseMarkdown(content).assets;
     for (const reference of references) {
-      const assetPath = resolveRelativePath(documentEntry.relativePath, reference.target);
-      const assetEntry = await this.store.findEntry(root.id, assetPath);
-      if (!assetEntry || assetEntry.kind !== "asset") continue;
-      let token = assetEntry.remoteToken;
-      const existingBinding = (await this.store.getAssetBindings(documentEntry.id)).find((binding) => binding.assetEntryId === assetEntry.id);
-      const targetDocumentToken = documentToken ?? documentEntry.remoteToken;
-      const bindingChanged = existingBinding !== undefined && existingBinding.contentHash !== assetEntry.localHash;
+      const assetPath = resolveRelativePath(documentBinding.relativePath, reference.target);
+      const assetBinding = await this.metaStorage.getBinding(root.id, assetPath);
+      if (!assetBinding || assetBinding.kind !== "asset") continue;
+      let token = assetBinding.remoteToken;
+      const existingBinding = (await this.metaStorage.getAssetBindings(documentBinding.entryId)).find((b) => b.assetEntryId === assetBinding.entryId);
+      const targetDocumentToken = documentToken ?? documentBinding.remoteToken;
+      const bindingChanged = existingBinding !== undefined && existingBinding.contentHash !== assetBinding.remoteContentHash;
       if (bindingChanged) changed = true;
       if (uploadInline && targetDocumentToken && this.remote.uploadInlineAsset && (!existingBinding || bindingChanged)) {
         const binary = await this.local.readBinary(root, assetPath);
@@ -565,26 +568,26 @@ export class SyncEngine {
         token = uploaded.token;
         changed = true;
       }
-      if (existingBinding && (!uploadInline || existingBinding.contentHash === assetEntry.localHash)) token = existingBinding.token;
+      if (existingBinding && (!uploadInline || existingBinding.contentHash === assetBinding.remoteContentHash)) token = existingBinding.token;
       if (token) {
         forwardMap.set(assetPath, token);
         reverseMap.set(token, assetPath);
-        bindings.push({ documentEntryId: documentEntry.id, assetEntryId: assetEntry.id, token, contentHash: assetEntry.localHash ?? "" });
+        bindings.push({ documentEntryId: documentBinding.entryId, assetEntryId: assetBinding.entryId, token, contentHash: assetBinding.remoteContentHash ?? "" });
       }
     }
-    await this.store.saveAssetBindings(documentEntry.id, bindings);
+    await this.metaStorage.saveAssetBindings(documentBinding.entryId, bindings);
     return { forwardMap, reverseMap, hasLocalAssets: references.length > 0, changed };
   }
 
   private async buildLinkMaps(rootId: string): Promise<{ forwardMap: Map<string, { token: string; url?: string }>; reverseMap: Map<string, string> }> {
     const forwardMap = new Map<string, { token: string; url?: string }>();
     const reverseMap = new Map<string, string>();
-    for (const entry of await this.store.listEntries(rootId)) {
-      if (entry.kind !== "document" || !entry.remoteToken) continue;
-      const path = entry.relativePath;
-      forwardMap.set(path, { token: entry.remoteToken });
-      forwardMap.set(path.replace(/\.md$/i, ""), { token: entry.remoteToken });
-      reverseMap.set(entry.remoteToken, path);
+    for (const binding of await this.metaStorage.listBindings(rootId)) {
+      if (binding.kind !== "document" || !binding.remoteToken) continue;
+      const path = binding.relativePath;
+      forwardMap.set(path, { token: binding.remoteToken });
+      forwardMap.set(path.replace(/\.md$/i, ""), { token: binding.remoteToken });
+      reverseMap.set(binding.remoteToken, path);
     }
     return { forwardMap, reverseMap };
   }
@@ -639,27 +642,27 @@ export class SyncEngine {
 
   private async saveBlockMapping(entryId: string, content: string, remote: RemoteDocument): Promise<void> {
     const blocks = parseMarkdown(content).blocks;
-    await this.store.saveBlocks(entryId, blocks.flatMap((block, position) => {
+    await this.metaStorage.saveBlocks(entryId, blocks.flatMap((block, position) => {
       const remoteBlock = remote.blocks[position];
       return remoteBlock ? [{ entryId, stableId: block.stableId, blockId: remoteBlock.id, kind: block.kind, contentHash: block.contentHash, position }] : [];
     }));
   }
 
   private async markDocumentReferences(root: SyncRoot, targetPath: string): Promise<void> {
-    for (const entry of await this.store.listEntries(root.id)) {
-      if (entry.kind !== "document" || entry.relativePath === targetPath || entry.ignoredAt) continue;
+    for (const binding of await this.metaStorage.listBindings(root.id)) {
+      if (binding.kind !== "document" || binding.relativePath === targetPath || binding.ignoredAt) continue;
       // local-missing entries have no local file to inspect; tolerate other
       // transient read failures (e.g. the file vanished mid-sync) as well.
-      if (entry.status === "local-missing") continue;
+      if (binding.status === "local-missing") continue;
       let content: string;
       try {
-        content = await this.local.readText(root, entry.relativePath);
+        content = await this.local.readText(root, binding.relativePath);
       } catch {
         continue;
       }
-      const references = parseMarkdown(content).links.map((link) => resolveRelativePath(entry.relativePath, link.target));
-      if (references.includes(targetPath) && entry.status !== "conflict") {
-        await this.store.upsertEntry({ ...entry, status: "pending", updatedAt: new Date().toISOString() });
+      const references = parseMarkdown(content).links.map((link) => resolveRelativePath(binding.relativePath, link.target));
+      if (references.includes(targetPath) && binding.status !== "conflict") {
+        await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "pending", updatedAt: new Date().toISOString() });
       }
     }
   }

@@ -1,6 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 import { Domain, EventDispatcher, LoggerLevel, WSClient } from "@feishu-sync/feishu";
-import type { StateStore, SyncRoot } from "@feishu-sync/core";
+import type { MetaStorage, SyncRoot } from "@feishu-sync/core";
 import type { CredentialStore } from "./credentials.js";
 import type { SyncRuntime } from "./runtime.js";
 
@@ -33,7 +33,7 @@ export class EventChannelService {
 
   constructor(
     private readonly credentials: CredentialStore,
-    private readonly store: StateStore,
+    private readonly metaStorage: MetaStorage,
     private readonly runtime: SyncRuntime,
     private readonly logger?: FastifyBaseLogger
   ) {}
@@ -133,16 +133,19 @@ export class EventChannelService {
   /** Folder tokens hit bound roots directly; file tokens resolve through the
    *  entry table (covers folder and wiki bindings alike). */
   private async matchRoots(fileToken?: string, folderToken?: string): Promise<SyncRoot[]> {
-    const roots = await this.store.listRoots();
+    const roots = await this.metaStorage.listRoots();
     const hits = new Map<string, SyncRoot>();
     if (folderToken) {
       for (const root of roots) if (root.remoteToken === folderToken) hits.set(root.id, root);
     }
     if (fileToken) {
-      const entry = await this.store.findEntryByRemoteToken(fileToken);
-      if (entry) {
-        const root = roots.find((candidate) => candidate.id === entry.rootId);
-        if (root) hits.set(root.id, root);
+      // Look through each root's bindings to find the entry with matching remote token.
+      for (const root of roots) {
+        const binding = await this.metaStorage.findBindingByToken(root.id, fileToken);
+        if (binding) {
+          hits.set(root.id, root);
+          break;
+        }
       }
     }
     return [...hits.values()];
