@@ -3,7 +3,8 @@ import { promisify } from "node:util";
 import type { FastifyBaseLogger } from "fastify";
 import { FeishuOpenApiProvider, LarkCliProvider } from "@feishu-sync/feishu";
 import type { UserTokenUpdate } from "@feishu-sync/feishu";
-import type { RemoteProvider, StateStore } from "@feishu-sync/core";
+import type { RemoteProvider } from "@feishu-sync/core";
+import { AppConfigStore, AUTH_FLAG_KEYS } from "./appconfig.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,7 +59,7 @@ export interface RedactedSettings extends CredentialInput {
   envFallback: { hasAccessToken: boolean; hasAppCredentials: boolean; hasRefreshToken: boolean };
 }
 
-/** Settings keys persisted in the state store (DB values win over env vars). */
+/** Credential keys persisted in config.json (saved values win over env vars). */
 const KEYS = {
   mode: "feishu.mode",
   baseUrl: "feishu.baseUrl",
@@ -68,8 +69,8 @@ const KEYS = {
   refreshToken: "feishu.refreshToken",
   refreshTokenExpiresAt: "feishu.refreshTokenExpiresAt",
   larkCliBin: "feishu.larkCliBin",
-  authStatus: "feishu.authStatus",
-  authCheckedAt: "feishu.authCheckedAt",
+  authStatus: AUTH_FLAG_KEYS.status,
+  authCheckedAt: AUTH_FLAG_KEYS.checkedAt,
   guideUrlUser: "feishu.guideUrl.user",
   guideUrlTenant: "feishu.guideUrl.tenant"
 } as const;
@@ -81,22 +82,23 @@ const DEFAULT_GUIDE_TENANT = "https://open.feishu.cn/app";
 /** Optional hook for probing the lark-cli executable; tests inject a fake. */
 export type CliProbe = (executable: string) => Promise<void>;
 
-/** Persists Feishu credentials in SQLite with env-var fallback, builds providers
- *  from the resolved config and runs lightweight connectivity probes. */
+/** Persists Feishu credentials in the AppConfigStore (config.json) with
+ *  env-var fallback, builds providers from the resolved config and runs
+ *  lightweight connectivity probes. */
 export class CredentialStore {
   private readonly fetchImpl: typeof fetch;
   private readonly probeCli?: CliProbe;
   private readonly logger?: FastifyBaseLogger;
 
-  constructor(private readonly store: StateStore, fetchImpl?: typeof fetch, probeCli?: CliProbe, logger?: FastifyBaseLogger) {
+  constructor(private readonly config: AppConfigStore, fetchImpl?: typeof fetch, probeCli?: CliProbe, logger?: FastifyBaseLogger) {
     this.fetchImpl = fetchImpl ?? fetch;
     this.probeCli = probeCli;
     this.logger = logger;
   }
 
-  /** Resolve the effective config: DB settings first, env vars as fallback. */
+  /** Resolve the effective config: saved settings first, env vars as fallback. */
   async load(): Promise<CredentialConfig> {
-    const saved = await this.store.getSettings();
+    const saved = await this.config.getCredentials();
     const savedMode = saved[KEYS.mode] as CredentialMode | undefined;
     const envHasAppCredentials = Boolean(process.env.FEISHU_APP_ID && process.env.FEISHU_APP_SECRET);
     const mode: CredentialMode = savedMode ?? (process.env.FEISHU_PROVIDER === "cli" ? "cli" : envHasAppCredentials ? "tenant" : "user");
@@ -125,7 +127,7 @@ export class CredentialStore {
       pairs.push([KEYS.refreshTokenExpiresAt, ""]);
     }
     if (patch.larkCliBin !== undefined) pairs.push([KEYS.larkCliBin, patch.larkCliBin.trim()]);
-    for (const [key, value] of pairs) await this.store.setSetting(key, value ?? "");
+    await this.config.setCredentials(pairs);
   }
 
   /** Build a provider that auto-renews user tokens via the stored refresh
@@ -145,19 +147,22 @@ export class CredentialStore {
   /** Persist a rotated token pair. The old refresh token is already dead
    *  server-side, so write the new values before the caller proceeds. */
   private async persistUserTokenUpdate(update: UserTokenUpdate): Promise<void> {
-    await this.store.setSetting(KEYS.accessToken, update.accessToken);
-    if (update.refreshToken !== undefined) await this.store.setSetting(KEYS.refreshToken, update.refreshToken);
-    if (update.refreshTokenExpiresAt !== undefined) await this.store.setSetting(KEYS.refreshTokenExpiresAt, String(update.refreshTokenExpiresAt));
+    const pairs: Array<[string, string]> = [[KEYS.accessToken, update.accessToken]];
+    if (update.refreshToken !== undefined) pairs.push([KEYS.refreshToken, update.refreshToken]);
+    if (update.refreshTokenExpiresAt !== undefined) pairs.push([KEYS.refreshTokenExpiresAt, String(update.refreshTokenExpiresAt)]);
+    await this.config.setCredentials(pairs);
     this.logger?.info({ refreshTokenExpiresAt: update.refreshTokenExpiresAt }, "user access token rotated via refresh token");
   }
 
   /** The refresh token can no longer be used; clear it and surface the failure
    *  in the UI so the user knows re-authorization is required. */
   private async handleRefreshInvalid(reason: string): Promise<void> {
-    await this.store.setSetting(KEYS.refreshToken, "");
-    await this.store.setSetting(KEYS.refreshTokenExpiresAt, "");
-    await this.store.setSetting(KEYS.authStatus, "invalid");
-    await this.store.setSetting(KEYS.authCheckedAt, new Date().toISOString());
+    await this.config.setCredentials([
+      [KEYS.refreshToken, ""],
+      [KEYS.refreshTokenExpiresAt, ""],
+      [KEYS.authStatus, "invalid"],
+      [KEYS.authCheckedAt, new Date().toISOString()]
+    ]);
     this.logger?.warn({ reason }, "refresh token invalid, re-authorization required");
   }
 
@@ -228,7 +233,7 @@ export class CredentialStore {
   }
 
   async getAuthStatus(): Promise<AuthStatus> {
-    const saved = await this.store.getSetting(KEYS.authStatus);
+    const saved = await this.config.getCredential(KEYS.authStatus);
     if (saved === "ok" || saved === "invalid") return saved;
     const config = await this.load();
     const configured = config.mode === "cli" || Boolean(config.accessToken) || Boolean(config.appId && config.appSecret);
@@ -236,21 +241,22 @@ export class CredentialStore {
   }
 
   async setAuthStatus(status: AuthStatus): Promise<void> {
-    await this.store.setSetting(KEYS.authStatus, status);
-    await this.store.setSetting(KEYS.authCheckedAt, new Date().toISOString());
+    await this.config.setCredentials([[KEYS.authStatus, status], [KEYS.authCheckedAt, new Date().toISOString()]]);
   }
 
   async setGuideUrls(user?: string, tenant?: string): Promise<void> {
-    if (user !== undefined) await this.store.setSetting(KEYS.guideUrlUser, user);
-    if (tenant !== undefined) await this.store.setSetting(KEYS.guideUrlTenant, tenant);
+    const pairs: Array<[string, string]> = [];
+    if (user !== undefined) pairs.push([KEYS.guideUrlUser, user]);
+    if (tenant !== undefined) pairs.push([KEYS.guideUrlTenant, tenant]);
+    await this.config.setCredentials(pairs);
   }
 
   /** Redacted view for the browser: secrets are never returned in full. */
   async redacted(): Promise<RedactedSettings> {
     const config = await this.load();
-    const guideUser = (await this.store.getSetting(KEYS.guideUrlUser)) ?? DEFAULT_GUIDE_USER;
-    const guideTenant = (await this.store.getSetting(KEYS.guideUrlTenant)) ?? DEFAULT_GUIDE_TENANT;
-    const savedRefreshExpiry = await this.store.getSetting(KEYS.refreshTokenExpiresAt);
+    const saved = await this.config.getCredentials();
+    const guideUser = saved[KEYS.guideUrlUser] ?? DEFAULT_GUIDE_USER;
+    const guideTenant = saved[KEYS.guideUrlTenant] ?? DEFAULT_GUIDE_TENANT;
     return {
       mode: config.mode,
       baseUrl: config.baseUrl,
@@ -260,11 +266,11 @@ export class CredentialStore {
       hasAppSecret: Boolean(config.appSecret),
       refreshToken: mask(config.refreshToken),
       hasRefreshToken: Boolean(config.refreshToken),
-      refreshTokenExpiresAt: toIsoEpoch(savedRefreshExpiry),
+      refreshTokenExpiresAt: toIsoEpoch(saved[KEYS.refreshTokenExpiresAt]),
       refreshSupported: Boolean(config.refreshToken && config.appId && config.appSecret),
       larkCliBin: config.larkCliBin,
       authStatus: await this.getAuthStatus(),
-      authCheckedAt: await this.store.getSetting(KEYS.authCheckedAt),
+      authCheckedAt: saved[KEYS.authCheckedAt],
       guideUrls: { user: guideUser, tenant: guideTenant },
       envFallback: {
         hasAccessToken: Boolean(process.env.FEISHU_ACCESS_TOKEN),

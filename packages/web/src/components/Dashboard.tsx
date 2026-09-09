@@ -1,6 +1,7 @@
 import React from "react";
 import { AUTH_STATUS_LABELS, formatDateTime, type AuthStatus, type Root, type RootStats } from "../api";
 import { Icon } from "./Icon";
+import type { DetailTab } from "./RootDetail";
 
 interface DashboardProps {
   roots: Root[];
@@ -10,7 +11,8 @@ interface DashboardProps {
   conflictsCount: number;
   syncing: boolean;
   authStatus?: AuthStatus;
-  onOpenRoot: (rootId: string) => void;
+  /** Optional tab so metric shortcuts land on the right workbench. */
+  onOpenRoot: (rootId: string, tab?: DetailTab) => void;
   onOpenAdd: () => void;
   onDeleteRoot: (root: Root) => Promise<void>;
   onToggleRoot: (rootId: string, enabled: boolean) => Promise<void>;
@@ -23,10 +25,24 @@ function rootName(root: Root): string {
 }
 
 export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatus, onOpenRoot, onOpenAdd, onDeleteRoot, onToggleRoot, onSyncNow, onRefresh }: DashboardProps): React.JSX.Element {
+  // Exception statistic: hard failures plus both missing flavors (and legacy
+  // orphans before their reclassification round).
   const errorEntries = Object.values(rootStats).reduce(
-    (sum, stats) => sum + (stats.entriesByStatus.error ?? 0) + (stats.entriesByStatus.orphan ?? 0),
+    (sum, stats) => sum
+      + (stats.entriesByStatus.error ?? 0)
+      + (stats.entriesByStatus["local-missing"] ?? 0)
+      + (stats.entriesByStatus["remote-missing"] ?? 0)
+      + (stats.entriesByStatus.orphan ?? 0),
     0
   );
+
+  // First root holding conflicts / anomalies, for the clickable metrics.
+  const conflictRoot = roots.find((root) => (rootStats[root.id]?.conflicts ?? 0) > 0);
+  const issueRoot = roots.find((root) => {
+    const byStatus = rootStats[root.id]?.entriesByStatus ?? {};
+    return (byStatus.error ?? 0) + (byStatus["local-missing"] ?? 0) + (byStatus["remote-missing"] ?? 0) + (byStatus.orphan ?? 0) > 0;
+  });
+  const issueRootHasMissing = issueRoot ? ((rootStats[issueRoot.id]?.entriesByStatus["local-missing"] ?? 0) + (rootStats[issueRoot.id]?.entriesByStatus["remote-missing"] ?? 0)) > 0 : false;
 
   return <div className="dashboard">
     <div className="page-heading">
@@ -36,8 +52,12 @@ export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatu
 
     <div className="overview-grid">
       <div className="metric"><span>同步根目录</span><strong>{roots.length}</strong></div>
-      <div className="metric"><span>待解决冲突</span><strong>{conflictsCount}</strong></div>
-      <div className="metric"><span>异常条目</span><strong>{errorEntries}</strong></div>
+      {conflictRoot
+        ? <button className="metric metric-link" title="打开第一个存在冲突的根目录" onClick={() => onOpenRoot(conflictRoot.id, "issues-conflicts")}><span>待解决冲突</span><strong>{conflictsCount}</strong></button>
+        : <div className="metric"><span>待解决冲突</span><strong>{conflictsCount}</strong></div>}
+      {issueRoot
+        ? <button className="metric metric-link" title="打开第一个存在异常条目的根目录" onClick={() => onOpenRoot(issueRoot.id, issueRootHasMissing ? "issues-missing" : "issues-conflicts")}><span>异常条目</span><strong>{errorEntries}</strong></button>
+        : <div className="metric"><span>异常条目</span><strong>{errorEntries}</strong></div>}
       <div className="metric"><span>凭证状态</span><strong>{authStatus ? AUTH_STATUS_LABELS[authStatus] : "—"}</strong></div>
     </div>
 
@@ -53,6 +73,7 @@ export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatu
             const stats = rootStats[root.id];
             const byStatus = stats?.entriesByStatus ?? {};
             const conflictEntries = byStatus.conflict ?? 0;
+            const missingEntries = (byStatus["local-missing"] ?? 0) + (byStatus["remote-missing"] ?? 0);
             return (
               <div key={root.id} className="root-card">
                 <button className="root-card-main" onClick={() => onOpenRoot(root.id)}>
@@ -62,6 +83,7 @@ export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatu
                       ? <span className="badge ok-badge">同步中</span>
                       : <span className="badge paused-badge">已暂停</span>}
                     {conflictEntries > 0 && <span className="badge conflict-badge">冲突 {conflictEntries}</span>}
+                    {missingEntries > 0 && <span className="badge missing-badge">缺失 {missingEntries}</span>}
                   </div>
                   <span className="root-card-path">{root.localPath}</span>
                   <span className="root-card-token">↔ {root.remoteToken}</span>

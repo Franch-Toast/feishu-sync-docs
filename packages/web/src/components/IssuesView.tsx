@@ -2,19 +2,43 @@ import React, { useEffect, useMemo, useState } from "react";
 import { markdown } from "@codemirror/lang-markdown";
 import { oneDark } from "@codemirror/theme-one-dark";
 import CodeMirror from "@uiw/react-codemirror";
-import { api, ENTRY_STATUS_LABELS, formatDateTime, type Conflict, type Resolution } from "../api";
+import { formatDateTime, type Conflict, type Entry, type Resolution } from "../api";
 import { applyHunks, clashingHunkIndices, computeHunks, lineDiff, type DiffRow, type Hunk } from "../diff";
 import { MarkdownPreview } from "./MarkdownPreview";
 
 type WorkspaceMode = "compare" | "edit" | "preview";
-type ListTab = "open" | "history";
+/** Issue groups: two-side conflicts, remote-missing, local-missing, ignored. */
+export type IssueGroup = "conflicts" | "remote-missing" | "local-missing" | "ignored";
 
-interface ConflictsViewProps {
+const GROUP_LABELS: Record<IssueGroup, string> = {
+  conflicts: "双边冲突",
+  "remote-missing": "远端缺失",
+  "local-missing": "本地缺失",
+  ignored: "已忽略"
+};
+
+const GROUP_EMPTY: Record<IssueGroup, { title: string; hint: string }> = {
+  conflicts: { title: "当前没有冲突", hint: "本地和飞书同时修改的文档会停在这里。" },
+  "remote-missing": { title: "没有远端缺失条目", hint: "飞书侧被删除的文档会出现在这里，可一键重新创建。" },
+  "local-missing": { title: "没有本地缺失条目", hint: "本地被删除的文档会出现在这里，可从飞书一键拉回。" },
+  ignored: { title: "没有已忽略条目", hint: "在异常列表中忽略的条目会出现在这里，可随时恢复评估。" }
+};
+
+interface IssuesViewProps {
+  /** Open conflicts, already filtered to this root. */
   conflicts: Conflict[];
-  rootId?: string;
+  /** All entries of this root (from the tree API) for missing/ignored groups. */
+  entries: Entry[];
+  rootId: string;
+  /** Group to open first (driven by RootDetail's initialTab). */
+  initialGroup?: IssueGroup;
   selected?: Conflict;
   onSelect: (conflict: Conflict | undefined) => void;
   onResolve: (id: string, resolution: Resolution, mergedContent?: string) => Promise<void>;
+  onSyncEntry: (entryId: string) => Promise<void>;
+  onIgnoreEntry: (entryId: string, ignored: boolean) => Promise<void>;
+  /** One-click resync of every missing entry; returns the processed count. */
+  onSyncMissing: () => Promise<number>;
   onRefresh: () => void;
 }
 
@@ -65,25 +89,30 @@ function BasePane({ content }: { content: string }): React.JSX.Element {
   </div>;
 }
 
-export function ConflictsView({ conflicts, selected, onSelect, onResolve, onRefresh }: ConflictsViewProps): React.JSX.Element {
-  const [tab, setTab] = useState<ListTab>("open");
-  const [history, setHistory] = useState<Conflict[]>([]);
+export function IssuesView({ conflicts, entries, rootId, initialGroup, selected, onSelect, onResolve, onSyncEntry, onIgnoreEntry, onSyncMissing, onRefresh }: IssuesViewProps): React.JSX.Element {
+  const [group, setGroup] = useState<IssueGroup>(initialGroup ?? "conflicts");
   const [mode, setMode] = useState<WorkspaceMode>("compare");
   const [applied, setApplied] = useState<Set<string>>(new Set());
   const [showBase, setShowBase] = useState(false);
   const [editorValue, setEditorValue] = useState("");
-  const [expandedHistory, setExpandedHistory] = useState<string | undefined>();
+  const [busyEntry, setBusyEntry] = useState<string | undefined>();
+  const [missingBusy, setMissingBusy] = useState(false);
 
+  // Follow the requested group when the detail page re-opens with a target.
   useEffect(() => {
-    api.listConflicts("all").then((list) => setHistory(list.filter((item) => item.status !== "open"))).catch(() => setHistory([]));
-  }, [onRefresh, conflicts.length]);
+    if (initialGroup) setGroup(initialGroup);
+  }, [initialGroup, rootId]);
+
+  const remoteMissing = useMemo(() => entries.filter((entry) => entry.status === "remote-missing" && !entry.ignoredAt), [entries]);
+  const localMissing = useMemo(() => entries.filter((entry) => entry.status === "local-missing" && !entry.ignoredAt), [entries]);
+  const ignored = useMemo(() => entries.filter((entry) => entry.ignoredAt), [entries]);
+  const missingCount = remoteMissing.length + localMissing.length;
 
   // Reset the workspace whenever another conflict is opened.
   useEffect(() => {
     setApplied(new Set());
     setMode("compare");
     setShowBase(false);
-    setExpandedHistory(undefined);
   }, [selected?.id]);
 
   const localHunks = useMemo<KeyedHunk[]>(() => {
@@ -109,45 +138,105 @@ export function ConflictsView({ conflicts, selected, onSelect, onResolve, onRefr
     [selected?.baseContent, appliedHunks]
   );
 
+  const runEntryAction = async (entryId: string, action: () => Promise<void>) => {
+    setBusyEntry(entryId);
+    try {
+      await action();
+      onRefresh();
+    } finally {
+      setBusyEntry(undefined);
+    }
+  };
+
+  const runSyncMissing = async () => {
+    setMissingBusy(true);
+    try {
+      await onSyncMissing();
+      onRefresh();
+    } finally {
+      setMissingBusy(false);
+    }
+  };
+
   if (!selected) {
-    const list = tab === "open" ? conflicts : history;
+    const groupCounts: Record<IssueGroup, number> = {
+      conflicts: conflicts.length,
+      "remote-missing": remoteMissing.length,
+      "local-missing": localMissing.length,
+      ignored: ignored.length
+    };
+    const missingEntries = group === "remote-missing" ? remoteMissing : group === "local-missing" ? localMissing : [];
     return <>
       <div className="page-heading">
-        <div><span className="eyebrow">WORKSPACE / CONFLICTS</span><h2>冲突工作台</h2><p>本地和飞书同时修改的文档会停在这里，解决后才会继续同步。</p></div>
+        <div><span className="eyebrow">WORKSPACE / ISSUES</span><h2>异常工作台</h2><p>冲突与缺失条目集中在这里：逐个解决，或一键同步全部缺失。</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => onRefresh()}>刷新状态</button></div>
       </div>
       <div className="root-tabs">
-        <button className={tab === "open" ? "active" : ""} onClick={() => setTab("open")}>待处理 ({conflicts.length})</button>
-        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>已解决历史 ({history.length})</button>
+        {(Object.keys(GROUP_LABELS) as IssueGroup[]).map((key) => (
+          <button key={key} className={group === key ? "active" : ""} onClick={() => setGroup(key)}>
+            {GROUP_LABELS[key]} ({groupCounts[key]})
+          </button>
+        ))}
       </div>
       <div className="panel">
-        <div className="panel-heading"><div><h3>{tab === "open" ? "待解决冲突" : "已解决冲突"}</h3><span className="muted">{tab === "open" ? "选择一个文档开始合并" : "点击展开当时的对比"}</span></div></div>
-        {list.length === 0
-          ? <div className="empty-state"><div className="check">✓</div><strong>{tab === "open" ? "当前没有冲突" : "还没有解决记录"}</strong><span>{tab === "open" ? "后台会持续检查本地目录和飞书文档。" : "解决冲突后会出现在这里，可回溯当时的版本差异。"}</span></div>
+        <div className="panel-heading">
+          <div>
+            <h3>{GROUP_LABELS[group]}</h3>
+            <span className="muted">{
+              group === "conflicts" ? "选择一个文档开始合并"
+              : group === "ignored" ? "恢复后重新参与扫描与同步"
+              : "单条同步或忽略，也可以一键处理全部缺失"}</span>
+          </div>
+          {(group === "remote-missing" || group === "local-missing") && missingEntries.length > 0 &&
+            <button className="primary" disabled={missingBusy} onClick={() => void runSyncMissing()}>{missingBusy ? "同步中…" : "一键同步全部缺失"}</button>}
+        </div>
+        {group === "conflicts" && (conflicts.length === 0
+          ? <div className="empty-state"><div className="check">✓</div><strong>{GROUP_EMPTY[group].title}</strong><span>{GROUP_EMPTY[group].hint}</span></div>
           : <div className="conflict-list">
-            {list.map((conflict) => (
-              <div key={conflict.id}>
-                <button className="conflict-row" onClick={() => tab === "open" ? onSelect(conflict) : setExpandedHistory(expandedHistory === conflict.id ? undefined : conflict.id)}>
-                  <span className="conflict-icon">{tab === "open" ? "!" : "✓"}</span>
-                  <span className="conflict-info">
-                    <strong>{conflict.relativePath ?? conflict.id.slice(0, 12)}</strong>
-                    <small>{tab === "open"
-                      ? `产生于 ${formatDateTime(conflict.createdAt)}`
-                      : `${conflict.status === "aborted" ? "已搁置" : "已解决"} · ${formatDateTime(conflict.resolvedAt)}`}</small>
-                  </span>
-                  <span className="arrow">{tab === "open" ? "→" : expandedHistory === conflict.id ? "↑" : "↓"}</span>
-                </button>
-                {tab === "history" && expandedHistory === conflict.id && (
-                  <div className="history-detail">
-                    <div className="diff-grid two">
-                      <SplitPane base={conflict.baseContent} target={conflict.status === "aborted" ? conflict.localContent : conflict.mergedContent ?? conflict.localContent} side="local" label="BASE / 当时基线" />
-                      <SplitPane base={conflict.baseContent} target={conflict.mergedContent ?? conflict.localContent} side="remote" label={conflict.status === "aborted" ? "LOCAL / 本地版本" : "MERGED / 当时采用的结果"} />
-                    </div>
-                  </div>
-                )}
+            {conflicts.map((conflict) => (
+              <button key={conflict.id} className="conflict-row" onClick={() => onSelect(conflict)}>
+                <span className="conflict-icon">!</span>
+                <span className="conflict-info">
+                  <strong>{conflict.relativePath ?? conflict.id.slice(0, 12)}</strong>
+                  <small>产生于 {formatDateTime(conflict.createdAt)}</small>
+                </span>
+                <span className="arrow">→</span>
+              </button>
+            ))}
+          </div>)}
+        {(group === "remote-missing" || group === "local-missing") && (missingEntries.length === 0
+          ? <div className="empty-state"><div className="check">✓</div><strong>{GROUP_EMPTY[group].title}</strong><span>{GROUP_EMPTY[group].hint}</span></div>
+          : <div className="conflict-list">
+            {missingEntries.map((entry) => (
+              <div key={entry.id} className="conflict-row issue-row">
+                <span className="conflict-icon">{group === "remote-missing" ? "☁" : "💻"}</span>
+                <span className="conflict-info">
+                  <strong>{entry.relativePath}</strong>
+                  <small>{group === "remote-missing" ? "飞书侧已不存在，同步将重新创建远端文档" : "本地文件已不存在，同步将从飞书拉回"}</small>
+                </span>
+                <span className="issue-row-actions">
+                  <button className="secondary" disabled={busyEntry === entry.id} onClick={() => void runEntryAction(entry.id, () => onSyncEntry(entry.id))}>{busyEntry === entry.id ? "同步中…" : "同步"}</button>
+                  <button className="danger-ghost" disabled={busyEntry === entry.id} onClick={() => void runEntryAction(entry.id, () => onIgnoreEntry(entry.id, true))}>忽略</button>
+                </span>
               </div>
             ))}
-          </div>}
+          </div>)}
+        {group === "ignored" && (ignored.length === 0
+          ? <div className="empty-state"><div className="check">✓</div><strong>{GROUP_EMPTY[group].title}</strong><span>{GROUP_EMPTY[group].hint}</span></div>
+          : <div className="conflict-list">
+            {ignored.map((entry) => (
+              <div key={entry.id} className="conflict-row issue-row">
+                <span className="conflict-icon">⊘</span>
+                <span className="conflict-info">
+                  <strong>{entry.relativePath}</strong>
+                  <small>忽略于 {formatDateTime(entry.ignoredAt)} · 当前状态 {entry.status}</small>
+                </span>
+                <span className="issue-row-actions">
+                  <button className="secondary" disabled={busyEntry === entry.id} onClick={() => void runEntryAction(entry.id, () => onIgnoreEntry(entry.id, false))}>{busyEntry === entry.id ? "恢复中…" : "恢复"}</button>
+                </span>
+              </div>
+            ))}
+          </div>)}
       </div>
     </>;
   }
@@ -220,7 +309,7 @@ export function ConflictsView({ conflicts, selected, onSelect, onResolve, onRefr
 
     {mode === "preview" && <div className="panel preview-panel">
       <div className="panel-heading"><div><h3>合并结果预览</h3><span className="muted">文档内相对路径图片通过服务端代理加载</span></div></div>
-      <MarkdownPreview source={resolutionContent} rootId={selected.rootId} className="padded" />
+      <MarkdownPreview source={resolutionContent} rootId={rootId} className="padded" />
     </div>}
 
     <div className="resolve-bar">
@@ -230,5 +319,3 @@ export function ConflictsView({ conflicts, selected, onSelect, onResolve, onRefr
     </div>
   </div>;
 }
-
-export const STATUS_LABELS = ENTRY_STATUS_LABELS;

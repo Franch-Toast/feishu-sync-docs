@@ -9,6 +9,7 @@ import type { RemoteProvider, StateStore } from "@feishu-sync/core";
 import { SqliteStateStore } from "@feishu-sync/storage";
 import { createRemoteProvider, ProviderRegistry } from "./provider.js";
 import { CredentialStore, type CredentialInput } from "./credentials.js";
+import { AppConfigStore, migrateLegacyDatabase, resolveDatabasePath, resolveLegacyDatabasePath, type LogLevel } from "./appconfig.js";
 import { SyncRuntime } from "./runtime.js";
 import { EventChannelService } from "./eventchannel.js";
 
@@ -18,11 +19,13 @@ export interface AppOptions {
   credentials?: CredentialStore;
   publicDir?: string;
   databasePath?: string;
+  /** Injected by tests/embedding; defaults to ~/.feishu-sync-docs/config.json. */
+  appConfig?: AppConfigStore;
 }
 
-export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime: SyncRuntime; store: StateStore; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService } {
-  const store = options.store ?? new SqliteStateStore(options.databasePath ?? process.env.SYNC_DB_PATH ?? ".data/sync.db");
-  const app = Fastify({ logger: process.env.NODE_ENV === "test" ? false : { level: process.env.SYNC_LOG_LEVEL ?? "info" } });
+export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime: SyncRuntime; store: StateStore; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore } {
+  const appConfig = options.appConfig ?? new AppConfigStore();
+  const app = Fastify({ logger: process.env.NODE_ENV === "test" ? false : { level: process.env.SYNC_LOG_LEVEL ?? appConfig.preferences.logLevel } });
   // Tolerate body-less requests that still carry the JSON content-type (e.g.
   // REST clients unbinding a root) instead of failing with
   // FST_ERR_CTP_EMPTY_JSON_BODY.
@@ -30,7 +33,14 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (body === "" || body === undefined) return done(null, undefined);
     try { done(null, JSON.parse(body)); } catch (error) { done(error as Error); }
   });
-  const credentials = options.credentials ?? new CredentialStore(store, undefined, undefined, app.log);
+  const databasePath = options.databasePath ?? process.env.SYNC_DB_PATH ?? resolveDatabasePath();
+  // Default-path deployments adopt the legacy <cwd>/.data/sync.db exactly once:
+  // only when no explicit store/path was requested and the target is still empty.
+  if (!options.store && !options.databasePath && migrateLegacyDatabase(databasePath)) {
+    app.log.info({ from: resolveLegacyDatabasePath(), to: databasePath }, "migrated legacy sync.db into the new default data directory");
+  }
+  const store = options.store ?? new SqliteStateStore(databasePath);
+  const credentials = options.credentials ?? new CredentialStore(appConfig, undefined, undefined, app.log);
   // When a remote is injected (tests/embedding) it is used as-is; otherwise a
   // registry rebuilds the provider from stored credentials on every save.
   const registry = options.remote ? undefined : new ProviderRegistry(credentials);
@@ -43,11 +53,12 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     app.log,
     // Maintenance tick: proactively rotate user tokens, then swap the live
     // delegate so the registry's in-memory token stays in sync with the DB.
-    () => credentials.maintainUserToken().then(() => registry?.rebuild()).then(() => undefined)
+    () => credentials.maintainUserToken().then(() => registry?.rebuild()).then(() => undefined),
+    appConfig
   );
   // Long-lived drive event subscription; polling stays enabled as the fallback.
   const eventChannel = new EventChannelService(credentials, store, runtime, app.log);
-  Object.assign(app, { runtime, store, credentials, registry, eventChannel });
+  Object.assign(app, { runtime, store, credentials, registry, eventChannel, appConfig });
 
   void app.register(fastifyWebsocket);
   const defaultPublicDir = join(dirname(fileURLToPath(import.meta.url)), "../public");
@@ -79,13 +90,26 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
   });
   app.post<{ Body: CredentialInput | undefined }>("/api/settings/test-connection", async (request) => credentials.testConnection(request.body ?? undefined));
 
+  // ---- Global preferences (config.json; never exposes credential fields) --
+  app.get("/api/app-config", async () => ({
+    preferences: appConfig.preferences,
+    paths: { config: appConfig.configPath, database: databasePath }
+  }));
+  app.put<{ Body: { defaultPollIntervalMs?: number; logLevel?: LogLevel } }>("/api/app-config", async (request) => {
+    const preferences = await appConfig.setPreferences(request.body ?? {});
+    // Apply the new verbosity live unless the env override wins.
+    if (process.env.SYNC_LOG_LEVEL === undefined) app.log.level = preferences.logLevel;
+    runtime.broadcastEvent({ type: "settings-updated" });
+    return { preferences, paths: { config: appConfig.configPath, database: databasePath } };
+  });
+
   app.get("/api/roots", async () => store.listRoots());
   app.post<{ Body: { localPath: string; remoteToken: string; remoteType?: "folder" | "wiki"; pollIntervalMs?: number } }>("/api/roots", async (request, reply) => {
     const body = request.body;
     if (!body || typeof body.localPath !== "string" || !body.localPath.trim() || typeof body.remoteToken !== "string" || !body.remoteToken.trim()) {
       return reply.code(400).send({ error: "localPath and remoteToken are required" });
     }
-    const pollIntervalMs = body.pollIntervalMs ?? 15000;
+    const pollIntervalMs = body.pollIntervalMs ?? appConfig.preferences.defaultPollIntervalMs;
     if (!Number.isFinite(pollIntervalMs) || pollIntervalMs < 1000) return reply.code(400).send({ error: "pollIntervalMs must be at least 1000ms" });
     if (!existsSync(body.localPath) || !statSync(body.localPath).isDirectory()) {
       return reply.code(400).send({ error: "localPath must point to an existing directory" });
@@ -187,6 +211,17 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
   });
   app.get<{ Params: { id: string } }>("/api/entries/:id/content", async (request) => runtime.readDocument(request.params.id));
   app.post<{ Params: { id: string } }>("/api/entries/:id/restore-base", async (request) => runtime.restoreBase(request.params.id));
+  // ---- Issue workbench: single-entry sync / ignore, batch missing resync --
+  app.post<{ Params: { id: string } }>("/api/entries/:id/sync", async (request) => runtime.syncEntryNow(request.params.id));
+  app.post<{ Params: { id: string }; Body: { ignored?: boolean } }>("/api/entries/:id/ignore", async (request, reply) => {
+    if (typeof request.body?.ignored !== "boolean") return reply.code(400).send({ error: "ignored must be a boolean" });
+    return runtime.setEntryIgnored(request.params.id, request.body.ignored);
+  });
+  app.post<{ Params: { id: string } }>("/api/roots/:id/sync-missing", async (request, reply) => {
+    const root = await store.getRoot(request.params.id);
+    if (!root) return reply.code(404).send({ error: "root not found" });
+    return runtime.syncMissingEntries(request.params.id);
+  });
   app.get<{ Querystring: { status?: string } }>("/api/conflicts", async (request) => {
     const status = request.query.status;
     const list = status === "all"
@@ -244,5 +279,5 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     const close = (store as StateStore & { close?: () => void }).close;
     close?.call(store);
   });
-  return app as unknown as FastifyInstance & { runtime: SyncRuntime; store: StateStore; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService };
+  return app as unknown as FastifyInstance & { runtime: SyncRuntime; store: StateStore; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore };
 }

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { SyncEngine } from "@feishu-sync/core";
 import { sha256 } from "@feishu-sync/core";
 import { FeishuApiError } from "@feishu-sync/feishu";
+import type { AuthStateStore } from "./appconfig.js";
 import type { ConflictRecord, LocalProvider, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, StateStore, SyncEntry, SyncRoot } from "@feishu-sync/core";
 
 export class SyncRuntime {
@@ -22,7 +23,9 @@ export class SyncRuntime {
     private readonly prepareRemote?: () => Promise<void>,
     private readonly logger?: FastifyBaseLogger,
     /** Invoked on every maintenance tick: proactively rotates user tokens. */
-    private readonly maintainCredentials?: () => Promise<void>
+    private readonly maintainCredentials?: () => Promise<void>,
+    /** Auth lifecycle flags live in config.json; absent in bare-runtime tests. */
+    private readonly authState?: AuthStateStore
   ) {
     this.engine = new SyncEngine(store, local, remote);
   }
@@ -238,8 +241,77 @@ export class SyncRuntime {
     return { ok: true, entryId, relativePath: entry.relativePath };
   }
 
+  /** Single-entry forced sync (issue workbench / docs view retry):
+   *  local-missing re-pulls the remote document, remote-missing re-creates
+   *  the remote side, everything else is re-evaluated from scratch. */
+  async syncEntryNow(entryId: string): Promise<SyncEntry> {
+    const entry = await this.store.getEntry(entryId);
+    if (!entry) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
+    const root = await this.store.getRoot(entry.rootId);
+    if (!root) throw Object.assign(new Error(`Root not found: ${entry.rootId}`), { statusCode: 404 });
+    await this.enqueue(root.id, () => this.syncSingleEntry(entry, root));
+    const result = await this.store.getEntry(entryId);
+    if (!result) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
+    return result;
+  }
+
+  /** Ignore or restore an entry. Ignoring keeps the current single-side
+   *  state and skips every future evaluation until restored. */
+  async setEntryIgnored(entryId: string, ignored: boolean): Promise<SyncEntry> {
+    const entry = await this.store.getEntry(entryId);
+    if (!entry) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
+    const next: SyncEntry = { ...entry, ignoredAt: ignored ? new Date().toISOString() : undefined, updatedAt: new Date().toISOString() };
+    await this.store.upsertEntry(next);
+    this.broadcast({ type: "sync", rootId: entry.rootId });
+    return (await this.store.getEntry(entryId)) ?? next;
+  }
+
+  /** One-click resync of every local-missing / remote-missing entry of a
+   *  root. Returns how many entries were actually processed. */
+  async syncMissingEntries(rootId: string): Promise<{ rootId: string; synced: number; total: number }> {
+    const root = await this.store.getRoot(rootId);
+    if (!root) throw Object.assign(new Error(`Root not found: ${rootId}`), { statusCode: 404 });
+    const missing = (await this.store.listEntries(rootId))
+      .filter((entry) => !entry.ignoredAt && (entry.status === "local-missing" || entry.status === "remote-missing"));
+    let synced = 0;
+    await this.enqueue(root.id, async () => {
+      for (const entry of missing) {
+        try {
+          await this.syncSingleEntry(entry, root);
+          synced += 1;
+        } catch (error) {
+          this.log("warn", "missing-entry resync failed", { rootId, entryId: entry.id, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+    });
+    this.broadcast({ type: "sync", rootId });
+    return { rootId, synced, total: missing.length };
+  }
+
+  /** Execute one forced entry sync without queueing; shared by the single
+   *  and batch resync paths. */
+  private async syncSingleEntry(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry> {
+    if (entry.ignoredAt) throw Object.assign(new Error("Entry is ignored; restore it before syncing"), { statusCode: 400 });
+    let result: SyncEntry;
+    if (entry.status === "local-missing") {
+      result = (await this.engine.pullRemoteEntry(entry, root)) ?? entry;
+    } else if (entry.status === "remote-missing") {
+      result = await this.engine.recreateRemoteEntry(entry, root);
+    } else {
+      // error/pending (and conflicts): force a fresh three-way evaluation.
+      const rearmed = { ...entry, status: "pending" as const, updatedAt: new Date().toISOString() };
+      await this.store.upsertEntry(rearmed);
+      result = await this.engine.syncEntry(rearmed, root);
+    }
+    this.broadcast({ type: "sync", rootId: root.id });
+    return result;
+  }
+
   private async scanAndSync(root: SyncRoot): Promise<unknown> {
     const startedAt = Date.now();
+    // Unified entry-point signal (manual/poll/watcher/event channel alike) so
+    // the UI can show per-root progress instead of silent syncing.
+    this.broadcast({ type: "sync-started", rootId: root.id });
     let scan: Awaited<ReturnType<SyncEngine["scan"]>>;
     try {
       scan = await this.engine.scan(root);
@@ -252,7 +324,8 @@ export class SyncRuntime {
     const attempts = new Map<string, number>();
     while (true) {
       const pending = (await this.store.listEntries(root.id))
-        .filter((entry) => entry.status === "pending" && (attempts.get(entry.id) ?? 0) < 3)
+        // Ignored entries are frozen by the user; never evaluate them here.
+        .filter((entry) => entry.status === "pending" && !entry.ignoredAt && (attempts.get(entry.id) ?? 0) < 3)
         .sort((left, right) => Number(left.kind !== "asset") - Number(right.kind !== "asset"));
       if (pending.length === 0) break;
       for (const entry of pending) {
@@ -305,10 +378,9 @@ export class SyncRuntime {
 
   /** Persist the credential-invalid state once and alert every open page. */
   private async flagAuthInvalid(): Promise<void> {
-    const current = await this.store.getSetting("feishu.authStatus");
+    const current = (await this.authState?.getAuthFlag())?.status;
     if (current !== "invalid") {
-      await this.store.setSetting("feishu.authStatus", "invalid");
-      await this.store.setSetting("feishu.authCheckedAt", new Date().toISOString());
+      await this.authState?.setAuthFlag("invalid", new Date().toISOString());
       this.broadcast({ type: "auth-invalid" });
       this.log("warn", "Feishu credentials marked invalid");
     }
@@ -316,10 +388,9 @@ export class SyncRuntime {
 
   /** Clear a previously flagged invalid state after a successful sync round. */
   private async markAuthHealthy(): Promise<void> {
-    const current = await this.store.getSetting("feishu.authStatus");
+    const current = (await this.authState?.getAuthFlag())?.status;
     if (current === "invalid") {
-      await this.store.setSetting("feishu.authStatus", "ok");
-      await this.store.setSetting("feishu.authCheckedAt", new Date().toISOString());
+      await this.authState?.setAuthFlag("ok", new Date().toISOString());
       this.broadcast({ type: "auth-restored" });
       this.log("info", "Feishu credentials restored");
     }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,7 @@ import type { RemoteTree, SyncRoot } from "@feishu-sync/core";
 import { FeishuApiError } from "@feishu-sync/feishu";
 import { SqliteStateStore } from "@feishu-sync/storage";
 import { SyncRuntime } from "../src/runtime.js";
+import { AppConfigStore } from "../src/appconfig.js";
 import type { WebSocket } from "ws";
 import { FakeRemote } from "./helpers/fake-remote.js";
 
@@ -22,6 +23,7 @@ interface EntryView {
   id: string;
   status: string;
   remoteToken?: string;
+  ignoredAt?: string;
 }
 
 function createScenario(): Scenario {
@@ -227,7 +229,8 @@ function broadcastTypes(messages: string[]): string[] {
 test("auth failures flag the credential state and recovery clears it", async () => {
   const store = new SqliteStateStore();
   const remote = new AuthFlippingRemote();
-  const runtime = new SyncRuntime(store, new FilesystemProvider(), remote);
+  const config = new AppConfigStore(join(mkdtempSync(join(tmpdir(), "feishu-sync-runtime-auth-config-")), "config.json"));
+  const runtime = new SyncRuntime(store, new FilesystemProvider(), remote, undefined, undefined, undefined, config);
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-runtime-auth-"));
   const { socket, messages } = createFakeSocket();
   runtime.addClient(socket);
@@ -237,25 +240,25 @@ test("auth failures flag the credential state and recovery clears it", async () 
 
     // A healthy round never touches the auth state.
     await runtime.syncRoot(root.id);
-    assert.equal(await store.getSetting("feishu.authStatus"), undefined);
+    assert.equal((await config.getAuthFlag()).status, undefined);
     assert.ok(!broadcastTypes(messages).includes("auth-invalid"));
 
     // An auth error flags the credentials once and short-circuits the round.
     remote.failAuth = true;
     const failed = (await runtime.syncRoot(root.id)) as { authInvalid?: boolean };
     assert.equal(failed.authInvalid, true);
-    assert.equal(await store.getSetting("feishu.authStatus"), "invalid");
+    assert.equal((await config.getAuthFlag()).status, "invalid");
     assert.equal(broadcastTypes(messages).filter((type) => type === "auth-invalid").length, 1);
 
     // Repeated failures stay quiet: the flag is broadcast once, not per sync.
     await runtime.syncRoot(root.id);
-    assert.equal(await store.getSetting("feishu.authStatus"), "invalid");
+    assert.equal((await config.getAuthFlag()).status, "invalid");
     assert.equal(broadcastTypes(messages).filter((type) => type === "auth-invalid").length, 1);
 
     // A healthy round restores the credential state and announces it.
     remote.failAuth = false;
     await runtime.syncRoot(root.id);
-    assert.equal(await store.getSetting("feishu.authStatus"), "ok");
+    assert.equal((await config.getAuthFlag()).status, "ok");
     assert.ok(broadcastTypes(messages).includes("auth-restored"), "expected an auth-restored broadcast");
   } finally {
     runtime.stop();
@@ -277,6 +280,131 @@ test("plain remote errors never flag the credential state", async () => {
     assert.equal(scenario.remote.documents.get(token)?.content, "shared line\n");
     const authStatus = await scenario.store.getSetting("feishu.authStatus");
     assert.ok(authStatus !== "invalid", "a plain write failure must not flag the credentials");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("reclassifies vanished local files as local-missing and re-pulls them on demand", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entry = result.entries[0]!;
+    const token = entry.remoteToken!;
+    assert.equal(entry.status, "clean");
+
+    rmSync(join(scenario.directory, "notes.md"));
+    const scanned = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(scanned.entries[0]?.status, "local-missing");
+    assert.ok(!existsSync(join(scenario.directory, "notes.md")), "the local file must stay absent until an explicit resync");
+
+    const restored = await scenario.runtime.syncEntryNow(entry.id);
+    assert.equal(restored.status, "clean");
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "shared line\n");
+    assert.equal(scenario.remote.documents.get(token)?.content, "shared line\n");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("reclassifies deleted remote documents as remote-missing and re-creates them on demand", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entry = result.entries[0]!;
+    const token = entry.remoteToken!;
+
+    await scenario.remote.softDelete(token);
+    const scanned = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(scanned.entries[0]?.status, "remote-missing");
+
+    const recreated = await scenario.runtime.syncEntryNow(entry.id);
+    assert.equal(recreated.status, "clean");
+    assert.ok(recreated.remoteToken, "the recreated entry must be bound to the new remote document");
+    assert.equal(scenario.remote.documents.get(recreated.remoteToken!)?.content, "shared line\n");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("ignoring freezes an entry across scans until it is restored", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entry = result.entries[0]!;
+    const token = entry.remoteToken!;
+
+    const ignored = await scenario.runtime.setEntryIgnored(entry.id, true);
+    assert.ok(ignored.ignoredAt, "ignoring must stamp ignoredAt");
+
+    // Both sides drift away; an ignored entry must not be re-evaluated.
+    writeFileSync(join(scenario.directory, "notes.md"), "local drift\n", "utf8");
+    scenario.remote.edit(token, "remote drift\n");
+    const scanned = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const frozen = scanned.entries[0]!;
+    assert.equal(frozen.status, "clean", "an ignored entry must not be re-evaluated");
+    assert.ok(frozen.ignoredAt);
+    assert.equal(scenario.remote.documents.get(token)?.content, "remote drift\n");
+
+    // Restoring re-arms the entry, and the drift is evaluated as a conflict.
+    const restored = await scenario.runtime.setEntryIgnored(entry.id, false);
+    assert.ok(!restored.ignoredAt, "restoring must clear ignoredAt");
+    const reevaluated = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(reevaluated.entries[0]?.status, "conflict");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("syncMissingEntries heals every missing entry of a root in one call", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    await scenario.runtime.syncRoot(root.id);
+    writeFileSync(join(scenario.directory, "extra.md"), "extra line\n", "utf8");
+    await scenario.runtime.syncRoot(root.id);
+
+    const before = await scenario.store.listEntries(root.id);
+    const notes = before.find((entry) => entry.relativePath === "notes.md")!;
+    const extra = before.find((entry) => entry.relativePath === "extra.md")!;
+    assert.equal(notes.status, "clean");
+    assert.equal(extra.status, "clean");
+
+    rmSync(join(scenario.directory, "notes.md"));
+    await scenario.remote.softDelete(extra.remoteToken!);
+    await scenario.runtime.syncRoot(root.id);
+    const broken = await scenario.store.listEntries(root.id);
+    assert.equal(broken.find((entry) => entry.relativePath === "notes.md")?.status, "local-missing");
+    assert.equal(broken.find((entry) => entry.relativePath === "extra.md")?.status, "remote-missing");
+
+    const outcome = await scenario.runtime.syncMissingEntries(root.id);
+    assert.deepEqual(outcome, { rootId: root.id, synced: 2, total: 2 });
+
+    const healed = await scenario.store.listEntries(root.id);
+    assert.equal(healed.find((entry) => entry.relativePath === "notes.md")?.status, "clean");
+    assert.equal(healed.find((entry) => entry.relativePath === "extra.md")?.status, "clean");
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "shared line\n");
+    assert.equal(scenario.remote.documents.get(healed.find((entry) => entry.relativePath === "extra.md")!.remoteToken!)?.content, "extra line\n");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("announces sync-started before each sync round", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+    await scenario.runtime.syncRoot(root.id);
+    const types = broadcastTypes(messages);
+    const started = types.indexOf("sync-started");
+    const done = types.indexOf("sync");
+    assert.ok(started >= 0, "expected a sync-started broadcast");
+    assert.ok(done > started, "the completion broadcast must follow sync-started");
   } finally {
     cleanup(scenario);
   }

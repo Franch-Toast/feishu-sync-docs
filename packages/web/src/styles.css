@@ -304,6 +304,71 @@ a { color: var(--blue); }
 .badge.ok-badge { background: var(--accent-soft); color: var(--accent-strong); }
 .badge.paused-badge { background: rgba(122, 142, 161, .15); color: var(--text-muted); }
 .badge.conflict-badge { background: var(--red-soft); color: var(--red); }
+.badge.missing-badge { background: var(--amber-soft); color: var(--amber); }
+
+/* Sync visibility (P3): root-level scanning state + per-entry badges. */
+.status-badge.scanning { background: var(--blue-soft); color: var(--blue); animation: pulse 1.6s ease-in-out infinite; }
+.status-badge.local-missing, .status-badge.remote-missing { background: var(--amber-soft); color: var(--amber); }
+.status-badge.ignored { background: rgba(122, 142, 161, .15); color: var(--text-muted); }
+
+.running-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; margin-bottom: 16px;
+  border: 1px solid var(--blue); border-radius: var(--radius);
+  background: var(--blue-soft); color: var(--blue);
+  font-size: 13px; font-weight: 600;
+}
+.running-spinner {
+  width: 14px; height: 14px; border-radius: 50%; flex: none;
+  border: 2px solid var(--blue); border-top-color: transparent;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Live activity feed (history tab / issue workbench). */
+.activity-panel { margin-bottom: 16px; }
+.activity-feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.activity-item {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 8px 18px; border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.activity-item:last-child { border-bottom: none; }
+.activity-item time { flex: none; font-variant-numeric: tabular-nums; }
+.activity-item .activity-kind {
+  flex: none; text-transform: uppercase; font-size: 10px; font-weight: 700;
+  letter-spacing: .04em; padding: 2px 7px; border-radius: 999px;
+  background: var(--blue-soft); color: var(--blue);
+}
+.activity-item.error .activity-kind { background: var(--red-soft); color: var(--red); }
+.activity-item.sync-started .activity-kind, .activity-item.sync .activity-kind { background: var(--accent-soft); color: var(--accent-strong); }
+.activity-item.pruned .activity-kind, .activity-item.conflict .activity-kind, .activity-item.ignored .activity-kind { background: var(--amber-soft); color: var(--amber); }
+.activity-item .activity-text { flex: 1; }
+
+/* Clickable dashboard metrics (metric shortcuts). */
+button.metric { cursor: pointer; text-align: left; font: inherit; color: inherit; }
+button.metric.metric-link:hover { border-color: var(--accent); }
+button.metric .strong, button.metric strong { cursor: pointer; }
+
+/* Failure hint under the docs preview toolbar. */
+.failure-hint {
+  margin: 0 0 12px; padding: 10px 14px;
+  border: 1px solid var(--red); border-radius: var(--radius);
+  background: var(--red-soft); color: var(--red);
+  font-size: 12.5px; word-break: break-all;
+}
+
+/* History filename search box. */
+.history-search {
+  min-width: 180px; max-width: 240px;
+  padding: 7px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-raised); color: var(--text); font-size: 13px;
+}
+.history-search:focus { outline: none; border-color: var(--accent); }
+
+/* Issue rows inside the workbench (sync / ignore action column). */
+.issue-row { cursor: default; }
+.issue-row-actions { display: inline-flex; gap: 8px; align-items: center; }
 
 /* =====================================================================
    Dashboard root cards
@@ -506,6 +571,18 @@ a { color: var(--blue); }
 .test-result.fail { background: var(--red-soft); color: var(--red); border: 1px solid rgba(240, 147, 140, .3); }
 .test-result a { color: var(--amber); }
 .interval-input { width: 100px !important; }
+
+/* Event push guide (settings, P2) */
+.event-guide, .event-troubleshoot {
+  margin: 0; padding: 10px 12px 10px 30px;
+  background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-size: 12px; line-height: 1.7;
+  color: var(--text-muted);
+}
+.event-troubleshoot { border-color: rgba(240, 147, 140, .3); color: var(--amber); background: var(--red-soft); }
+.event-guide li + li, .event-troubleshoot li + li { margin-top: 6px; }
+.event-guide a { color: var(--accent-strong); }
+.event-guide code { background: var(--border); border-radius: 4px; padding: 1px 5px; font-size: 11px; }
 
 /* =====================================================================
    Auth badge

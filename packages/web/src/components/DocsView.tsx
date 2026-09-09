@@ -1,13 +1,19 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { api, ENTRY_STATUS_LABELS, formatDateTime, type Entry, type TreeResponse } from "../api";
+import { api, ENTRY_STATUS_LABELS, formatDateTime, type Entry, type Operation, type TreeResponse } from "../api";
 import { buildFileTree, filterFileTree, type FileTreeNode } from "../fileTree";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { Icon } from "./Icon";
 
 interface DocsViewProps {
   tree?: TreeResponse;
+  /** True while a sync round for the whole root is in flight: entries that
+   *  are not individually syncing show a "scanning" badge instead of silence. */
+  running?: boolean;
+  /** Operations for surfacing the latest failure reason of error entries. */
+  operations?: Operation[];
   selectedEntryId?: string;
   onSelectEntry: (entryId: string | undefined) => void;
+  onSyncEntry?: (entryId: string) => Promise<void>;
   onRefresh: () => void;
 }
 
@@ -17,11 +23,12 @@ type PreviewState =
   | { kind: "asset"; relativePath: string; url: string }
   | { kind: "error"; message: string };
 
-export function DocsView({ tree, selectedEntryId, onSelectEntry, onRefresh }: DocsViewProps): React.JSX.Element {
+export function DocsView({ tree, running, operations, selectedEntryId, onSelectEntry, onSyncEntry, onRefresh }: DocsViewProps): React.JSX.Element {
   const [filter, setFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const [preview, setPreview] = useState<PreviewState>();
   const [restoring, setRestoring] = useState(false);
+  const [retrying, setRetrying] = useState(false);
 
   const entries = tree?.entries;
   const rootId = tree?.root.id;
@@ -34,9 +41,22 @@ export function DocsView({ tree, selectedEntryId, onSelectEntry, onRefresh }: Do
   }, [entries, needle]);
   const filterActive = needle.length > 0;
 
+  // Newest failed operation per entry: powers the failure hint in the preview.
+  const lastFailures = useMemo(() => {
+    const map: Record<string, { error?: string; at?: string }> = {};
+    (operations ?? []).forEach((operation) => {
+      if (!operation.entryId || operation.status !== "failed") return;
+      const known = map[operation.entryId];
+      if (!known || !known.at || (operation.completedAt ?? operation.createdAt) > known.at) {
+        map[operation.entryId] = { error: operation.error, at: operation.completedAt ?? operation.createdAt };
+      }
+    });
+    return map;
+  }, [operations]);
+
   const statusBadge = (entry: Entry) => (
-    <span className={`status-badge ${entry.syncing ? "syncing" : entry.status}`}>
-      {entry.syncing ? "同步中" : ENTRY_STATUS_LABELS[entry.status] ?? entry.status}
+    <span className={`status-badge ${entry.ignoredAt ? "ignored" : entry.syncing ? "syncing" : running ? "scanning" : entry.status}`}>
+      {entry.ignoredAt ? "已忽略" : entry.syncing ? "同步中" : running ? "检测中" : ENTRY_STATUS_LABELS[entry.status] ?? entry.status}
     </span>
   );
 
@@ -87,6 +107,7 @@ export function DocsView({ tree, selectedEntryId, onSelectEntry, onRefresh }: Do
     });
 
   const selected = entries?.find((entry) => entry.id === selectedEntryId);
+  const selectedFailure = selected ? lastFailures[selected.id] : undefined;
 
   useEffect(() => {
     if (!selected) {
@@ -117,6 +138,17 @@ export function DocsView({ tree, selectedEntryId, onSelectEntry, onRefresh }: Do
     }
   };
 
+  const retrySelected = async () => {
+    if (!selected || !onSyncEntry || retrying) return;
+    setRetrying(true);
+    try {
+      await onSyncEntry(selected.id);
+      onRefresh();
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   return <div className="docs-view">
     {(entries ?? []).length === 0
       ? <div className="empty-state"><div className="check">✓</div><strong>暂无条目</strong><span>绑定根目录并执行同步后，文档会出现在这里。</span></div>
@@ -134,12 +166,14 @@ export function DocsView({ tree, selectedEntryId, onSelectEntry, onRefresh }: Do
           {!selected && <div className="empty-state"><div className="check">📄</div><strong>选择左侧文档</strong><span>支持 Markdown 渲染与图片预览。</span></div>}
           {selected && <>
             <div className="preview-toolbar">
-                          <button className="back-to-list" onClick={() => onSelectEntry(undefined)}><Icon name="back" size={15} />返回列表</button>
+              <button className="back-to-list" onClick={() => onSelectEntry(undefined)}><Icon name="back" size={15} />返回列表</button>
               <div className="preview-title"><strong>{selected.relativePath}</strong>{statusBadge(selected)}</div>
               <div className="heading-actions">
                 {selected.kind === "document" && selected.status !== "clean" && <button className="danger-ghost" disabled={restoring} onClick={() => void restoreBase()}>{restoring ? "恢复中…" : "恢复到基线版本"}</button>}
+                {selected.status === "error" && onSyncEntry && <button className="secondary" disabled={retrying} onClick={() => void retrySelected()}>{retrying ? "重试中…" : "重试同步"}</button>}
               </div>
             </div>
+            {selected.status === "error" && selectedFailure?.error && <div className="failure-hint">上次失败原因：{selectedFailure.error}</div>}
             {preview?.kind === "loading" && <div className="empty-state"><span>加载中…</span></div>}
             {preview?.kind === "error" && <div className="empty-state"><strong>无法读取内容</strong><span>{preview.message}</span></div>}
             {preview?.kind === "asset" && <div className="panel preview-panel"><div className="asset-frame"><img src={preview.url} alt={preview.relativePath} /></div></div>}

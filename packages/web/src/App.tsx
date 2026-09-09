@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
+  type ActivityItem,
+  type AppConfigPatch,
+  type AppConfigView,
   type Conflict,
   type CredentialPatch,
   type Operation,
@@ -16,7 +19,7 @@ import {
 } from "./api";
 import { Dashboard } from "./components/Dashboard";
 import { GuideModal } from "./components/GuideModal";
-import { RootDetail } from "./components/RootDetail";
+import { RootDetail, type DetailTab } from "./components/RootDetail";
 import { NOTIFY_STORAGE_KEY, SettingsView } from "./components/SettingsView";
 import { Icon, type IconName } from "./components/Icon";
 import "./styles.css";
@@ -53,6 +56,11 @@ function rootName(root: Root): string {
   return root.localPath.split(/[\\/]/).at(-1) ?? root.localPath;
 }
 
+/** Short display form for ids inside activity texts. */
+function shortRootId(id: string): string {
+  return id.slice(0, 8);
+}
+
 export function App(): React.JSX.Element {
   const [view, setView] = useState<View>("dashboard");
   const [roots, setRoots] = useState<Root[]>([]);
@@ -60,9 +68,11 @@ export function App(): React.JSX.Element {
   const [tree, setTree] = useState<TreeResponse>();
   const [operations, setOperations] = useState<Operation[]>([]);
   const [settings, setSettings] = useState<RedactedSettings>();
+  const [appConfig, setAppConfig] = useState<AppConfigView>();
   const [stats, setStats] = useState<RootStats>();
   const [rootStats, setRootStats] = useState<Record<string, RootStats>>({});
   const [selectedRootId, setSelectedRootId] = useState<string | undefined>();
+  const [initialTab, setInitialTab] = useState<DetailTab>("docs");
   const [message, setMessage] = useState("正在连接服务...");
   const [syncing, setSyncing] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
@@ -71,6 +81,25 @@ export function App(): React.JSX.Element {
   const [notifyEnabled, setNotifyEnabled] = useState(() => window.localStorage.getItem(NOTIFY_STORAGE_KEY) === "1");
   const [newLocalPath, setNewLocalPath] = useState("");
   const [newRemoteToken, setNewRemoteToken] = useState("");
+  const [newRemoteType, setNewRemoteType] = useState<"folder" | "wiki">("folder");
+  const [newIntervalSec, setNewIntervalSec] = useState("");
+  /** Roots with a sync round in flight (from sync-started until sync/error). */
+  const [runningRoots, setRunningRoots] = useState<ReadonlySet<string>>(new Set());
+  /** Live activity feed shown in the issue workbench and history tab. */
+  const [activity, setActivity] = useState<ActivityItem[]>([]);
+
+  const pushActivity = useCallback((item: Omit<ActivityItem, "at">) => {
+    setActivity((current) => [{ ...item, at: new Date().toISOString() }, ...current].slice(0, 50));
+  }, []);
+
+  const setRootRunning = useCallback((rootId: string, running: boolean) => {
+    setRunningRoots((current) => {
+      if (running === current.has(rootId)) return current;
+      const next = new Set(current);
+      if (running) next.add(rootId); else next.delete(rootId);
+      return next;
+    });
+  }, []);
 
   // Poll-critical values live in refs so `refresh` stays referentially stable
   // (a changing callback used to tear down / reopen the WebSocket in a loop).
@@ -91,14 +120,16 @@ export function App(): React.JSX.Element {
     try {
       const currentView = viewRef.current;
       const currentRoot = selectedRootRef.current;
-      const [nextRoots, nextConflicts, nextSettings] = await Promise.all([
+      const [nextRoots, nextConflicts, nextSettings, nextAppConfig] = await Promise.all([
         api.listRoots(),
         api.listConflicts("open"),
-        api.getSettings()
+        api.getSettings(),
+        api.getAppConfig().catch(() => undefined)
       ]);
       setRoots(nextRoots);
       setConflicts(nextConflicts);
       setSettings(nextSettings);
+      if (nextAppConfig) setAppConfig(nextAppConfig);
       setMessage("服务正常");
 
       if (currentView === "detail" && currentRoot) {
@@ -142,6 +173,27 @@ export function App(): React.JSX.Element {
       try { payload = JSON.parse(String(event.data)) as ServerEvent; } catch { /* ignore */ }
       void refresh();
       if (!payload) return;
+      if (payload.type === "sync-started") {
+        setRootRunning(payload.rootId, true);
+        pushActivity({ kind: "sync-started", text: `根目录 ${shortRootId(payload.rootId)} 开始检测远端变更与本地差异` });
+      }
+      if (payload.type === "sync") {
+        setRootRunning(payload.rootId, false);
+        pushActivity({ kind: "sync", text: `根目录 ${shortRootId(payload.rootId)} 一轮同步结束` });
+      }
+      if (payload.type === "scan") {
+        setRootRunning(payload.rootId, false);
+        pushActivity({ kind: "scan", text: `根目录 ${shortRootId(payload.rootId)} 完成远端检测` });
+      }
+      if (payload.type === "error") {
+        if (payload.rootId) setRootRunning(payload.rootId, false);
+        pushActivity({ kind: "error", text: payload.entryId ? `条目 ${shortRootId(payload.entryId)} 同步失败：${payload.error}` : `同步出错：${payload.error}` });
+      }
+      if (payload.type === "maintenance-pruned") {
+        pushActivity({ kind: "pruned", text: `维护清理完成：${payload.operations} 条操作、${payload.conflicts} 条冲突、${payload.snapshots} 个快照` });
+      }
+      if (payload.type === "conflict-resolved") pushActivity({ kind: "conflict", text: "冲突已解决，合并结果写入本地与飞书" });
+      if (payload.type === "conflict-aborted") pushActivity({ kind: "conflict", text: "冲突已搁置，等待下次变更重新评估" });
       if (payload.type === "auth-invalid") {
         setGuideOpen(true);
         notify("飞书凭证已失效", "同步已暂停，点击页面顶部徽章更新凭证");
@@ -153,7 +205,7 @@ export function App(): React.JSX.Element {
     socket.onopen = () => { setLive(true); setMessage("实时连接已建立"); };
     socket.onclose = () => { setLive(false); setMessage("实时连接已断开，使用轮询"); };
     return () => socket.close();
-  }, [refresh, notify]);
+  }, [refresh, notify, pushActivity, setRootRunning]);
 
   // Reload view-specific data when the view or inspected root changes.
   useEffect(() => { void refresh(); }, [view, selectedRootId, refresh]);
@@ -166,11 +218,12 @@ export function App(): React.JSX.Element {
     }
   }, [view, selectedRootId, roots]);
 
-  const openRoot = (rootId: string) => {
+  const openRoot = (rootId: string, tab: DetailTab = "docs") => {
     // Drop stale detail data from a previously inspected root.
     setTree(undefined);
     setStats(undefined);
     setOperations([]);
+    setInitialTab(tab);
     setSelectedRootId(rootId);
     setView("detail");
   };
@@ -186,14 +239,48 @@ export function App(): React.JSX.Element {
   const addRoot = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!newLocalPath || !newRemoteToken) return;
+    const interval = Number.parseInt(newIntervalSec, 10);
     try {
-      const root = await api.createRoot({ localPath: newLocalPath, remoteToken: newRemoteToken });
+      const root = await api.createRoot({
+        localPath: newLocalPath,
+        remoteToken: newRemoteToken,
+        remoteType: newRemoteType,
+        pollIntervalMs: Number.isFinite(interval) && interval >= 1 ? interval * 1000 : undefined
+      });
       setNewLocalPath("");
       setNewRemoteToken("");
+      setNewIntervalSec("");
       setAddOpen(false);
       await refresh();
       openRoot(root.id);
     } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  };
+
+  const syncEntryNow = async (entryId: string) => {
+    try {
+      await api.syncEntry(entryId);
+      await refresh();
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  };
+
+  const setEntryIgnored = async (entryId: string, ignored: boolean) => {
+    try {
+      await api.setEntryIgnored(entryId, ignored);
+      pushActivity({ kind: "ignored", text: `条目 ${shortRootId(entryId)} ${ignored ? "已忽略，不再评估" : "已恢复评估"}` });
+      await refresh();
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  };
+
+  const syncMissing = async (rootId: string): Promise<number> => {
+    try {
+      const result = await api.syncMissing(rootId);
+      setMessage(`已同步 ${result.synced}/${result.total} 条缺失条目`);
+      await refresh();
+      return result.synced;
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+      return 0;
+    }
   };
 
   const resolveConflict = async (id: string, resolution: Resolution, mergedContent?: string) => {
@@ -234,6 +321,12 @@ export function App(): React.JSX.Element {
   const saveSettings = async (patch: CredentialPatch) => {
     const saved = await api.saveSettings(patch);
     setSettings(saved);
+  };
+
+  const saveAppConfig = async (patch: AppConfigPatch): Promise<AppConfigView> => {
+    const saved = await api.saveAppConfig(patch);
+    setAppConfig(saved);
+    return saved;
   };
 
   const testConnection = (patch?: CredentialPatch): Promise<TestConnectionResult> => api.testConnection(patch);
@@ -314,17 +407,25 @@ export function App(): React.JSX.Element {
           stats={stats}
           conflicts={detailConflicts}
           operations={detailOperations}
+          running={runningRoots.has(inspectedRoot.id)}
+          initialTab={initialTab}
+          activity={activity}
           syncing={syncing}
           onBack={closeRoot}
           onSyncNow={(rootId) => syncNow(rootId)}
           onToggleRoot={toggleRoot}
           onResolve={resolveConflict}
           onRetryRoot={(rootId) => syncNow(rootId)}
+          onSyncEntry={syncEntryNow}
+          onIgnoreEntry={setEntryIgnored}
+          onSyncMissing={syncMissing}
           onPrune={pruneHistory}
           onRefresh={() => void refresh()}
         />}
         {view === "settings" && <SettingsView
           settings={settings}
+          appConfig={appConfig}
+          onSaveAppConfig={saveAppConfig}
           roots={roots}
           onSaveSettings={saveSettings}
           onTestConnection={testConnection}
@@ -350,12 +451,30 @@ export function App(): React.JSX.Element {
     {addOpen && <div className="modal-backdrop" onClick={() => setAddOpen(false)}>
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <div className="modal-heading">
-          <div><h3>绑定同步根目录</h3><span className="muted">一个本地目录 ↔ 一个飞书文件夹</span></div>
+          <div><h3>绑定同步根目录</h3><span className="muted">一个本地目录 ↔ 一个飞书文件夹/知识空间节点</span></div>
           <button className="secondary" onClick={() => setAddOpen(false)}>关闭</button>
         </div>
         <form className="add-root-form" onSubmit={addRoot}>
           <input value={newLocalPath} onChange={(event) => setNewLocalPath(event.target.value)} placeholder="本地目录绝对路径，如 /home/me/docs" />
-          <input value={newRemoteToken} onChange={(event) => setNewRemoteToken(event.target.value)} placeholder="飞书文件夹 token" />
+          <div className="add-root-row">
+            <select value={newRemoteType} onChange={(event) => setNewRemoteType(event.target.value as "folder" | "wiki")}>
+              <option value="folder">云空间文件夹</option>
+              <option value="wiki">知识空间（Wiki）节点</option>
+            </select>
+            <input
+              className="interval-input"
+              type="number"
+              min={1}
+              value={newIntervalSec}
+              onChange={(event) => setNewIntervalSec(event.target.value)}
+              placeholder={`轮询秒数（默认 ${appConfig?.preferences.defaultPollIntervalMs ? Math.round(appConfig.preferences.defaultPollIntervalMs / 1000) : 15}）`}
+            />
+          </div>
+          <input value={newRemoteToken} onChange={(event) => setNewRemoteToken(event.target.value)} placeholder={newRemoteType === "wiki" ? "Wiki 节点 token（wiki space node）" : "飞书文件夹 token"} />
+          <p className="muted form-hint">
+            token 获取：在飞书云空间打开目标文件夹，或知识空间打开目标节点，复制浏览器地址栏末尾的 token；
+            也可用 <a href="https://open.feishu.cn/api-explorer/" target="_blank" rel="noreferrer">API 调试台 ↗</a> 调用「获取根文件夹元信息 / 获取知识空间列表」查询。轮询间隔留空则使用设置页中的全局默认值。
+          </p>
           <button className="primary" type="submit" disabled={!newLocalPath || !newRemoteToken}>绑定根目录</button>
         </form>
       </div>

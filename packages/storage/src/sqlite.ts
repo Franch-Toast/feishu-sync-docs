@@ -77,9 +77,9 @@ export class SqliteStateStore implements StateStore {
   }
 
   async upsertEntry(entry: SyncEntry): Promise<void> {
-    this.db.prepare(`INSERT INTO entries (id, root_id, relative_path, kind, remote_token, remote_parent_token, status, local_hash, remote_hash, base_hash, local_revision, remote_revision, updated_at)
-      VALUES (@id,@rootId,@relativePath,@kind,@remoteToken,@remoteParentToken,@status,@localHash,@remoteHash,@baseHash,@localRevision,@remoteRevision,@updatedAt)
-      ON CONFLICT(id) DO UPDATE SET root_id=excluded.root_id, relative_path=excluded.relative_path, kind=excluded.kind, remote_token=excluded.remote_token, remote_parent_token=excluded.remote_parent_token, status=excluded.status, local_hash=excluded.local_hash, remote_hash=excluded.remote_hash, base_hash=excluded.base_hash, local_revision=excluded.local_revision, remote_revision=excluded.remote_revision, updated_at=excluded.updated_at`)
+    this.db.prepare(`INSERT INTO entries (id, root_id, relative_path, kind, remote_token, remote_parent_token, status, local_hash, remote_hash, base_hash, local_revision, remote_revision, ignored_at, updated_at)
+      VALUES (@id,@rootId,@relativePath,@kind,@remoteToken,@remoteParentToken,@status,@localHash,@remoteHash,@baseHash,@localRevision,@remoteRevision,@ignoredAt,@updatedAt)
+      ON CONFLICT(id) DO UPDATE SET root_id=excluded.root_id, relative_path=excluded.relative_path, kind=excluded.kind, remote_token=excluded.remote_token, remote_parent_token=excluded.remote_parent_token, status=excluded.status, local_hash=excluded.local_hash, remote_hash=excluded.remote_hash, base_hash=excluded.base_hash, local_revision=excluded.local_revision, remote_revision=excluded.remote_revision, ignored_at=excluded.ignored_at, updated_at=excluded.updated_at`)
       .run({
         id: entry.id,
         rootId: entry.rootId,
@@ -93,6 +93,7 @@ export class SqliteStateStore implements StateStore {
         baseHash: entry.baseHash ?? null,
         localRevision: entry.localRevision ?? null,
         remoteRevision: entry.remoteRevision ?? null,
+        ignoredAt: entry.ignoredAt ?? null,
         updatedAt: entry.updatedAt
       });
   }
@@ -323,7 +324,7 @@ export class SqliteStateStore implements StateStore {
         id TEXT PRIMARY KEY, root_id TEXT NOT NULL, relative_path TEXT NOT NULL, kind TEXT NOT NULL,
         remote_token TEXT, remote_parent_token TEXT, status TEXT NOT NULL, local_hash TEXT,
         remote_hash TEXT, base_hash TEXT, local_revision INTEGER, remote_revision INTEGER,
-        updated_at TEXT NOT NULL, UNIQUE(root_id, relative_path)
+        updated_at TEXT NOT NULL, ignored_at TEXT, UNIQUE(root_id, relative_path)
       );
       CREATE TABLE IF NOT EXISTS blocks (
         entry_id TEXT NOT NULL, stable_id TEXT NOT NULL, block_id TEXT NOT NULL,
@@ -362,6 +363,7 @@ export class SqliteStateStore implements StateStore {
     `);
     try { this.db.exec("ALTER TABLE conflicts ADD COLUMN remote_revision INTEGER"); } catch { /* existing schema already migrated */ }
     try { this.db.exec("ALTER TABLE conflicts ADD COLUMN remote_content_hash TEXT"); } catch { /* existing schema already migrated */ }
+    try { this.db.exec("ALTER TABLE entries ADD COLUMN ignored_at TEXT"); } catch { /* existing schema already migrated */ }
   }
 }
 
@@ -370,7 +372,7 @@ function readRoot(row: Row): SyncRoot {
 }
 
 function readEntry(row: Row): SyncEntry {
-  return { id: String(row.id), rootId: String(row.root_id), relativePath: String(row.relative_path), kind: row.kind as SyncEntry["kind"], remoteToken: optionalString(row.remote_token), remoteParentToken: optionalString(row.remote_parent_token), status: row.status as SyncEntry["status"], localHash: optionalString(row.local_hash), remoteHash: optionalString(row.remote_hash), baseHash: optionalString(row.base_hash), localRevision: optionalNumber(row.local_revision), remoteRevision: optionalNumber(row.remote_revision), updatedAt: String(row.updated_at) };
+  return { id: String(row.id), rootId: String(row.root_id), relativePath: String(row.relative_path), kind: row.kind as SyncEntry["kind"], remoteToken: optionalString(row.remote_token), remoteParentToken: optionalString(row.remote_parent_token), status: row.status as SyncEntry["status"], localHash: optionalString(row.local_hash), remoteHash: optionalString(row.remote_hash), baseHash: optionalString(row.base_hash), localRevision: optionalNumber(row.local_revision), remoteRevision: optionalNumber(row.remote_revision), ignoredAt: optionalString(row.ignored_at), updatedAt: String(row.updated_at) };
 }
 
 function readSnapshot(row: Row): SyncSnapshot {

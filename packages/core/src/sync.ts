@@ -30,6 +30,9 @@ export class SyncEngine {
 
     for (const file of files) {
       const existing = existingByPath.get(file.relativePath);
+      // Ignored entries keep their single-side state: neither hashes nor
+      // status are re-evaluated until the user restores them.
+      if (existing?.ignoredAt) continue;
       const changed = existing?.localHash !== file.contentHash;
       const status = existing?.status === "conflict"
         ? "conflict"
@@ -56,19 +59,10 @@ export class SyncEngine {
     }
 
     const remoteTree = await this.refreshRemoteTree(root);
-    const remoteNodesByToken = new Map(remoteTree.nodes.map((node) => [node.token, node]));
-    const remoteDocumentPaths = new Map<string, string>();
-    const remoteAssetPaths = new Map<string, string>();
-    const remoteAssetParents = new Map<string, string>();
-    for (const node of remoteTree.nodes) {
-      const path = remoteRelativePath(root.remoteToken, node, remoteNodesByToken);
-      if (!path) continue;
-      if (node.type === "document") remoteDocumentPaths.set(node.token, ensureMarkdownPath(path));
-      if (node.type === "asset") {
-        remoteAssetPaths.set(node.token, path);
-        remoteAssetParents.set(node.token, node.parentToken);
-      }
-    }
+    const remotePathMaps = this.buildRemotePathMaps(root.remoteToken, remoteTree);
+    const remoteDocumentPaths = remotePathMaps.documents;
+    const remoteAssetPaths = remotePathMaps.assets;
+    const remoteAssetParents = remotePathMaps.assetParents;
     for (const node of remoteTree.nodes.filter((item) => item.type === "document")) {
       const relativePath = remoteDocumentPaths.get(node.token);
       if (!relativePath) continue;
@@ -91,8 +85,11 @@ export class SyncEngine {
     }
 
     for (const entry of initialEntries) {
+      // Ignored entries are frozen as-is; legacy "orphan" entries get
+      // reclassified here into local-missing when their local file is gone.
+      if (entry.ignoredAt) continue;
       if (!localByPath.has(entry.relativePath) && entry.remoteToken) {
-        await this.store.upsertEntry({ ...entry, status: "orphan", updatedAt: new Date().toISOString() });
+        await this.store.upsertEntry({ ...entry, status: "local-missing", updatedAt: new Date().toISOString() });
       }
     }
 
@@ -116,7 +113,7 @@ export class SyncEngine {
     for (const assetPath of changedAssets) {
       for (const entryId of await this.store.listAssetReferences(root.id, assetPath)) {
         const entry = await this.store.getEntry(entryId);
-        if (entry && entry.status !== "conflict") {
+        if (entry && !entry.ignoredAt && entry.status !== "conflict") {
           await this.store.upsertEntry({ ...entry, status: "pending", updatedAt: new Date().toISOString() });
         }
       }
@@ -126,13 +123,16 @@ export class SyncEngine {
     // Load open conflicts once for the whole loop instead of querying per entry.
     const openConflicts = await this.store.listConflicts("open");
     for (const entry of await this.store.listEntries(root.id)) {
+      // Ignored entries are never probed against the remote side.
+      if (entry.ignoredAt) continue;
       if (entry.kind !== "document" || !entry.remoteToken || !localByPath.has(entry.relativePath)) continue;
       let remote;
       try {
         remote = await this.remote.getDocument(entry.remoteToken);
       } catch (error) {
         if (!isRemoteNotFound(error)) throw error;
-        await this.store.upsertEntry({ ...entry, status: "orphan", updatedAt: new Date().toISOString() });
+        // The remote document is gone: the local copy is the only survivor.
+        await this.store.upsertEntry({ ...entry, status: "remote-missing", updatedAt: new Date().toISOString() });
         continue;
       }
       const assetReverseMap = new Map<string, string>();
@@ -152,7 +152,9 @@ export class SyncEngine {
       }
       await this.store.upsertEntry({
         ...entry,
-        status: entry.status === "conflict" ? "conflict" : remoteChanged ? "pending" : entry.status,
+        // Legacy "orphan" entries whose local file and remote document both
+        // exist are re-armed for a fresh evaluation instead of staying stuck.
+        status: entry.status === "conflict" ? "conflict" : entry.status === "orphan" || remoteChanged ? "pending" : entry.status,
         remoteHash,
         remoteRevision: remote.revisionId,
         updatedAt: new Date().toISOString()
@@ -167,6 +169,8 @@ export class SyncEngine {
   }
 
   async syncEntry(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry> {
+    // Ignored entries are never evaluated until the user restores them.
+    if (entry.ignoredAt) return entry;
     if (entry.kind === "asset") return this.syncAsset(entry, root);
 
     const localContent = await this.local.readText(root, entry.relativePath);
@@ -177,9 +181,10 @@ export class SyncEngine {
         remote = await this.remote.getDocument(entry.remoteToken);
       } catch (error) {
         if (!isRemoteNotFound(error)) throw error;
-        const orphan = { ...entry, status: "orphan" as const, updatedAt: new Date().toISOString() };
-        await this.store.upsertEntry(orphan);
-        return orphan;
+        // Remote 404 while a local file exists: the remote side is missing.
+        const missing = { ...entry, status: "remote-missing" as const, updatedAt: new Date().toISOString() };
+        await this.store.upsertEntry(missing);
+        return missing;
       }
     }
     let assetMaps = await this.prepareAssets(root, entry, localContent, remote?.token, false);
@@ -323,6 +328,7 @@ export class SyncEngine {
   }
 
   private async syncAsset(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry> {
+    if (entry.ignoredAt) return entry;
     if (!this.remote.capabilities.assetUpload) {
       const error = { ...entry, status: "error" as const, updatedAt: new Date().toISOString() };
       await this.store.upsertEntry(error);
@@ -340,6 +346,78 @@ export class SyncEngine {
     await this.store.upsertEntry(next);
     if (entry.remoteToken !== remoteToken) await this.markDocumentReferences(root, entry.relativePath);
     return next;
+  }
+
+  /** Re-pull a remote resource whose local file disappeared (local-missing).
+   *  Documents go through the same import path as a fresh remote import;
+   *  assets are simply downloaded back into place. When the remote side is
+   *  also gone the entry is reclassified as remote-missing. */
+  async pullRemoteEntry(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry | undefined> {
+    if (entry.ignoredAt) throw Object.assign(new Error("Entry is ignored; restore it before syncing"), { statusCode: 400 });
+    if (!entry.remoteToken) throw Object.assign(new Error("Entry is not bound to a remote resource"), { statusCode: 400 });
+    if (entry.kind === "asset") {
+      let binary: Uint8Array;
+      try {
+        binary = await this.remote.downloadAsset(entry.remoteToken);
+      } catch (error) {
+        if (!isRemoteNotFound(error)) throw error;
+        const missing = { ...entry, status: "remote-missing" as const, updatedAt: new Date().toISOString() };
+        await this.store.upsertEntry(missing);
+        return missing;
+      }
+      await this.local.writeBinary(root, entry.relativePath, binary);
+      const restored = { ...entry, status: "clean" as const, updatedAt: new Date().toISOString() };
+      await this.store.upsertEntry(restored);
+      return restored;
+    }
+    // Force a fresh listing: the cached tree may predate a remote rename/delete.
+    const tree = await this.refreshRemoteTree(root);
+    const node = tree.nodes.find((item) => item.token === entry.remoteToken);
+    if (!node || node.type !== "document") {
+      const missing = { ...entry, status: "remote-missing" as const, updatedAt: new Date().toISOString() };
+      await this.store.upsertEntry(missing);
+      return missing;
+    }
+    const maps = this.buildRemotePathMaps(root.remoteToken, tree);
+    await this.importRemoteDocument(root, node, entry.relativePath, maps.documents, maps.assets, maps.assetParents);
+    return this.store.getEntry(entry.id);
+  }
+
+  /** Re-create the remote side of an entry whose remote resource disappeared
+   *  (remote-missing): the binding is cleared so syncEntry walks the creation
+   *  branch and pushes the surviving local content as a new remote document. */
+  async recreateRemoteEntry(entry: SyncEntry, root: SyncRoot): Promise<SyncEntry> {
+    if (entry.ignoredAt) throw Object.assign(new Error("Entry is ignored; restore it before syncing"), { statusCode: 400 });
+    const rearmed: SyncEntry = {
+      ...entry,
+      remoteToken: undefined,
+      remoteParentToken: undefined,
+      remoteHash: undefined,
+      remoteRevision: undefined,
+      status: "pending",
+      updatedAt: new Date().toISOString()
+    };
+    await this.store.upsertEntry(rearmed);
+    return this.syncEntry(rearmed, root);
+  }
+
+  /** Token→relative-path maps for one remote tree snapshot, shared by scan
+   *  and the single-entry pull path. */
+  private buildRemotePathMaps(rootToken: string, tree: RemoteTree): { documents: Map<string, string>; assets: Map<string, string>; assetParents: Map<string, string> } {
+    const nodesByToken = new Map(tree.nodes.map((node) => [node.token, node]));
+    const documents = new Map<string, string>();
+    const assets = new Map<string, string>();
+    const assetParents = new Map<string, string>();
+    for (const node of tree.nodes) {
+      const path = remoteRelativePath(rootToken, node, nodesByToken);
+      if (!path) continue;
+      if (node.type === "document") documents.set(node.token, ensureMarkdownPath(path));
+      if (node.type === "asset") {
+        assets.set(node.token, path);
+        assetParents.set(node.token, node.parentToken);
+      }
+    }
+    return { documents, assets, assetParents };
   }
 
   private async importRemoteDocument(root: SyncRoot, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>): Promise<void> {
@@ -569,8 +647,16 @@ export class SyncEngine {
 
   private async markDocumentReferences(root: SyncRoot, targetPath: string): Promise<void> {
     for (const entry of await this.store.listEntries(root.id)) {
-      if (entry.kind !== "document" || entry.relativePath === targetPath) continue;
-      const content = await this.local.readText(root, entry.relativePath);
+      if (entry.kind !== "document" || entry.relativePath === targetPath || entry.ignoredAt) continue;
+      // local-missing entries have no local file to inspect; tolerate other
+      // transient read failures (e.g. the file vanished mid-sync) as well.
+      if (entry.status === "local-missing") continue;
+      let content: string;
+      try {
+        content = await this.local.readText(root, entry.relativePath);
+      } catch {
+        continue;
+      }
       const references = parseMarkdown(content).links.map((link) => resolveRelativePath(entry.relativePath, link.target));
       if (references.includes(targetPath) && entry.status !== "conflict") {
         await this.store.upsertEntry({ ...entry, status: "pending", updatedAt: new Date().toISOString() });

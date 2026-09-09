@@ -1,5 +1,7 @@
 export type EntryKind = "document" | "asset";
-export type EntryStatus = "clean" | "pending" | "conflict" | "orphan" | "error";
+/** "orphan" is kept for backward compatibility: entries stored before the
+ *  local/remote-missing split get reclassified by the next scan round. */
+export type EntryStatus = "clean" | "pending" | "conflict" | "orphan" | "error" | "local-missing" | "remote-missing";
 export type ConflictStatus = "open" | "resolved" | "aborted";
 export type SyncDirection = "push" | "pull" | "merge";
 export type RemoteNodeType = "folder" | "document" | "asset";
@@ -160,6 +162,9 @@ export interface SyncEntry {
   localRevision?: number;
   remoteRevision?: number;
   updatedAt: string;
+  /** Set when the user ignored the entry: scan and sync both skip it until
+   *  it is restored. */
+  ignoredAt?: string;
 }
 
 export interface SyncSnapshot {

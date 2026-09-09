@@ -1,15 +1,28 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import type { RemoteTree, SyncRoot } from "@feishu-sync/core";
 import { FeishuApiError } from "@feishu-sync/feishu";
 import type { WebSocket } from "ws";
 import { buildApp } from "../src/app.js";
 import { CredentialStore } from "../src/credentials.js";
+import { AppConfigStore } from "../src/appconfig.js";
 import { SqliteStateStore } from "@feishu-sync/storage";
 import { FakeRemote } from "./helpers/fake-remote.js";
+
+/** Every app gets its own config.json in tmpdir so tests never touch ~/.feishu-sync-docs. */
+const configDirs: string[] = [];
+function buildIsolatedApp(options: Parameters<typeof buildApp>[0] = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "feishu-sync-config-"));
+  configDirs.push(dir);
+  return buildApp({ ...options, appConfig: new AppConfigStore(join(dir, "config.json")) });
+}
+
+test.after(() => {
+  for (const dir of configDirs) rmSync(dir, { recursive: true, force: true });
+});
 
 interface EntryView {
   id: string;
@@ -18,7 +31,7 @@ interface EntryView {
 }
 
 test("serves health and root APIs without Feishu credentials", async () => {
-  const app = buildApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
+  const app = buildIsolatedApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
   const response = await app.inject({ method: "GET", url: "/api/health" });
   assert.equal(response.statusCode, 200);
   assert.equal(response.json().ok, true);
@@ -29,7 +42,7 @@ test("serves health and root APIs without Feishu credentials", async () => {
 });
 
 test("validates root CRUD requests", async () => {
-  const app = buildApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
+  const app = buildIsolatedApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
   const missing = await app.inject({ method: "POST", url: "/api/roots", payload: { remoteToken: "root-token" } });
   assert.equal(missing.statusCode, 400);
   const badPath = await app.inject({ method: "POST", url: "/api/roots", payload: { localPath: "/nonexistent-directory-xyz", remoteToken: "root-token" } });
@@ -56,7 +69,7 @@ test("validates root CRUD requests", async () => {
 test("syncs through the API and surfaces conflicts for resolution", async () => {
   const store = new SqliteStateStore();
   const remote = new FakeRemote();
-  const app = buildApp({ store, remote });
+  const app = buildIsolatedApp({ store, remote });
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-e2e-"));
   try {
     writeFileSync(join(directory, "notes.md"), "shared line\n", "utf8");
@@ -117,7 +130,7 @@ test("syncs through the API and surfaces conflicts for resolution", async () => 
 
 test("prunes operation history through the maintenance endpoint", async () => {
   const store = new SqliteStateStore();
-  const app = buildApp({ store, remote: new FakeRemote() });
+  const app = buildIsolatedApp({ store, remote: new FakeRemote() });
   try {
     for (let index = 0; index < 5; index += 1) {
       await store.addOperation({ entryId: "entry", direction: "push", operation: "test" });
@@ -133,12 +146,15 @@ test("prunes operation history through the maintenance endpoint", async () => {
 
 test("settings APIs store credentials redacted and rebuild the provider", async () => {
   const store = new SqliteStateStore();
-  const credentials = new CredentialStore(store, async (input) => {
+  const appConfig = new AppConfigStore(join(mkdtempSync(join(tmpdir(), "feishu-sync-config-")), "config.json"));
+  configDirs.push(dirname(appConfig.configPath));
+  const credentials = new CredentialStore(appConfig, async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/open-apis/authen/v1/user_info") return new Response(JSON.stringify({ code: 0, data: { name: "Tester", open_id: "ou_1" } }), { status: 200, headers: { "content-type": "application/json" } });
     throw new Error(`unexpected request ${url.pathname}`);
   });
-  const app = buildApp({ store, credentials });
+  // The injected credentials share the app's config.json, so pass it explicitly.
+  const app = buildApp({ store, credentials, appConfig });
   try {
     const initial = (await app.inject({ method: "GET", url: "/api/settings" })).json();
     assert.equal(initial.mode, "user");
@@ -165,8 +181,48 @@ test("settings APIs store credentials redacted and rebuild the provider", async 
   }
 });
 
+test("global preferences API reads and persists config.json", async () => {
+  const app = buildIsolatedApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
+  try {
+    const initial = (await app.inject({ method: "GET", url: "/api/app-config" })).json();
+    assert.deepEqual(initial.preferences, { defaultPollIntervalMs: 15000, logLevel: "info" });
+    assert.ok(initial.paths.config.endsWith("config.json"));
+    assert.ok(initial.paths.database.endsWith("sync.db"));
+
+    const saved = await app.inject({ method: "PUT", url: "/api/app-config", payload: { defaultPollIntervalMs: 30000, logLevel: "debug" } });
+    assert.equal(saved.statusCode, 200);
+    assert.deepEqual(saved.json().preferences, { defaultPollIntervalMs: 30000, logLevel: "debug" });
+
+    // Values persist on disk for the next process (config.json next to the app).
+    const disk = JSON.parse(readFileSync(app.appConfig.configPath, "utf8")) as { preferences: { defaultPollIntervalMs: number; logLevel: string } };
+    assert.equal(disk.preferences.defaultPollIntervalMs, 30000);
+    assert.equal(disk.preferences.logLevel, "debug");
+
+    const badInterval = await app.inject({ method: "PUT", url: "/api/app-config", payload: { defaultPollIntervalMs: 500 } });
+    assert.equal(badInterval.statusCode, 400);
+    const badLevel = await app.inject({ method: "PUT", url: "/api/app-config", payload: { logLevel: "verbose" } });
+    assert.equal(badLevel.statusCode, 400);
+  } finally {
+    await app.close();
+  }
+});
+
+test("new roots default to the configured poll interval", async () => {
+  const app = buildIsolatedApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-default-interval-"));
+  try {
+    await app.inject({ method: "PUT", url: "/api/app-config", payload: { defaultPollIntervalMs: 45000 } });
+    const created = await app.inject({ method: "POST", url: "/api/roots", payload: { localPath: directory, remoteToken: "root-token" } });
+    assert.equal(created.statusCode, 201);
+    assert.equal(created.json().pollIntervalMs, 45000, "missing pollIntervalMs must fall back to the global preference");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    await app.close();
+  }
+});
+
 test("patches a root and hot-restarts its poller", async () => {
-  const app = buildApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
+  const app = buildIsolatedApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-patch-"));
   try {
     const created = await app.inject({ method: "POST", url: "/api/roots", payload: { localPath: directory, remoteToken: "root-token", pollIntervalMs: 60000 } });
@@ -188,7 +244,7 @@ test("patches a root and hot-restarts its poller", async () => {
 test("serves local files safely, document content and root stats", async () => {
   const store = new SqliteStateStore();
   const remote = new FakeRemote();
-  const app = buildApp({ store, remote });
+  const app = buildIsolatedApp({ store, remote });
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-files-"));
   try {
     writeFileSync(join(directory, "note.md"), "# Hello\n\n![img](pic.png)\n", "utf8");
@@ -241,7 +297,7 @@ test("serves local files safely, document content and root stats", async () => {
 test("restores the baseline snapshot for an entry", async () => {
   const store = new SqliteStateStore();
   const remote = new FakeRemote();
-  const app = buildApp({ store, remote });
+  const app = buildIsolatedApp({ store, remote });
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-restore-"));
   try {
     writeFileSync(join(directory, "note.md"), "shared line\n", "utf8");
@@ -277,7 +333,7 @@ function createFakeSocket(): { socket: WebSocket; messages: string[] } {
 }
 
 test("websocket clients observe the root lifecycle events", async () => {
-  const app = buildApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
+  const app = buildIsolatedApp({ store: new SqliteStateStore(), remote: new FakeRemote() });
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-ws-"));
   const { socket, messages } = createFakeSocket();
   try {
@@ -313,7 +369,7 @@ class AuthFlippingRemote extends FakeRemote {
 test("serves the local tree even when Feishu credentials are invalid", async () => {
   const store = new SqliteStateStore();
   const remote = new AuthFlippingRemote();
-  const app = buildApp({ store, remote });
+  const app = buildIsolatedApp({ store, remote });
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-tree-"));
   try {
     writeFileSync(join(directory, "note.md"), "shared line\n", "utf8");
@@ -340,7 +396,7 @@ test("serves the local tree even when Feishu credentials are invalid", async () 
 
 test("prunes operation history by age while keeping recent records", async () => {
   const store = new SqliteStateStore();
-  const app = buildApp({ store, remote: new FakeRemote() });
+  const app = buildIsolatedApp({ store, remote: new FakeRemote() });
   try {
     await store.addOperation({ entryId: "entry", direction: "push", operation: "old" });
     await store.addOperation({ entryId: "entry", direction: "push", operation: "recent" });
@@ -356,6 +412,62 @@ test("prunes operation history by age while keeping recent records", async () =>
     assert.deepEqual(pruned.json(), { operations: 1, conflicts: 0, snapshots: 0 });
     assert.deepEqual((await store.listOperations()).map((operation) => operation.operation), ["recent"]);
   } finally {
+    await app.close();
+  }
+});
+
+test("issue workbench APIs drive single-entry sync, ignore and batch missing resync", async () => {
+  const store = new SqliteStateStore();
+  const remote = new FakeRemote();
+  const app = buildIsolatedApp({ store, remote });
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-issues-"));
+  try {
+    writeFileSync(join(directory, "notes.md"), "shared line\n", "utf8");
+    const created = await app.inject({ method: "POST", url: "/api/roots", payload: { localPath: directory, remoteToken: "root-token" } });
+    assert.equal(created.statusCode, 201);
+    const rootId = created.json().id as string;
+    const synced = await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync` });
+    const entry = (synced.json().entries as Array<{ id: string; remoteToken?: string }>)[0]!;
+    const token = entry.remoteToken!;
+
+    // Unknown ids and malformed payloads are rejected.
+    assert.equal((await app.inject({ method: "POST", url: "/api/entries/no-such-entry/sync" })).statusCode, 404);
+    assert.equal((await app.inject({ method: "POST", url: "/api/entries/no-such-entry/ignore", payload: { ignored: true } })).statusCode, 404);
+    assert.equal((await app.inject({ method: "POST", url: `/api/entries/${entry.id}/ignore`, payload: { ignored: "yes" } })).statusCode, 400);
+    assert.equal((await app.inject({ method: "POST", url: "/api/roots/no-such-root/sync-missing" })).statusCode, 404);
+
+    // The local file disappears -> local-missing; the entry API pulls it back.
+    rmSync(join(directory, "notes.md"));
+    await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync` });
+    assert.equal((await store.getEntry(entry.id))?.status, "local-missing");
+    const pulled = await app.inject({ method: "POST", url: `/api/entries/${entry.id}/sync` });
+    assert.equal(pulled.statusCode, 200);
+    assert.equal(pulled.json().status, "clean");
+    assert.equal(readFileSync(join(directory, "notes.md"), "utf8"), "shared line\n");
+
+    // The remote document disappears -> remote-missing; ignoring freezes it
+    // so the batch resync skips it until it is restored.
+    await remote.softDelete(token);
+    await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync` });
+    assert.equal((await store.getEntry(entry.id))?.status, "remote-missing");
+    const ignoredEntry = await app.inject({ method: "POST", url: `/api/entries/${entry.id}/ignore`, payload: { ignored: true } });
+    assert.equal(ignoredEntry.statusCode, 200);
+    assert.ok(ignoredEntry.json().ignoredAt);
+    const skipped = await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync-missing` });
+    assert.equal(skipped.statusCode, 200);
+    assert.deepEqual(skipped.json(), { rootId, synced: 0, total: 0 });
+
+    // Restoring makes the batch resync re-create the remote document.
+    await app.inject({ method: "POST", url: `/api/entries/${entry.id}/ignore`, payload: { ignored: false } });
+    const batch = await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync-missing` });
+    assert.equal(batch.statusCode, 200);
+    assert.deepEqual(batch.json(), { rootId, synced: 1, total: 1 });
+    const healed = await store.getEntry(entry.id);
+    assert.equal(healed?.status, "clean");
+    assert.ok(healed?.remoteToken);
+    assert.equal(remote.documents.get(healed!.remoteToken!)?.content, "shared line\n");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
     await app.close();
   }
 });
