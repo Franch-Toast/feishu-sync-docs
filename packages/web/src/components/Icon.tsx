@@ -5,6 +5,7 @@ export type IconName =
   | "docs"
   | "conflicts"
   | "history"
+  | "tasks"
   | "settings"
   | "plus"
   | "sync"
@@ -37,6 +38,13 @@ const PATHS: Record<IconName, React.JSX.Element> = {
     <>
       <circle cx="12" cy="12" r="8.5" />
       <path d="M12 7.5V12l3 2" />
+    </>
+  ),
+  tasks: (
+    <>
+      <path d="M9 5.5h9.5a1.5 1.5 0 0 1 1.5 1.5v11a1.5 1.5 0 0 1-1.5 1.5H9" />
+      <path d="M4.5 8.5l1.8 1.8 3.2-3.4" />
+      <path d="M4.5 15l1.8 1.8 3.2-3.4" />
     </>
   ),
   settings: (

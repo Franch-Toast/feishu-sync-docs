@@ -3,8 +3,9 @@ import { posix } from "node:path";
 import { buildBlockPatch, decideSync } from "./merge.js";
 import { parseMarkdown, restoreAssetReferences, restoreInternalLinks, rewriteAssetReferences, rewriteInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
+import { matchesAnyGlob } from "./glob.js";
 import type {
-  EntryBinding, GitStorage, LocalProvider, MetaStorage, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, SyncRoot, SyncTrigger
+  EntryBinding, GitStorage, LocalFile, LocalProvider, MetaStorage, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger
 } from "./types.js";
 
 export class SyncEngine {
@@ -14,6 +15,9 @@ export class SyncEngine {
   private readonly remoteTreeCache = new Map<string, { tree: RemoteTree; at: number }>();
   private readonly remoteTreeJobs = new Map<string, Promise<RemoteTree>>();
   private static readonly REMOTE_TREE_TTL_MS = 60_000;
+  /** Direction taken by the most recent syncEntry/syncAsset per entry; the
+   *  runtime consumes it via takeDirection() to label operation records. */
+  private readonly lastDirections = new Map<string, SyncDirection>();
 
   constructor(
     private readonly gitStorage: GitStorage,
@@ -22,14 +26,47 @@ export class SyncEngine {
     private readonly remote: RemoteProvider
   ) {}
 
-  async scan(root: SyncRoot, trigger: SyncTrigger = 'manual'): Promise<{ entries: EntryBinding[]; conflicts: number }> {
+  /** Consume the direction recorded by the last sync for this entry. */
+  takeDirection(entryId: string): SyncDirection | undefined {
+    const direction = this.lastDirections.get(entryId);
+    this.lastDirections.delete(entryId);
+    return direction;
+  }
+
+  private setDirection(entryId: string, direction: SyncDirection): void {
+    this.lastDirections.set(entryId, direction);
+  }
+
+  async scan(root: SyncRoot, trigger: SyncTrigger = 'manual', scope?: SyncScope): Promise<{ entries: EntryBinding[]; conflicts: number }> {
+    const mode: SyncMode = root.mode ?? "bidirectional";
+    // Incremental scope is honored only for event/watch triggers: the costly
+    // per-entry loops below are restricted to the changed paths/tokens, while
+    // local.scan()/refreshRemoteTree() still run once to produce a consistent
+    // snapshot for those loops to filter over. poll/manual always scan fully.
+    const scopedPaths = scope?.relativePaths?.length ? new Set(scope.relativePaths) : undefined;
+    const scopedTokens = scope?.remoteTokens?.length ? new Set(scope.remoteTokens) : undefined;
+    const incremental = (trigger === 'event' || trigger === 'watch') && Boolean(scopedPaths || scopedTokens);
+    const inScope = (relativePath: string, remoteToken?: string): boolean =>
+      !incremental || (scopedPaths?.has(relativePath) ?? false) || (remoteToken !== undefined && (scopedTokens?.has(remoteToken) ?? false));
     let files = await this.local.scan(root);
     const initialBindings = await this.metaStorage.listBindings(root.id);
     const existingByPath = new Map(initialBindings.map((binding) => [binding.relativePath, binding]));
     let localByPath = new Map(files.map((file) => [file.relativePath, file]));
     const changedAssets: string[] = [];
 
+    // B6.5: a previously bound path now covered by an exclude pattern is frozen
+    // as ignored (local.scan already skipped it), so it is neither flagged
+    // local-missing nor re-synced until the user removes the pattern.
+    const isExcluded = (relativePath: string): boolean => matchesAnyGlob(relativePath, root.exclude);
+    for (const binding of initialBindings) {
+      if (!binding.ignoredAt && isExcluded(binding.relativePath)) {
+        await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, ignoredAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+      }
+    }
+
     for (const file of files) {
+      // Incremental local scope: only the changed paths are re-hashed/re-armed.
+      if (incremental && !(scopedPaths?.has(file.relativePath) ?? false)) continue;
       const existing = existingByPath.get(file.relativePath);
       // Ignored entries keep their single-side state: neither hashes nor
       // status are re-evaluated until the user restores them.
@@ -66,6 +103,8 @@ export class SyncEngine {
     for (const node of remoteTree.nodes.filter((item) => item.type === "document")) {
       const relativePath = remoteDocumentPaths.get(node.token);
       if (!relativePath) continue;
+      if (isExcluded(relativePath)) continue;
+      if (!inScope(relativePath, node.token)) continue;
       const alreadyBound = initialBindings.some((binding) => binding.remoteToken === node.token);
       if (alreadyBound) continue;
       const existing = await this.metaStorage.getBinding(root.id, relativePath);
@@ -75,7 +114,7 @@ export class SyncEngine {
         else await this.metaStorage.setBinding(root.id, relativePath, { ...existing, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, status: "pending", updatedAt: new Date().toISOString() });
         continue;
       }
-      if (!localByPath.has(relativePath)) {
+      if (!localByPath.has(relativePath) && mode !== "push-only") {
         await this.importRemoteDocument(root, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents);
       }
     }
@@ -84,11 +123,22 @@ export class SyncEngine {
       localByPath = new Map(files.map((file) => [file.relativePath, file]));
     }
 
+    // Paths that already own a remote token; rename detection must never
+    // steal a file that legitimately backs its own document.
+    const boundPaths = new Set(initialBindings.filter((item) => item.remoteToken).map((item) => item.relativePath));
     for (const binding of initialBindings) {
       // Ignored entries are frozen as-is; legacy "orphan" entries get
       // reclassified here into local-missing when their local file is gone.
       if (binding.ignoredAt) continue;
+      if (isExcluded(binding.relativePath)) continue;
+      if (!inScope(binding.relativePath, binding.remoteToken)) continue;
       if (!localByPath.has(binding.relativePath) && binding.remoteToken) {
+        // B3 rename/move detection: the bound local path vanished. When the
+        // same content resurfaces at exactly one new, still-unbound path we
+        // re-point the binding (the remote document follows) instead of
+        // flagging local-missing and later pushing a duplicate copy.
+        const outcome = await this.detectRename(root, binding, localByPath, boundPaths);
+        if (outcome !== "none") continue;
         await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "local-missing", updatedAt: new Date().toISOString() });
       }
     }
@@ -125,6 +175,7 @@ export class SyncEngine {
     for (const binding of await this.metaStorage.listBindings(root.id)) {
       // Ignored entries are never probed against the remote side.
       if (binding.ignoredAt) continue;
+      if (!inScope(binding.relativePath, binding.remoteToken)) continue;
       if (binding.kind !== "document" || !binding.remoteToken || !localByPath.has(binding.relativePath)) continue;
       let remote;
       try {
@@ -172,6 +223,7 @@ export class SyncEngine {
     // Ignored entries are never evaluated until the user restores them.
     if (binding.ignoredAt) return binding;
     if (binding.kind === "asset") return this.syncAsset(binding, root);
+    const mode: SyncMode = root.mode ?? "bidirectional";
 
     const localContent = await this.local.readText(root, binding.relativePath);
     const { forwardMap, reverseMap } = await this.buildLinkMaps(root.id);
@@ -189,6 +241,9 @@ export class SyncEngine {
     }
     let assetMaps = await this.prepareAssets(root, binding, localContent, remote?.token, false);
     if (!remote) {
+      // pull-only never creates a remote document: there is nothing to pull
+      // down, so a local-only file is left untouched instead of being pushed.
+      if (mode === "pull-only") return binding;
       const parent = await this.ensureRemoteParent(root, binding.relativePath);
       // Feishu derives the drive-visible title from the markdown H1, so two
       // local files sharing a first heading would push two identically named
@@ -244,6 +299,7 @@ export class SyncEngine {
       await this.metaStorage.setBinding(root.id, binding.relativePath, next);
       await this.saveBlockMapping(binding.entryId, localContent, created);
       await this.markDocumentReferences(root, binding.relativePath);
+      this.setDirection(binding.entryId, "push");
       return next;
     }
 
@@ -264,7 +320,12 @@ export class SyncEngine {
     const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
     const base = baselineContent ?? localContent;
     const decision = decideSync(base, localContent, canonicalRemote);
-    const action = decision.action === "noop" && assetMaps.changed ? "push" as const : decision.action;
+    let action = decision.action === "noop" && assetMaps.changed ? "push" as const : decision.action;
+    // One-way modes override the three-way decision so the authoritative side
+    // always wins and no conflict is raised: pull-only never pushes, push-only
+    // never pulls.
+    if (mode === "pull-only" && action !== "noop" && action !== "pull") action = "pull";
+    if (mode === "push-only" && action !== "noop" && action !== "push") action = "push";
     if (action === "conflict") {
       const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
       if (open) await this.metaStorage.updateConflict(open.id, { localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
@@ -274,6 +335,7 @@ export class SyncEngine {
       return next;
     }
 
+    this.setDirection(binding.entryId, action === "pull" ? "pull" : action === "push" ? "push" : "merge");
     const content = action === "pull" ? canonicalRemote : action === "merge" ? decision.mergedContent ?? localContent : localContent;
     if (action === "pull") await this.local.writeText(root, binding.relativePath, content);
 
@@ -339,6 +401,7 @@ export class SyncEngine {
     const next: EntryBinding = { ...binding, remoteToken, remoteParentToken: parent, remoteContentHash: contentHash, status: "clean", updatedAt: new Date().toISOString() };
     await this.metaStorage.setBinding(root.id, binding.relativePath, next);
     if (binding.remoteToken !== remoteToken) await this.markDocumentReferences(root, binding.relativePath);
+    this.setDirection(binding.entryId, "push");
     return next;
   }
 
@@ -622,22 +685,80 @@ export class SyncEngine {
   }
 
   private async ensureRemoteParent(root: SyncRoot, relativePath: string): Promise<string> {
-    const directories = posix.dirname(relativePath).split("/").filter(Boolean);
+    // `posix.dirname("a.md")` is "." — a root-level document has no remote
+    // folder to create, so the placeholder segments must be dropped.
+    const directories = posix.dirname(relativePath).split("/").filter((part) => part !== "" && part !== "." && part !== "..");
     let parentToken = root.remoteToken;
-    const tree = await this.loadRemoteTree(root);
+    let folderPath = "";
+    // The remote tree is loaded lazily: a path whose folders are all persisted
+    // in folders.json never triggers a drive listing, so a restart reuses the
+    // stored tokens and cannot re-create folders that already exist remotely.
+    let tree: RemoteTree | undefined;
     for (const name of directories) {
+      folderPath = folderPath ? `${folderPath}/${name}` : name;
+      const bound = await this.metaStorage.getFolderBinding(root.id, folderPath);
+      if (bound?.remoteToken) {
+        parentToken = bound.remoteToken;
+        continue;
+      }
+      if (!tree) tree = await this.loadRemoteTree(root);
       const existing = tree.nodes.find((node) => node.type === "folder" && node.parentToken === parentToken && node.name === name);
       if (existing) {
         parentToken = existing.token;
-        continue;
+      } else {
+        const created = await this.remote.createFolder(parentToken, name);
+        // Register before returning: drive listings may lag behind creation
+        // and a retry in that window would otherwise create a duplicate folder.
+        tree.nodes.push(created);
+        parentToken = created.token;
       }
-      const created = await this.remote.createFolder(parentToken, name);
-      // Register before returning: drive listings may lag behind creation
-      // and a retry in that window would otherwise create a duplicate folder.
-      tree.nodes.push(created);
-      parentToken = created.token;
+      // Persist the resolved token so the next document in this folder — or a
+      // process restart — skips the remote walk instead of duplicating it.
+      await this.metaStorage.setFolderBinding(root.id, folderPath, { relativePath: folderPath, remoteToken: parentToken, createdAt: new Date().toISOString() });
     }
     return parentToken;
+  }
+
+  /** Decide whether a vanished binding was actually renamed/moved locally.
+   *  Returns "moved" once the binding was re-pointed to the new path,
+   *  "conflict" when several unbound files match and the target is ambiguous,
+   *  or "none" when there is no rename evidence (a genuine local deletion). */
+  private async detectRename(root: SyncRoot, binding: EntryBinding, localByPath: Map<string, LocalFile>, boundPaths: Set<string>): Promise<"moved" | "conflict" | "none"> {
+    const hash = binding.remoteContentHash;
+    if (!hash || !binding.remoteToken) return "none";
+    const candidates = [...localByPath.values()].filter((file) =>
+      file.relativePath !== binding.relativePath &&
+      file.contentHash === hash &&
+      !boundPaths.has(file.relativePath));
+    if (candidates.length === 0) return "none";
+    if (candidates.length > 1) {
+      // Ambiguous: two or more unbound files carry identical content. Surface a
+      // conflict so the user picks the real successor rather than the engine
+      // guessing and silently orphaning the remote document.
+      let remoteContent = "";
+      try {
+        remoteContent = (await this.remote.getDocument(binding.remoteToken)).content;
+      } catch { /* a missing remote doc leaves the comparison empty */ }
+      const baseContent = await this.gitStorage.getBaseline(root.id, binding.relativePath) ?? "";
+      await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "conflict", updatedAt: new Date().toISOString() });
+      const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
+      if (!open) await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent, localContent: "", remoteContent, remoteRevision: binding.remoteRevision, remoteContentHash: hash });
+      return "conflict";
+    }
+    const target = candidates[0]!;
+    // Re-point: drop the stale path and hand the entry's identity (and remote
+    // token) to the new path. Content is unchanged, so the entry stays clean
+    // and the next round neither re-pushes it nor creates a duplicate document.
+    await this.metaStorage.deleteBinding(root.id, binding.relativePath);
+    await this.metaStorage.setBinding(root.id, target.relativePath, {
+      ...binding,
+      relativePath: target.relativePath,
+      kind: target.kind,
+      remoteContentHash: target.contentHash,
+      status: "clean",
+      updatedAt: new Date().toISOString()
+    });
+    return "moved";
   }
 
   private async saveBlockMapping(entryId: string, content: string, remote: RemoteDocument): Promise<void> {

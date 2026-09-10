@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,7 +7,7 @@ import { FilesystemProvider } from "@feishu-sync/core";
 import type { RemoteTree, SyncRoot } from "@feishu-sync/core";
 import { FeishuApiError } from "@feishu-sync/feishu";
 import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
-import { SyncRuntime } from "../src/runtime.js";
+import { SyncRuntime, watcherIgnore } from "../src/runtime.js";
 import { AppConfigStore } from "../src/appconfig.js";
 import type { WebSocket } from "ws";
 import { FakeRemote } from "./helpers/fake-remote.js";
@@ -28,13 +28,19 @@ interface EntryView {
   ignoredAt?: string;
 }
 
-function createScenario(): Scenario {
+function createScenario(options?: { delays?: number[] }): Scenario {
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-runtime-"));
   const globalDir = mkdtempSync(join(tmpdir(), "feishu-sync-global-"));
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
-  const runtime = new SyncRuntime(gitStorage, metaStorage, new FilesystemProvider(), remote);
+  // Zero-delay backoff so auto-retry exhaustion never waits on real timers.
+  // Passing `delays` records each backoff instead, letting a test assert the
+  // exact delay the runtime chose (B6.2 Retry-After floor).
+  const sleep = options?.delays
+    ? async (ms: number): Promise<void> => { options.delays!.push(ms); }
+    : async (): Promise<void> => {};
+  const runtime = new SyncRuntime(gitStorage, metaStorage, new FilesystemProvider(), remote, undefined, undefined, undefined, undefined, { sleep });
   return { gitStorage, metaStorage, remote, runtime, directory, globalDir };
 }
 
@@ -160,15 +166,21 @@ test("records failures on the entry and recovers on the next sync", async () => 
     const token = result.entries[0]!.remoteToken!;
 
     writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
-    scenario.remote.failNextWrite();
+    // A persistent failure so the runtime exhausts its auto-retries (a one-shot
+    // failure would simply be retried into success within the same round).
+    scenario.remote.failWrites = true;
     const failed = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
     assert.equal(failed.entries[0]?.status, "error");
     const failedOperation = (await scenario.metaStorage.listOperations()).find((operation) => operation.status === "failed");
     assert.ok(failedOperation, "expected a failed operation record");
     assert.equal(failedOperation.entryId, entryId);
     assert.ok(failedOperation.error);
+    // B2: the failure is categorized and the auto-retry ceiling is recorded.
+    assert.equal(failedOperation.errorCategory, "unknown");
+    assert.equal(failedOperation.retryCount, failedOperation.maxRetries ?? 3);
 
-    // The next scan re-arms error entries; the retry succeeds and pushes the content.
+    // The next scan re-arms error entries; with writes healthy the retry succeeds.
+    scenario.remote.failWrites = false;
     const recovered = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
     assert.equal(recovered.entries[0]?.status, "clean");
     assert.equal(scenario.remote.documents.get(token)?.content, "local edit\n");
@@ -286,7 +298,7 @@ test("plain remote errors never flag the credential state", async () => {
     const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
     const token = result.entries[0]!.remoteToken!;
     writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
-    scenario.remote.failNextWrite();
+    scenario.remote.failWrites = true;
     const failed = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
     assert.equal(failed.entries[0]?.status, "error");
     assert.equal(scenario.remote.documents.get(token)?.content, "shared line\n");
@@ -417,6 +429,322 @@ test("announces sync-started before each sync round", async () => {
     const done = types.indexOf("sync");
     assert.ok(started >= 0, "expected a sync-started broadcast");
     assert.ok(done > started, "the completion broadcast must follow sync-started");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("pull-only mode pulls remote edits and never pushes local changes", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const token = result.entries[0]!.remoteToken!;
+    assert.equal(result.entries[0]!.status, "clean");
+    await scenario.metaStorage.updateRoot(root.id, { mode: "pull-only" });
+    // Both sides drift; pull-only resolves in favour of the remote without a conflict.
+    scenario.remote.edit(token, "remote wins\n");
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "remote wins\n");
+    assert.equal(scenario.remote.documents.get(token)?.content, "remote wins\n", "the local edit must never be pushed");
+    assert.equal(synced.entries[0]?.status, "clean");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("pull-only mode never creates a remote document for a local-only file", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario);
+    await scenario.metaStorage.updateRoot(root.id, { mode: "pull-only" });
+    writeFileSync(join(scenario.directory, "only.md"), "only local\n", "utf8");
+    const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(synced.entries[0]?.remoteToken, undefined);
+    assert.equal(scenario.remote.documents.size, 0, "pull-only must not push a new document");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("push-only mode pushes local edits and never pulls remote changes", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const token = result.entries[0]!.remoteToken!;
+    await scenario.metaStorage.updateRoot(root.id, { mode: "push-only" });
+    scenario.remote.edit(token, "remote edit\n");
+    writeFileSync(join(scenario.directory, "notes.md"), "local wins\n", "utf8");
+    const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "local wins\n", "the remote edit must never be pulled");
+    assert.equal(scenario.remote.documents.get(token)?.content, "local wins\n");
+    assert.equal(synced.entries[0]?.status, "clean");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("push-only mode does not import remote-only documents", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario);
+    await scenario.metaStorage.updateRoot(root.id, { mode: "push-only" });
+    await scenario.remote.createDocument("root-token", "remote-only", "remote content\n");
+    const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(synced.entries.length, 0, "push-only must not import remote-only documents");
+    assert.equal(existsSync(join(scenario.directory, "remote-only.md")), false);
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("a drive event echoing a just-pushed token is ignored while others scan", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    await scenario.metaStorage.updateRoot(root.id, { enabled: true });
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const token = result.entries[0]!.remoteToken!;
+    const before = scenario.remote.listTreeCalls;
+    // The push registered an echo guard, so this event is skipped without a scan.
+    await scenario.runtime.requestSync(root.id, token);
+    assert.equal(scenario.remote.listTreeCalls, before, "an echoed push must not trigger a scan");
+    // A different (genuine) remote change is not guarded and does scan.
+    await scenario.runtime.requestSync(root.id, "other-token");
+    assert.ok(scenario.remote.listTreeCalls > before, "a genuine remote change must trigger a scan");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("a transient write failure auto-retries with backoff and recovers", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const token = result.entries[0]!.remoteToken!;
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    // Fail twice then succeed: the round auto-retries (zero-delay) and recovers.
+    scenario.remote.failWritesTimes(2);
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+    const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(synced.entries[0]?.status, "clean");
+    assert.equal(scenario.remote.documents.get(token)?.content, "local edit\n");
+    const operation = (await scenario.metaStorage.listOperations()).find((op) => op.status === "succeeded");
+    assert.ok(operation, "expected a succeeded operation after retries");
+    assert.equal(operation!.retryCount, 2);
+    const types = broadcastTypes(messages);
+    assert.equal(types.filter((type) => type === "operation-retrying").length, 2);
+    assert.ok(types.includes("operation-completed"));
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("an auth failure on write fails fast without auto-retry", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    await scenario.runtime.syncRoot(root.id);
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    scenario.remote.failWritesAuth = true;
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+    const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[]; authInvalid?: boolean };
+    assert.equal(synced.authInvalid, true);
+    const operation = (await scenario.metaStorage.listOperations()).find((op) => op.status === "failed");
+    assert.ok(operation, "expected a failed operation");
+    assert.equal(operation!.errorCategory, "auth");
+    assert.equal(operation!.retryCount, 0, "auth failures must never auto-retry");
+    // The engine picks the direction before it writes, so a failed push must not
+    // fall back to the "merge" placeholder the record was opened with (B1).
+    assert.equal(operation!.direction, "push", "a failed operation keeps its real direction");
+    assert.ok(!broadcastTypes(messages).includes("operation-retrying"));
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("a successful sync broadcasts the operation lifecycle with a real direction", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+    await scenario.runtime.syncRoot(root.id);
+    const types = broadcastTypes(messages);
+    assert.ok(types.includes("operation-queued"));
+    assert.ok(types.includes("operation-started"));
+    assert.ok(types.includes("operation-completed"));
+    const operation = (await scenario.metaStorage.listOperations()).find((op) => op.status === "succeeded");
+    assert.equal(operation?.direction, "push", "a new local document is pushed to the remote");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("version history diffs against a commit and rolls back both sides (B4)", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "v1\n");
+    const first = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entryId = first.entries[0]!.entryId;
+    const token = first.entries[0]!.remoteToken!;
+    assert.equal(scenario.remote.documents.get(token)?.content, "v1\n");
+
+    // A second local version is pushed, leaving two commits for notes.md.
+    writeFileSync(join(scenario.directory, "notes.md"), "v2\n", "utf8");
+    await scenario.runtime.syncRoot(root.id);
+    assert.equal(scenario.remote.documents.get(token)?.content, "v2\n");
+
+    const history = await scenario.runtime.getRootHistory(root.id, "notes.md", 50);
+    assert.equal(history.length, 2, "two versions of notes.md, newest first");
+    const [newest, oldest] = history;
+
+    // Diff against the oldest commit exposes the historical content as the base.
+    const diff = await scenario.runtime.getEntryDiff(entryId, oldest!.hash);
+    assert.equal(diff.baseContent, "v1\n");
+    assert.equal(diff.currentContent, "v2\n");
+
+    // Diff against the baseline shows no pending local change after a clean sync.
+    const baselineDiff = await scenario.runtime.getEntryDiff(entryId, "baseline");
+    assert.equal(baselineDiff.baseContent, "v2\n");
+    assert.equal(baselineDiff.currentContent, "v2\n");
+
+    // Rolling back to the oldest version rewrites local AND pushes to remote.
+    const result = await scenario.runtime.rollbackEntry(entryId, oldest!.hash);
+    assert.equal(result.ok, true);
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "v1\n");
+    assert.equal(scenario.remote.documents.get(token)?.content, "v1\n", "the remote follows the rollback");
+
+    // The rollback is itself a new version on the timeline.
+    const afterRollback = await scenario.runtime.getRootHistory(root.id, "notes.md", 50);
+    assert.equal(afterRollback.length, 3);
+    assert.notEqual(afterRollback[0]!.hash, newest!.hash);
+
+    // An unknown commit is rejected rather than silently no-oping.
+    await assert.rejects(() => scenario.runtime.rollbackEntry(entryId, "deadbeef"), /No such version/);
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("a 429 Retry-After hint becomes the backoff floor and is broadcast (B6.2)", async () => {
+  const delays: number[] = [];
+  const scenario = createScenario({ delays });
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const first = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const token = first.entries[0]!.remoteToken!;
+
+    // Round 1: the remote answers 429 with Retry-After far above the first
+    // scheduled backoff step (1s), so the hint must win.
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    scenario.remote.failWritesRateLimit(1, 5000);
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+    const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(synced.entries[0]?.status, "clean");
+    assert.equal(scenario.remote.documents.get(token)?.content, "local edit\n", "the retry after the rate limit still lands");
+    assert.deepEqual(delays, [5000], "Retry-After overrides a shorter scheduled backoff");
+
+    const rateLimited = messages
+      .map((payload) => JSON.parse(payload) as Record<string, unknown>)
+      .find((event) => event.type === "rate-limited");
+    assert.ok(rateLimited, "the UI receives a rate-limited event");
+    assert.equal(rateLimited!.retryAfterMs, 5000);
+    assert.equal(rateLimited!.retryCount, 1);
+    const operation = (await scenario.metaStorage.listOperations()).find((op) => op.status === "succeeded");
+    assert.equal(operation?.errorCategory, "rate_limit");
+    assert.equal(operation?.retryCount, 1);
+
+    // Round 2: a tiny Retry-After must NOT shorten the scheduled backoff.
+    writeFileSync(join(scenario.directory, "notes.md"), "second edit\n", "utf8");
+    scenario.remote.failWritesRateLimit(1, 100);
+    await scenario.runtime.syncRoot(root.id);
+    assert.deepEqual(delays, [5000, 1000], "the scheduled step is the floor when Retry-After is smaller");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("watcherIgnore shields the watcher from git, metadata and excluded paths (B1)", () => {
+  // chokidar v4 no longer accepts globs in `ignored`, so the shield is a single
+  // predicate; these cases are what it has to get right.
+  const root: SyncRoot = {
+    id: "watcher-root",
+    localPath: "/work/notes",
+    remoteToken: "token",
+    remoteType: "folder",
+    enabled: true,
+    pollIntervalMs: 60_000,
+    exclude: ["archive/**", "drafts/*.md"]
+  };
+  const ignore = watcherIgnore(root);
+
+  assert.equal(ignore("/work/notes"), false, "the watched root itself is never ignored");
+  assert.equal(ignore("/work/notes/.git"), true);
+  assert.equal(ignore("/work/notes/.git/index"), true, "the baseline commit rewrites the index");
+  assert.equal(ignore("/work/notes/.git/objects/1a/2b3c4d"), true);
+  assert.equal(ignore("/work/notes/.git/refs/heads/main"), true);
+  assert.equal(ignore("/work/notes/nested/.git/index"), true);
+  assert.equal(ignore("/work/notes/.feishu-sync/entries.json"), true);
+  assert.equal(ignore("/work/notes/todo.feishu-sync-9f3a.tmp"), true, "atomic-write scratch file");
+
+  assert.equal(ignore("/work/notes/archive/old.md"), true, "B6.5 excludes are honoured by the watcher too");
+  assert.equal(ignore("/work/notes/drafts/wip.md"), true);
+  assert.equal(ignore("/work/notes/drafts/nested/wip.md"), false, "the same matcher local.scan uses");
+
+  assert.equal(ignore("/work/notes/todo.md"), false, "real documents still trigger a watch round");
+  assert.equal(ignore("/work/notes/guide/setup.md"), false);
+  assert.equal(ignore("/work/notes/.gitconfig"), false, "only the exact metadata names are shielded");
+  assert.equal(ignore("/work/notes-backup/todo.md"), false, "a sibling sharing the path prefix");
+  assert.equal(ignore("/elsewhere/.git/index"), false, "paths outside the root are not ours to judge");
+});
+
+test("a baseline commit does not retrigger the watcher into an endless loop (B1)", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "seed line\n");
+    // First round so `.git` already exists and holds a baseline commit.
+    await scenario.runtime.syncRoot(root.id);
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+    scenario.runtime.startRoot(root);
+    await sleep(1500);
+    const watchRounds = (): number => messages
+      .map((payload) => JSON.parse(payload) as { type?: string; trigger?: string })
+      .filter((event) => event.type === "sync-started" && event.trigger === "watch").length;
+    assert.equal(watchRounds(), 0, "starting the watcher emits its own manual round, never a watch round");
+
+    // Writes the sync engine performs itself: the git index (same bytes, new
+    // mtime — clobbering it would corrupt the repo), a loose object, the
+    // metadata store and its atomic scratch file.
+    const indexPath = join(scenario.directory, ".git", "index");
+    const indexBefore = statSync(indexPath).mtimeMs;
+    mkdirSync(join(scenario.directory, ".git", "objects", "1a"), { recursive: true });
+    writeFileSync(indexPath, readFileSync(indexPath));
+    writeFileSync(join(scenario.directory, ".git", "objects", "1a", "2b3c4d"), "object\n", "utf8");
+    mkdirSync(join(scenario.directory, ".feishu-sync"), { recursive: true });
+    writeFileSync(join(scenario.directory, ".feishu-sync", "entries.json"), "{}\n", "utf8");
+    writeFileSync(join(scenario.directory, "notes.feishu-sync-9f3a.tmp"), "scratch\n", "utf8");
+    await sleep(1500);
+    assert.equal(watchRounds(), 0, "metadata writes must never start a sync round");
+
+    // A genuine edit must still be picked up exactly once — the round it starts
+    // commits a new baseline, which under the old glob-based `ignored` fired yet
+    // another watch round, and so on every ~600ms forever.
+    writeFileSync(join(scenario.directory, "todo.md"), "a real new document\n", "utf8");
+    await sleep(2500);
+    assert.equal(watchRounds(), 1, `expected exactly one watch round, got ${watchRounds()}`);
+    const entries = (await scenario.metaStorage.listBindings(root.id)) as EntryView[];
+    assert.ok(entries.some((entry) => entry.status === "clean"), "the watch round synced the new document");
+    // Proves the loop precondition really happened: that watch round committed,
+    // so the index was rewritten and would have retriggered the watcher.
+    assert.ok(statSync(indexPath).mtimeMs > indexBefore, "the watch round committed a new baseline");
   } finally {
     cleanup(scenario);
   }

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildFileTree, collectFolderPaths, filterFileTree } from "./fileTree";
+import { buildFileTree, collectFolderPaths, filterFileTree, matchRanges } from "./fileTree";
 import type { Entry } from "./api";
 
-function entry(relativePath: string, id = relativePath): Entry {
-  return { id, rootId: "root-1", relativePath, kind: "document", status: "clean", updatedAt: "2026-01-01T00:00:00Z" };
+function entry(relativePath: string, entryId = relativePath): Entry {
+  return { entryId, rootId: "root-1", relativePath, kind: "document", status: "clean", updatedAt: "2026-01-01T00:00:00Z" };
 }
 
 describe("buildFileTree", () => {
@@ -86,5 +86,64 @@ describe("filterFileTree", () => {
   it("is case-insensitive and drops non-matching branches", () => {
     const filtered = filterFileTree(tree, "NOTES");
     expect(filtered.map((node) => node.path)).toEqual(["notes.txt"]);
+  });
+});
+
+describe("matchRanges (B6.7)", () => {
+  it("returns half-open ranges for every non-overlapping occurrence", () => {
+    expect(matchRanges("setup.md", "setup")).toEqual([{ start: 0, end: 5 }]);
+    expect(matchRanges("ab-ab.md", "ab")).toEqual([{ start: 0, end: 2 }, { start: 3, end: 5 }]);
+  });
+
+  it("is case-insensitive but reports ranges in the original text", () => {
+    expect(matchRanges("README.md", "readme")).toEqual([{ start: 0, end: 6 }]);
+    expect("README.md".slice(0, 6)).toBe("README");
+  });
+
+  it("ignores surrounding whitespace in the needle", () => {
+    expect(matchRanges("docs/api.md", "  api  ")).toEqual([{ start: 5, end: 8 }]);
+  });
+
+  it("yields no ranges for a blank needle or a miss", () => {
+    expect(matchRanges("setup.md", "")).toEqual([]);
+    expect(matchRanges("setup.md", "   ")).toEqual([]);
+    expect(matchRanges("setup.md", "usage")).toEqual([]);
+  });
+});
+
+describe("filterFileTree hit ranges (B6.7)", () => {
+  const tree = buildFileTree([
+    entry("docs/guide/setup.md"),
+    entry("docs/api.md"),
+    entry("notes.txt")
+  ]);
+
+  it("marks the matched slice of a file name", () => {
+    const filtered = filterFileTree(tree, "setup");
+    const docs = filtered[0]!;
+    if (docs.kind !== "folder") return;
+    const guide = docs.children[0]!;
+    if (guide.kind !== "folder") return;
+    const file = guide.children[0]!;
+    expect(file.hits).toEqual([{ start: 0, end: 5 }]);
+    expect(file.name.slice(file.hits![0]!.start, file.hits![0]!.end)).toBe("setup");
+  });
+
+  it("marks the matched slice of a folder name that kept its subtree", () => {
+    const filtered = filterFileTree(tree, "guide");
+    const docs = filtered[0]!;
+    if (docs.kind !== "folder") return;
+    const guide = docs.children[0]!;
+    expect(guide.hits).toEqual([{ start: 0, end: 5 }]);
+    // The ancestor matched only through the path, so its own name has no hit.
+    expect(docs.hits).toEqual([]);
+  });
+
+  it("leaves hits empty when only the ancestor path matched", () => {
+    const filtered = filterFileTree(tree, "docs/api");
+    const docs = filtered[0]!;
+    if (docs.kind !== "folder") return;
+    expect(docs.hits).toEqual([]);
+    expect(docs.children[0]!.hits).toEqual([]);
   });
 });

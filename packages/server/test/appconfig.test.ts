@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { AppConfigStore, DEFAULT_PREFERENCES } from "../src/appconfig.js";
+import { AppConfigStore, DEFAULT_NOTIFICATIONS, DEFAULT_PREFERENCES } from "../src/appconfig.js";
 
 test("preferences default, round-trip on disk and validation", async () => {
   const dir = mkdtempSync(join(tmpdir(), "feishu-appconfig-"));
@@ -14,7 +14,7 @@ test("preferences default, round-trip on disk and validation", async () => {
     assert.ok(!existsSync(configPath), "no file is written until the first save");
 
     const saved = await config.setPreferences({ defaultPollIntervalMs: 30000, logLevel: "debug" });
-    assert.deepEqual(saved, { defaultPollIntervalMs: 30000, logLevel: "debug" });
+    assert.deepEqual(saved, { defaultPollIntervalMs: 30000, logLevel: "debug", notifications: { ...DEFAULT_NOTIFICATIONS } });
     assert.ok(existsSync(configPath), "the first save must create config.json");
 
     // A second instance re-reads the file: persistence really happened.
@@ -24,6 +24,52 @@ test("preferences default, round-trip on disk and validation", async () => {
     await assert.rejects(config.setPreferences({ defaultPollIntervalMs: 500 }), /at least 1000ms/);
     await assert.rejects(config.setPreferences({ logLevel: "verbose" as never }), /logLevel/);
     assert.deepEqual(config.preferences, saved, "failed saves must not mutate state");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("notification preferences default on, persist per category and survive a partial patch (B6.8)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "feishu-appconfig-"));
+  try {
+    const configPath = join(dir, "config.json");
+    const config = new AppConfigStore(configPath);
+    assert.deepEqual(config.preferences.notifications, { conflict: true, failure: true, credential: true });
+
+    // A partial patch only flips the named categories.
+    const saved = await config.setPreferences({ notifications: { conflict: false } });
+    assert.deepEqual(saved.notifications, { conflict: false, failure: true, credential: true });
+    await config.setPreferences({ notifications: { credential: false } });
+    assert.deepEqual(config.preferences.notifications, { conflict: false, failure: true, credential: false });
+
+    // The toggles live server-side, so a second instance (another browser or a
+    // restarted process) reads the same values instead of per-device defaults.
+    const reopened = new AppConfigStore(configPath);
+    assert.deepEqual(reopened.preferences.notifications, { conflict: false, failure: true, credential: false });
+    const disk = JSON.parse(readFileSync(configPath, "utf8")) as { preferences: { notifications: Record<string, boolean> } };
+    assert.deepEqual(disk.preferences.notifications, { conflict: false, failure: true, credential: false });
+
+    // Turning one back on works, and an unrelated patch leaves them untouched.
+    await config.setPreferences({ logLevel: "warn" });
+    assert.deepEqual(config.preferences.notifications, { conflict: false, failure: true, credential: false });
+    assert.equal((await config.setPreferences({ notifications: { conflict: true } })).notifications.conflict, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a config.json written before notifications existed still yields all defaults", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "feishu-appconfig-"));
+  try {
+    const configPath = join(dir, "config.json");
+    // Legacy document: no `notifications` key at all (JSON-default compatible,
+    // no migration step required).
+    writeFileSync(configPath, JSON.stringify({ version: 1, credentials: {}, preferences: { defaultPollIntervalMs: 20000, logLevel: "error" } }), "utf8");
+    const config = new AppConfigStore(configPath);
+    assert.deepEqual(config.preferences, { defaultPollIntervalMs: 20000, logLevel: "error", notifications: { ...DEFAULT_NOTIFICATIONS } });
+    // A partially written notifications object is merged over the defaults too.
+    writeFileSync(configPath, JSON.stringify({ version: 1, credentials: {}, preferences: { notifications: { failure: false } } }), "utf8");
+    assert.deepEqual(new AppConfigStore(configPath).preferences.notifications, { conflict: true, failure: false, credential: true });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

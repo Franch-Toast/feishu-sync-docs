@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type {
   AssetBinding, BlockMapping, ConflictRecord, ConflictStatus, EntryBinding,
-  FolderBinding, MetaStorage, OperationRecord, PruneHistoryOptions,
+  FolderBinding, ListOperationsOptions, MetaStorage, OperationRecord, PruneHistoryOptions,
   PruneHistoryResult, RootState, SyncRoot
 } from '@feishu-sync/core';
 
@@ -221,6 +221,7 @@ export class JsonMetaStorage implements MetaStorage {
 
   async addOperation(input: Omit<OperationRecord, 'id' | 'createdAt' | 'retryCount' | 'status'>): Promise<OperationRecord> {
     const operation: OperationRecord = {
+      maxRetries: 3,
       ...input,
       id: randomUUID(),
       retryCount: 0,
@@ -260,7 +261,7 @@ export class JsonMetaStorage implements MetaStorage {
     return operation;
   }
 
-  async updateOperation(id: string, patch: Partial<Pick<OperationRecord, 'status' | 'error' | 'completedAt' | 'retryCount'>>): Promise<OperationRecord> {
+  async updateOperation(id: string, patch: Partial<Pick<OperationRecord, 'status' | 'error' | 'errorCategory' | 'completedAt' | 'startedAt' | 'retryCount' | 'maxRetries' | 'direction' | 'trigger'>>): Promise<OperationRecord> {
     for (const metaDir of this.metaDirs.values()) {
       const opsPath = path.join(metaDir, 'operations.json');
       const ops = await this.readJson<OperationRecord[]>(opsPath, []);
@@ -276,17 +277,32 @@ export class JsonMetaStorage implements MetaStorage {
     throw new Error(`Operation not found: ${id}`);
   }
 
-  async listOperations(limit = 100): Promise<OperationRecord[]> {
+  async listOperations(options: number | ListOperationsOptions = {}): Promise<OperationRecord[]> {
+    const opts: ListOperationsOptions = typeof options === 'number' ? { limit: options } : options;
+    const { rootId, limit = 100, cursor, status, trigger, errorCategory } = opts;
     const allOps: OperationRecord[] = [];
-    for (const metaDir of this.metaDirs.values()) {
+    for (const [rid, metaDir] of this.metaDirs) {
+      // Scope to a single root's ring buffer when the caller filters by root.
+      if (rootId !== undefined && rid !== rootId) continue;
       const opsPath = path.join(metaDir, 'operations.json');
       const ops = await this.readJson<OperationRecord[]>(opsPath, []);
       allOps.push(...ops);
     }
-    // Sort by createdAt descending and limit
-    return allOps
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-      .slice(0, limit);
+    const filtered = allOps.filter((op) =>
+      (status === undefined || op.status === status)
+      && (trigger === undefined || op.trigger === trigger)
+      && (errorCategory === undefined || op.errorCategory === errorCategory));
+    // Newest first; tie-break on id so cursor paging is stable across equal timestamps.
+    const sorted = filtered.sort((a, b) =>
+      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    let start = 0;
+    if (cursor !== undefined) {
+      const cursorIndex = sorted.findIndex((op) => op.id === cursor);
+      // Unknown cursor (e.g. the record was pruned): fall back to the first page.
+      if (cursorIndex !== -1) start = cursorIndex + 1;
+    }
+    return sorted.slice(start, start + limit);
   }
 
   async getOperation(id: string): Promise<OperationRecord | undefined> {
@@ -516,6 +532,24 @@ export class JsonMetaStorage implements MetaStorage {
     }
 
     return { operations: operationsPruned, conflicts: conflictsPruned, snapshots: 0 };
+  }
+
+  /**
+   * Drop finished operation records across every root's ring buffer and report
+   * how many went away. Defaults to the two terminal "done" statuses so the task
+   * center's「清空已完成」never throws away a failure the user still has to act on.
+   */
+  async clearCompletedOperations(statuses: OperationRecord['status'][] = ['succeeded', 'cancelled']): Promise<number> {
+    let cleared = 0;
+    for (const metaDir of this.metaDirs.values()) {
+      const opsPath = path.join(metaDir, 'operations.json');
+      const ops = await this.readJson<OperationRecord[]>(opsPath, []);
+      const kept = ops.filter((op) => !statuses.includes(op.status));
+      if (kept.length === ops.length) continue;
+      cleared += ops.length - kept.length;
+      await this.writeJson(opsPath, kept);
+    }
+    return cleared;
   }
 
   // ============================================================================

@@ -2,6 +2,8 @@
  *  to decide when a failure means "credentials need user attention". */
 export type FeishuErrorKind = "auth" | "permission" | "rate_limit" | "not_found" | "network" | "other";
 
+import type { EntryStatus, ErrorCategory } from "@feishu-sync/core";
+
 /** Feishu error codes that unambiguously indicate an invalid/expired token. */
 const AUTH_CODES = new Set([99991661, 99991663, 99991664, 99991668, 99991679]);
 
@@ -10,11 +12,26 @@ export class FeishuApiError extends Error {
     readonly kind: FeishuErrorKind,
     message: string,
     readonly code?: number,
-    readonly httpStatus?: number
+    readonly httpStatus?: number,
+    /** Parsed from a 429 Retry-After header; the runtime uses it as the
+     *  auto-retry delay floor so backoff respects the server's window (B6.2). */
+    readonly retryAfterMs?: number
   ) {
     super(message);
     this.name = "FeishuApiError";
   }
+}
+
+/** Parse an HTTP Retry-After header into milliseconds. Accepts both the
+ *  delta-seconds form ("120") and the HTTP-date form; returns undefined when
+ *  the value is absent or unparseable. */
+export function parseRetryAfterMs(value: string | null | undefined): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value.trim());
+  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000));
+  const date = Date.parse(value);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return undefined;
 }
 
 /** Error raised by the OAuth v3 token endpoint when refreshing a user access
@@ -61,3 +78,34 @@ export function classifyCliMessage(message: string): FeishuErrorKind {
   if (/rate.?limit|too many|429|限流/i.test(message)) return "rate_limit";
   return "other";
 }
+
+/** Map a thrown error (plus the entry's status) onto the task-center error
+ *  category. A conflict entry status wins over the transport classification so
+ *  the UI routes the user to the issue workbench; Feishu API errors carry a
+ *  semantic kind, and anything else is best-effort matched from the message.
+ *  "other" collapses to "unknown". */
+export function categorizeError(error: unknown, entryStatus?: EntryStatus): ErrorCategory {
+  if (entryStatus === "conflict") return "conflict";
+  if (error instanceof FeishuApiError) {
+    switch (error.kind) {
+      case "auth": return "auth";
+      case "permission": return "permission";
+      case "rate_limit": return "rate_limit";
+      case "not_found": return "not_found";
+      case "network": return "network";
+      default: return "unknown";
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (/HTTP\s+404|not[ -]?found|notexisted|deleted/i.test(message)) return "not_found";
+  if (/HTTP\s+403|forbidden|permission|access denied|权限/i.test(message)) return "permission";
+  if (/HTTP\s+401|unauthorized|invalid[^\n]*token|token[^\n]*invalid|认证|登录/i.test(message)) return "auth";
+  if (/rate.?limit|too many|HTTP\s+429|限流/i.test(message)) return "rate_limit";
+  if (/network|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET|aborted|fetch failed/i.test(message)) return "network";
+  return "unknown";
+}
+
+/** Categories the runtime auto-retries with exponential backoff. Auth and
+ *  permission failures need user action, conflicts need a human decision, and
+ *  not_found is terminal for this round, so none of them are retried. */
+export const RETRIABLE_ERROR_CATEGORIES: ReadonlySet<ErrorCategory> = new Set(["network", "rate_limit", "unknown"]);

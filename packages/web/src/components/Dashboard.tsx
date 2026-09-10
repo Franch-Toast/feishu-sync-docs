@@ -18,13 +18,15 @@ interface DashboardProps {
   onToggleRoot: (rootId: string, enabled: boolean) => Promise<void>;
   onSyncNow: (rootId: string) => Promise<void>;
   onRefresh: () => void;
+  /** Quick-start card shown while first-run steps remain (B6.1). */
+  quickStart?: React.ReactNode;
 }
 
 function rootName(root: Root): string {
   return root.localPath.split(/[\\/]/).at(-1) ?? root.localPath;
 }
 
-export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatus, onOpenRoot, onOpenAdd, onDeleteRoot, onToggleRoot, onSyncNow, onRefresh }: DashboardProps): React.JSX.Element {
+export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatus, onOpenRoot, onOpenAdd, onDeleteRoot, onToggleRoot, onSyncNow, onRefresh, quickStart }: DashboardProps): React.JSX.Element {
   // Exception statistic: hard failures plus both missing flavors (and legacy
   // orphans before their reclassification round).
   const errorEntries = Object.values(rootStats).reduce(
@@ -49,6 +51,8 @@ export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatu
       <div><span className="eyebrow">WORKSPACE / OVERVIEW</span><h2>仪表盘</h2><p>全局同步状态一览；点击根目录卡片进入详情，管理目录文档、冲突与历史。</p></div>
       <div className="heading-actions"><button className="secondary" onClick={onRefresh}>刷新</button></div>
     </div>
+
+    {quickStart}
 
     <div className="overview-grid">
       <div className="metric"><span>同步根目录</span><strong>{roots.length}</strong></div>

@@ -124,3 +124,33 @@ describe("overlap detection", () => {
     expect(clashingHunkIndices(hunks)).toEqual(new Set([0, 1]));
   });
 });
+
+// The three-column conflict view (BASE | LOCAL | REMOTE) renders the base text
+// plus two independent diffs, base→local and base→remote. Both sides must stay
+// aligned to the same base coordinate system so the columns line up row by row.
+describe("three-column base/local/remote view", () => {
+  const base = "title\nline one\nline two\nend";
+  const local = "title\nLINE ONE\nline two\nend";
+  const remote = "title\nline one\nline two\nREMOTE END";
+
+  it("diffs each side against the shared base independently", () => {
+    expect(lineDiff(base, local).map((row) => row.kind)).toEqual(["same", "del", "add", "same", "same"]);
+    expect(lineDiff(base, remote).map((row) => row.kind)).toEqual(["same", "same", "same", "del", "add"]);
+  });
+
+  it("anchors each side's change to the same base line number", () => {
+    expect(lineDiff(base, local).find((row) => row.kind === "del")?.oldNumber).toBe(2);
+    expect(lineDiff(base, remote).find((row) => row.kind === "del")?.oldNumber).toBe(4);
+  });
+
+  it("renders one base-pane row per base line", () => {
+    expect(base.replace(/\n$/, "").split("\n")).toEqual(["title", "line one", "line two", "end"]);
+  });
+
+  it("merges disjoint local/remote hunks losslessly against base", () => {
+    const localHunks = computeHunks(base, local, "local");
+    const remoteHunks = computeHunks(base, remote, "remote");
+    expect(clashingHunkIndices([...localHunks, ...remoteHunks]).size).toBe(0);
+    expect(applyHunks(base, [...localHunks, ...remoteHunks])).toBe("title\nLINE ONE\nline two\nREMOTE END");
+  });
+});

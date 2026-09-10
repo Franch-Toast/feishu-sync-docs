@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FeishuOpenApiProvider, FeishuApiError } from "../src/index.js";
+import { FeishuOpenApiProvider, FeishuApiError, parseRetryAfterMs } from "../src/index.js";
 import type { UserTokenUpdate } from "../src/index.js";
 import type { SyncRoot } from "@feishu-sync/core";
 
@@ -250,4 +250,43 @@ test("routes the OAuth refresh endpoint to the accounts host", async () => {
     assert.deepEqual(tokenHosts, [item.accountsHost], `${item.baseUrl} must refresh via ${item.accountsHost}`);
     assert.deepEqual(apiHosts, [item.apiHost], `${item.baseUrl} must keep calling the API host`);
   }
+});
+
+test("a 429 response carries Retry-After on the error for the runtime backoff (B6.2)", async () => {
+  const limited: typeof fetch = async () => new Response("too many requests", { status: 429, headers: { "Retry-After": "30" } });
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl: limited });
+  const error = await provider.getDocument("doc-1").then(() => undefined, (caught: unknown) => caught);
+  assert.ok(error instanceof FeishuApiError);
+  assert.equal(error.kind, "rate_limit");
+  assert.equal(error.httpStatus, 429);
+  assert.equal(error.retryAfterMs, 30000, "delta-seconds become milliseconds");
+
+  // No header means no hint, so the runtime falls back to its scheduled backoff.
+  const bare = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl: async () => new Response("slow down", { status: 429 }) });
+  const bareError = await bare.getDocument("doc-1").then(() => undefined, (caught: unknown) => caught);
+  assert.ok(bareError instanceof FeishuApiError);
+  assert.equal(bareError.retryAfterMs, undefined);
+
+  // A non-429 failure never invents a retry hint.
+  const forbidden = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl: async () => new Response("nope", { status: 403, headers: { "Retry-After": "30" } }) });
+  const forbiddenError = await forbidden.getDocument("doc-1").then(() => undefined, (caught: unknown) => caught);
+  assert.ok(forbiddenError instanceof FeishuApiError);
+  assert.equal(forbiddenError.kind, "permission");
+  assert.equal(forbiddenError.retryAfterMs, undefined);
+});
+
+test("parseRetryAfterMs accepts delta-seconds and HTTP dates and rejects junk", () => {
+  assert.equal(parseRetryAfterMs("5"), 5000);
+  assert.equal(parseRetryAfterMs("  12 "), 12000);
+  assert.equal(parseRetryAfterMs("0"), 0);
+  assert.equal(parseRetryAfterMs("-3"), 0, "a negative hint never schedules a negative delay");
+  assert.equal(parseRetryAfterMs(undefined), undefined);
+  assert.equal(parseRetryAfterMs(null), undefined);
+  assert.equal(parseRetryAfterMs(""), undefined);
+  assert.equal(parseRetryAfterMs("not-a-number"), undefined);
+
+  const future = new Date(Date.now() + 60_000).toUTCString();
+  const parsed = parseRetryAfterMs(future)!;
+  assert.ok(parsed > 55_000 && parsed <= 60_000, `an HTTP-date hint resolves to roughly 60s, got ${parsed}`);
+  assert.equal(parseRetryAfterMs(new Date(Date.now() - 60_000).toUTCString()), 0, "an elapsed date means retry immediately");
 });

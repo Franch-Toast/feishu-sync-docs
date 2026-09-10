@@ -5,6 +5,18 @@ export type EntryStatus = "clean" | "pending" | "conflict" | "orphan" | "error" 
 export type ConflictStatus = "open" | "resolved" | "aborted";
 export type SyncDirection = "push" | "pull" | "merge";
 export type RemoteNodeType = "folder" | "document" | "asset";
+/** One-way sync modes folded in from the read-only/upstream-only request:
+ *  bidirectional keeps the three-way merge, pull-only makes the remote the
+ *  source of truth (local edits are never pushed), push-only makes the local
+ *  tree authoritative (remote edits are never pulled). Absent = bidirectional. */
+export type SyncMode = "bidirectional" | "pull-only" | "push-only";
+/** Incremental scan hint carried by event/watch triggers: only these local
+ *  paths and/or remote tokens changed, so the engine can restrict the costly
+ *  per-entry remote probing to the affected entries. */
+export interface SyncScope {
+  relativePaths?: string[];
+  remoteTokens?: string[];
+}
 
 export interface SyncRoot {
   id: string;
@@ -13,6 +25,10 @@ export interface SyncRoot {
   remoteType: "folder" | "wiki";
   enabled: boolean;
   pollIntervalMs: number;
+  /** Sync direction policy; absent means bidirectional (backward compatible). */
+  mode?: SyncMode;
+  /** Glob patterns excluded from scanning/watching (B6.5). */
+  exclude?: string[];
 }
 
 export interface LocalFile {
@@ -181,11 +197,28 @@ export interface OperationRecord {
   trigger?: SyncTrigger;
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   retryCount: number;
+  /** Auto-retry ceiling for this operation; absent records default to 3. */
+  maxRetries?: number;
   error?: string;
-  errorCategory?: string;
+  errorCategory?: ErrorCategory;
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+}
+
+/** Semantic bucket of a failed operation, driving the task-center guidance and
+ *  the auto-retry policy (auth/permission never auto-retry). */
+export type ErrorCategory = "auth" | "conflict" | "network" | "permission" | "not_found" | "rate_limit" | "unknown";
+
+/** Cursor-paged, filterable operation query used by the task center/history. */
+export interface ListOperationsOptions {
+  rootId?: string;
+  limit?: number;
+  /** Id of the last seen operation; the next page starts strictly after it. */
+  cursor?: string;
+  status?: OperationRecord["status"];
+  trigger?: SyncTrigger;
+  errorCategory?: ErrorCategory;
 }
 
 export interface SyncDecision {
@@ -290,6 +323,12 @@ export interface GitStorage {
   
   // History (replaces operations table for sync history)
   getHistory(rootId: string, limit?: number): Promise<Commit[]>;
+  /** Read a file's content at a specific commit (version-history diff/rollback).
+   *  Returns undefined when the path did not exist at that commit. */
+  readBlobAt(rootId: string, commit: string, relativePath: string): Promise<string | undefined>;
+  /** List commits that touched a single relative path, newest first. Backs the
+   *  per-document version timeline. */
+  listCommitsForPath(rootId: string, relativePath: string, limit?: number): Promise<Commit[]>;
   
   // Root path management
   getRootPath(rootId: string): string | undefined;
@@ -329,8 +368,8 @@ export interface MetaStorage {
   
   // Operations (operations.json - ring buffer)
   addOperation(input: Omit<OperationRecord, "id" | "createdAt" | "retryCount" | "status">): Promise<OperationRecord>;
-  updateOperation(id: string, patch: Partial<Pick<OperationRecord, "status" | "error" | "completedAt" | "retryCount">>): Promise<OperationRecord>;
-  listOperations(limit?: number): Promise<OperationRecord[]>;
+  updateOperation(id: string, patch: Partial<Pick<OperationRecord, "status" | "error" | "errorCategory" | "completedAt" | "startedAt" | "retryCount" | "maxRetries" | "direction" | "trigger">>): Promise<OperationRecord>;
+  listOperations(options?: number | ListOperationsOptions): Promise<OperationRecord[]>;
   getOperation(id: string): Promise<OperationRecord | undefined>;
   
   // Conflicts (conflicts/<conflictId>.json)
@@ -357,4 +396,8 @@ export interface MetaStorage {
   
   // History pruning
   pruneHistory(options?: PruneHistoryOptions): Promise<PruneHistoryResult>;
+  /** Delete finished operation records on demand, backing the task center's
+   *  「清空已完成」. The retention prune keeps ~1000 recent records, so it would
+   *  report nothing cleared long before any record actually expires. */
+  clearCompletedOperations(statuses?: OperationRecord["status"][]): Promise<number>;
 }

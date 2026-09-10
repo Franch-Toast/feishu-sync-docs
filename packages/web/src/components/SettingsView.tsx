@@ -1,7 +1,13 @@
 import React, { useEffect, useState } from "react";
-import { AUTH_STATUS_LABELS, EVENT_CHANNEL_LABELS, formatDateTime, type AppConfigPatch, type AppConfigView, type CredentialMode, type CredentialPatch, type LogLevel, type PruneResult, type RedactedSettings, type Root, type RootPatch, type TestConnectionResult } from "../api";
+import { api, AUTH_STATUS_LABELS, EVENT_CHANNEL_LABELS, formatDateTime, formatDurationMs, NOTIFICATION_LABELS, type ApiStats, type AppConfigPatch, type AppConfigView, type CredentialMode, type CredentialPatch, type LogLevel, type NotificationPreferences, type PruneResult, type RedactedSettings, type Root, type RootPatch, type TestConnectionResult } from "../api";
 
-export const NOTIFY_STORAGE_KEY = "fsync.notify.enabled";
+/** Browser permission state labels for the notification section (B6.8). */
+const PERMISSION_LABELS: Record<string, string> = {
+  granted: "已授权",
+  denied: "已拒绝（需在浏览器地址栏重新允许）",
+  default: "未请求",
+  unsupported: "当前浏览器不支持系统通知"
+};
 
 interface SettingsViewProps {
   settings?: RedactedSettings;
@@ -13,8 +19,12 @@ interface SettingsViewProps {
   onPatchRoot: (id: string, patch: RootPatch) => Promise<void>;
   onPrune: () => Promise<PruneResult>;
   onOpenGuide: () => void;
-  notifyEnabled: boolean;
-  onToggleNotify: (enabled: boolean) => void;
+  /** Server-side per-category notification toggles (B6.8). */
+  notifications: NotificationPreferences;
+  onToggleNotification: (category: keyof NotificationPreferences, enabled: boolean) => Promise<void>;
+  /** Browser Notification permission, or "unsupported" where the API is absent. */
+  notifyPermission: string;
+  onRequestNotifyPermission: () => void;
 }
 
 const MODE_LABELS: Record<CredentialMode, string> = {
@@ -39,7 +49,7 @@ interface RootDraft {
   intervalSec: string;
 }
 
-export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSaveSettings, onTestConnection, onPatchRoot, onPrune, onOpenGuide, notifyEnabled, onToggleNotify }: SettingsViewProps): React.JSX.Element {
+export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSaveSettings, onTestConnection, onPatchRoot, onPrune, onOpenGuide, notifications, onToggleNotification, notifyPermission, onRequestNotifyPermission }: SettingsViewProps): React.JSX.Element {
   const [mode, setMode] = useState<CredentialMode>("user");
   const [baseUrl, setBaseUrl] = useState("");
   const [accessToken, setAccessToken] = useState("");
@@ -60,6 +70,13 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
   const [prefSeededFor, setPrefSeededFor] = useState<string>();
   const [prefBusy, setPrefBusy] = useState(false);
   const [prefNotice, setPrefNotice] = useState<string>();
+  /** Category currently being persisted, so its switch shows a pending state. */
+  const [notifyBusy, setNotifyBusy] = useState<keyof NotificationPreferences>();
+  const [notifyNotice, setNotifyNotice] = useState<string>();
+  /** Lightweight remote API call tally, refreshed on demand (B6.2). */
+  const [apiStats, setApiStats] = useState<ApiStats>();
+  const [statsBusy, setStatsBusy] = useState(false);
+  const [statsNotice, setStatsNotice] = useState<string>();
 
   // Seed the form once settings arrive; afterwards the user's edits win.
   const [seededFor, setSeededFor] = useState<string>();
@@ -118,6 +135,36 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
     larkCliBin: larkCliBin.trim()
   });
 
+  /** Persist one notification category server-side (B6.8): the preference now
+   *  follows the installation instead of a single browser's localStorage. */
+  const toggleNotification = async (category: keyof NotificationPreferences, enabled: boolean) => {
+    setNotifyBusy(category);
+    setNotifyNotice(undefined);
+    try {
+      await onToggleNotification(category, enabled);
+      setNotifyNotice(`「${NOTIFICATION_LABELS[category].label}」已${enabled ? "开启" : "关闭"}，已保存到服务端。`);
+    } catch (error) {
+      setNotifyNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setNotifyBusy(undefined);
+    }
+  };
+
+  /** Fetch the in-memory API tally; counters reset when the service restarts. */
+  const loadApiStats = async () => {
+    setStatsBusy(true);
+    setStatsNotice(undefined);
+    try {
+      setApiStats(await api.getApiStats());
+    } catch (error) {
+      setStatsNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setStatsBusy(false);
+    }
+  };
+
+  useEffect(() => { void loadApiStats(); }, []);
+
   const runTest = async () => {
     setBusy(true);
     setNotice(undefined);
@@ -168,18 +215,6 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     }
-  };
-
-  const toggleNotify = async (enabled: boolean) => {
-    if (enabled && typeof Notification !== "undefined" && Notification.permission !== "granted") {
-      const permission = await Notification.requestPermission();
-      if (permission !== "granted") {
-        onToggleNotify(false);
-        setNotice("浏览器拒绝了通知权限，无法开启提醒。");
-        return;
-      }
-    }
-    onToggleNotify(enabled);
   };
 
   const authStatus = settings?.authStatus ?? "unconfigured";
@@ -344,13 +379,63 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
     </div>
 
     <div className="panel settings-panel">
-      <div className="panel-heading"><div><h3>浏览器通知</h3><span className="muted">冲突与同步失败时弹出系统通知</span></div></div>
+      <div className="panel-heading"><div><h3>通知偏好</h3><span className="muted">按类别开关，保存在服务端 config.json，换浏览器也跟随生效</span></div></div>
       <div className="settings-form">
-        <label className="form-row checkbox-row">
-          <input type="checkbox" checked={notifyEnabled} onChange={(event) => void toggleNotify(event.target.checked)} />
-          <span>启用浏览器通知（冲突新增、解决、同步出错时提醒）</span>
-        </label>
+        {(Object.keys(NOTIFICATION_LABELS) as Array<keyof NotificationPreferences>).map((category) => (
+          <label className="form-row checkbox-row" key={category}>
+            <input
+              type="checkbox"
+              checked={notifications[category]}
+              disabled={notifyBusy === category}
+              onChange={(event) => void toggleNotification(category, event.target.checked)}
+            />
+            <span>{NOTIFICATION_LABELS[category].label}<small className="muted">{NOTIFICATION_LABELS[category].hint}</small></span>
+          </label>
+        ))}
+        <div className="form-row">
+          <span className="form-label">浏览器系统通知权限</span>
+          <div className="rebind-row">
+            <span className={`notify-permission ${notifyPermission}`}>{PERMISSION_LABELS[notifyPermission] ?? notifyPermission}</span>
+            {notifyPermission !== "granted" && notifyPermission !== "unsupported" && <button className="secondary" onClick={onRequestNotifyPermission}>请求通知权限</button>}
+          </div>
+          <span className="muted">关闭某一类后，该类事件不再弹出系统通知；页面内的徽章、任务中心与异常工作台仍会展示。本版本不提供通知声音。</span>
+        </div>
+        {notifyNotice && <div className="form-notice">{notifyNotice}</div>}
       </div>
+    </div>
+
+    <div className="panel settings-panel">
+      <div className="panel-heading">
+        <div><h3>API 调用统计</h3><span className="muted">自服务启动以来的飞书接口调用计数，用于判断是否正在被限流</span></div>
+        <button className="secondary" disabled={statsBusy} onClick={() => void loadApiStats()}>{statsBusy ? "刷新中…" : "刷新"}</button>
+      </div>
+      {apiStats && <div className="api-stats">
+        <div className="overview-grid">
+          <div className="metric"><span>调用总数</span><strong>{apiStats.calls}</strong><small>{apiStats.provider}</small></div>
+          <div className="metric"><span>失败</span><strong>{apiStats.failures}</strong></div>
+          <div className={`metric${apiStats.rateLimited > 0 ? " warning" : ""}`}><span>429 限流</span><strong>{apiStats.rateLimited}</strong><small>命中后按 Retry-After 退避重试</small></div>
+          <div className="metric"><span>累计耗时</span><strong className="metric-time">{formatDurationMs(apiStats.totalDurationMs)}</strong></div>
+        </div>
+        {Object.keys(apiStats.byMethod).length > 0
+          ? <table className="op-table">
+            <thead><tr><th>接口</th><th>调用</th><th>失败</th><th>限流</th><th>累计耗时</th></tr></thead>
+            <tbody>
+              {Object.entries(apiStats.byMethod).map(([method, stats]) => (
+                <tr key={method}>
+                  <td data-label="接口"><code>{method}</code></td>
+                  <td data-label="调用" className="muted">{stats.calls}</td>
+                  <td data-label="失败" className="muted">{stats.failures}</td>
+                  <td data-label="限流" className="muted">{stats.rateLimited}</td>
+                  <td data-label="累计耗时" className="muted">{formatDurationMs(stats.totalDurationMs)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          : <p className="muted form-hint">尚未调用过飞书接口。绑定根目录并执行一次同步后，这里会按接口列出调用次数、失败数与耗时。</p>}
+        <p className="muted form-hint">统计仅保存在内存中，服务重启后归零；本轮计数开始于 {formatDateTime(apiStats.startedAt)}。限流发生时顶栏会出现徽章，任务中心与历史页会记录退避重试。</p>
+      </div>}
+      {!apiStats && <p className="muted form-hint">{statsNotice ? "统计读取失败，请点击右上角「刷新」重试。" : "正在读取 API 调用统计…"}</p>}
+      {statsNotice && <div className="form-notice">{statsNotice}</div>}
     </div>
 
     <div className="panel settings-panel">

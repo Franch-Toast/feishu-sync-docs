@@ -2,11 +2,71 @@ import type { WebSocket } from "ws";
 import type { FastifyBaseLogger } from "fastify";
 import { watch, type FSWatcher } from "chokidar";
 import { randomUUID } from "node:crypto";
+import { join, relative, resolve, sep } from "node:path";
 import { SyncEngine } from "@feishu-sync/core";
-import { sha256 } from "@feishu-sync/core";
-import { FeishuApiError } from "@feishu-sync/feishu";
+import { sha256, matchesAnyGlob } from "@feishu-sync/core";
+import { categorizeError, FeishuApiError, RETRIABLE_ERROR_CATEGORIES } from "@feishu-sync/feishu";
 import type { AuthStateStore } from "./appconfig.js";
-import type { ConflictRecord, EntryBinding, GitStorage, LocalProvider, MetaStorage, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, SyncRoot, SyncTrigger } from "@feishu-sync/core";
+import { ApiCallStats, instrumentRemote, type ApiStatsSnapshot } from "./apistats.js";
+import type { Commit, ConflictRecord, EntryBinding, ErrorCategory, FolderBinding, GitStorage, LocalProvider, MetaStorage, OperationRecord, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger } from "@feishu-sync/core";
+
+/** Task-center status filter; "active" groups queued + running operations. */
+export type TaskStatus = "active" | "queued" | "running" | "succeeded" | "failed" | "cancelled" | "all";
+/** An operation record joined with its entry's relativePath/kind for display. */
+export type TaskView = OperationRecord & { relativePath?: string; kind?: string };
+
+/** Directories the sync engine writes inside the user's tree. */
+const METADATA_DIRECTORIES = new Set([".git", ".feishu-sync"]);
+/** Atomic-write scratch files of the metadata stores, e.g. `x.feishu-sync-7f3.tmp`. */
+const METADATA_TEMP_FILE = /\.feishu-sync-[^/]*\.tmp$/;
+
+/**
+ * Build the `ignored` predicate for a root's file watcher (B1 loop prevention).
+ *
+ * Three families, all of which the sync round itself writes and which would
+ * otherwise trigger the next round:
+ * - `.git/**` — every baseline commit rewrites the index, adds loose objects and
+ *   moves the branch ref. Without this the watcher fired a `trigger:"watch"`
+ *   round for each commit, and that round committed again: an endless ~600ms loop.
+ * - `.feishu-sync/**` and the `*.feishu-sync-*.tmp` files of its atomic writer;
+ * - user exclude patterns (B6.5), matched with the same gitignore-style matcher
+ *   `local.scan` uses so watching and scanning stay consistent.
+ *
+ * chokidar v4 dropped glob support in `ignored` (a string is now an exact path),
+ * so the rules are expressed as one predicate over the POSIX-relative path.
+ */
+export function watcherIgnore(root: SyncRoot): (testPath: string) => boolean {
+  const base = resolve(root.localPath);
+  return (testPath: string): boolean => {
+    const absolute = resolve(testPath);
+    // Never ignore the watched root itself, or chokidar watches nothing at all.
+    if (absolute === base) return false;
+    const relativePath = relative(base, absolute).split(sep).join("/");
+    if (relativePath === "" || relativePath.startsWith("../")) return false;
+    if (relativePath.split("/").some((segment) => METADATA_DIRECTORIES.has(segment))) return true;
+    if (METADATA_TEMP_FILE.test(relativePath)) return true;
+    return matchesAnyGlob(relativePath, root.exclude);
+  };
+}
+
+/**
+ * Consume the direction the engine recorded before it wrote, so a *failed*
+ * operation still reports push/pull instead of the "merge" placeholder written
+ * when the record was opened (B1: `direction` is never a constant).
+ * Returns an empty patch when the attempt died before any direction was chosen.
+ */
+function failedDirection(engine: SyncEngine, entryId: string): { direction?: SyncDirection } {
+  const direction = engine.takeDirection(entryId);
+  return direction ? { direction } : {};
+}
+
+/** Fastify only maps a thrown error onto a status code when it carries
+ *  `statusCode`; without it a missing root answered 500 instead of 404, which a
+ *  stale client (e.g. a tab polling a rootId from before a restart) reads as a
+ *  server fault rather than "this root is gone". */
+function notFound(message: string): Error {
+  return Object.assign(new Error(message), { statusCode: 404 });
+}
 
 export class SyncRuntime {
   private readonly watchers = new Map<string, FSWatcher>();
@@ -16,20 +76,48 @@ export class SyncRuntime {
   private readonly engine: SyncEngine;
   private maintenanceTimer?: NodeJS.Timeout;
   private currentTrigger: SyncTrigger = 'manual';
+  /** Echo guards (TTL 5s): local paths we just pulled and remote tokens we just
+   *  pushed, so the watcher / drive-event channel ignores our own writes instead
+   *  of looping them back into another sync round. */
+  private readonly recentLocalWrites = new Map<string, number>();
+  private readonly recentRemotePushes = new Map<string, number>();
+  private static readonly ECHO_TTL_MS = 5_000;
+  private readonly backoffMs: number[];
+  private readonly sleepImpl: (ms: number) => Promise<void>;
+  /** Tally of remote API calls, surfaced as the settings-page 调用统计 (B6.2). */
+  private readonly apiStats = new ApiCallStats();
+  private readonly countedRemote: RemoteProvider;
 
   constructor(
     private readonly gitStorage: GitStorage,
     private readonly metaStorage: MetaStorage,
     private readonly local: LocalProvider,
-    private readonly remote: RemoteProvider,
+    remote: RemoteProvider,
     private readonly prepareRemote?: () => Promise<void>,
     private readonly logger?: FastifyBaseLogger,
     /** Invoked on every maintenance tick: proactively rotates user tokens. */
     private readonly maintainCredentials?: () => Promise<void>,
     /** Auth lifecycle flags live in config.json; absent in bare-runtime tests. */
-    private readonly authState?: AuthStateStore
+    private readonly authState?: AuthStateStore,
+    /** Injectable auto-retry backoff schedule/sleep so tests never wait for real. */
+    retryOptions?: { backoffMs?: number[]; sleep?: (ms: number) => Promise<void> }
   ) {
-    this.engine = new SyncEngine(gitStorage, metaStorage, local, remote);
+    // Every remote call goes through the instrumented provider so the engine
+    // and the runtime's own probes share one tally.
+    this.countedRemote = instrumentRemote(remote, this.apiStats);
+    this.engine = new SyncEngine(gitStorage, metaStorage, local, this.countedRemote);
+    this.backoffMs = retryOptions?.backoffMs ?? [1_000, 2_000, 4_000];
+    this.sleepImpl = retryOptions?.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  }
+
+  /** Remote provider whose calls are tallied; API routes should use this one. */
+  get instrumentedRemote(): RemoteProvider {
+    return this.countedRemote;
+  }
+
+  /** Snapshot of the in-memory API call tally since process start (B6.2). */
+  getApiStats(): ApiStatsSnapshot {
+    return this.apiStats.snapshot(this.countedRemote.name);
   }
 
   /** Structured logging helper; no-ops when no logger is injected (tests). */
@@ -75,6 +163,19 @@ export class SyncRuntime {
     return result;
   }
 
+  /**
+   * Task center「清空已完成」: drop finished operation records right now.
+   * pruneHistory is retention-based (keep 1000 / 24h), so routing the button
+   * there reported "cleared 0" for anything short of a very long history.
+   * Failures stay unless the caller explicitly asks for them.
+   */
+  async clearCompletedTasks(statuses?: OperationRecord["status"][]): Promise<{ cleared: number }> {
+    const cleared = await this.metaStorage.clearCompletedOperations(statuses);
+    if (cleared > 0) this.broadcast({ type: "maintenance-pruned", operations: cleared, conflicts: 0, snapshots: 0 });
+    this.log("info", "cleared completed operations", { cleared });
+    return { cleared };
+  }
+
   private scheduleMaintenance(): void {
     if (this.maintenanceTimer) return;
     const intervalMs = numberFromEnv("SYNC_MAINTENANCE_INTERVAL_MS", 3_600_000);
@@ -90,10 +191,23 @@ export class SyncRuntime {
 
   startRoot(root: SyncRoot): void {
     if (this.watchers.has(root.id)) return;
-    const watcher = watch(root.localPath, { ignoreInitial: true, awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 } });
-    watcher.on("add", () => void this.enqueue(root.id, () => this.scanAndSync(root, 'watch')));
-    watcher.on("change", () => void this.enqueue(root.id, () => this.scanAndSync(root, 'watch')));
-    watcher.on("unlink", () => void this.enqueue(root.id, () => this.scanAndSync(root, 'watch')));
+    const watcher = watch(root.localPath, {
+      ignoreInitial: true,
+      awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
+      // See watcherIgnore: our own metadata (.git / .feishu-sync / atomic tmp
+      // files) and user excludes must never start another sync round.
+      ignored: watcherIgnore(root)
+    });
+    // Incremental watch sync scoped to the changed path, skipping echoes of our
+    // own pull-writes (recentLocalWrites) to avoid a watcher → sync → write loop.
+    const onLocalChange = (changedPath: string) => {
+      if (this.isRecentLocalWrite(changedPath)) return;
+      const relativePath = relative(root.localPath, changedPath).split(sep).join("/");
+      void this.enqueue(root.id, () => this.scanAndSync(root, 'watch', { relativePaths: [relativePath] }));
+    };
+    watcher.on("add", onLocalChange);
+    watcher.on("change", onLocalChange);
+    watcher.on("unlink", onLocalChange);
     watcher.on("error", (error) => this.broadcast({ type: "error", rootId: root.id, error: String(error) }));
     this.watchers.set(root.id, watcher);
     const timer = setInterval(() => void this.enqueue(root.id, () => this.scanAndSync(root, 'poll')), root.pollIntervalMs);
@@ -119,7 +233,7 @@ export class SyncRuntime {
 
   async scanRoot(id: string): Promise<unknown> {
     const root = await this.metaStorage.getRoot(id);
-    if (!root) throw new Error(`Root not found: ${id}`);
+    if (!root) throw notFound(`Root not found: ${id}`);
     // Serialize with any in-flight round for this root: scan mutates bindings
     // and must not interleave with a watcher/poll sync.
     const result = await this.enqueueResult(root.id, () => this.engine.scan(root));
@@ -129,20 +243,26 @@ export class SyncRuntime {
 
   async syncRoot(id: string, trigger: SyncTrigger = 'manual'): Promise<unknown> {
     const root = await this.metaStorage.getRoot(id);
-    if (!root) throw new Error(`Root not found: ${id}`);
+    if (!root) throw notFound(`Root not found: ${id}`);
     // Serialize with watcher/poll/event syncs for this root. Concurrent rounds
     // would race on the shared git index and the JSON binding files, so an
     // API-triggered sync joins the same per-root queue.
     return this.enqueueResult(root.id, () => this.scanAndSync(root, trigger));
   }
 
-  /** Queue a full scan+sync round for the root. Entry point for the event
-   *  channel: serializes with watcher/poll tasks through the per-root queue
-   *  and skips disabled roots. */
-  async requestSync(rootId: string): Promise<void> {
+  /** Queue a scan+sync round for the root. Entry point for the event channel:
+   *  serializes with watcher/poll tasks through the per-root queue, skips
+   *  disabled roots, ignores drive events that merely echo our own recent push,
+   *  and narrows the round to the changed token via an incremental scope. */
+  async requestSync(rootId: string, fileToken?: string): Promise<void> {
     const root = await this.metaStorage.getRoot(rootId);
     if (!root || !root.enabled) return;
-    await this.enqueue(root.id, () => this.scanAndSync(root, 'event'));
+    if (fileToken && this.isRecentRemotePush(fileToken)) {
+      this.log("debug", "drive event ignored: echo of a recent push", { rootId, fileToken });
+      return;
+    }
+    const scope: SyncScope | undefined = fileToken ? { remoteTokens: [fileToken] } : undefined;
+    await this.enqueue(root.id, () => this.scanAndSync(root, 'event', scope));
   }
 
   /** Local tree for the browser: fully DB-backed and credential-independent,
@@ -150,7 +270,7 @@ export class SyncRuntime {
    *  Entries with an in-flight operation are flagged for the "syncing" badge. */
   async getTree(id: string): Promise<unknown> {
     const root = await this.metaStorage.getRoot(id);
-    if (!root) throw new Error(`Root not found: ${id}`);
+    if (!root) throw notFound(`Root not found: ${id}`);
     const bindings = await this.metaStorage.listBindings(id);
     const active = new Set((await this.metaStorage.listOperations(200))
       .filter((operation) => (operation.status === "queued" || operation.status === "running") && operation.entryId !== undefined)
@@ -163,8 +283,8 @@ export class SyncRuntime {
 
   async pairEntry(rootId: string, relativePath: string, remoteToken: string): Promise<unknown> {
     const root = await this.metaStorage.getRoot(rootId);
-    if (!root) throw new Error(`Root not found: ${rootId}`);
-    const remoteDocument = await this.remote.getDocument(remoteToken);
+    if (!root) throw notFound(`Root not found: ${rootId}`);
+    const remoteDocument = await this.countedRemote.getDocument(remoteToken);
     const localPathExists = (await this.local.scan(root)).some((file) => file.relativePath === relativePath);
     if (!localPathExists) await this.local.writeText(root, relativePath, remoteDocument.content);
     const existing = await this.metaStorage.getBinding(rootId, relativePath);
@@ -178,7 +298,7 @@ export class SyncRuntime {
   async deleteRemoteEntry(entryId: string): Promise<unknown> {
     const binding = await this.metaStorage.findBindingById(entryId);
     if (!binding?.remoteToken) throw new Error("Entry is not bound to a remote resource");
-    await this.remote.softDelete(binding.remoteToken, binding.kind === "asset" ? "file" : "docx");
+    await this.countedRemote.softDelete(binding.remoteToken, binding.kind === "asset" ? "file" : "docx");
     await this.metaStorage.setBinding(binding.rootId, binding.relativePath, { ...binding, status: "orphan", updatedAt: new Date().toISOString() });
     return this.metaStorage.findBindingById(entryId);
   }
@@ -201,7 +321,7 @@ export class SyncRuntime {
     if (!binding?.remoteToken) throw new Error("Conflict entry is no longer bound to a remote document");
     const root = await this.metaStorage.getRoot(binding.rootId);
     if (!root) throw new Error("Conflict root not found");
-    const currentRemote = await this.remote.getDocument(binding.remoteToken);
+    const currentRemote = await this.countedRemote.getDocument(binding.remoteToken);
     if (conflict.remoteRevision !== undefined && currentRemote.revisionId !== undefined && conflict.remoteRevision !== currentRemote.revisionId) {
       throw Object.assign(new Error("This conflict is stale because the remote document changed again"), { statusCode: 409 });
     }
@@ -255,6 +375,66 @@ export class SyncRuntime {
     return { ok: true, entryId, relativePath: binding.relativePath };
   }
 
+  /** Version timeline for one document: commits that touched its path (B4).
+   *  Root+path based because git history lives in the root's repository. */
+  async getRootHistory(rootId: string, relativePath: string, limit = 50): Promise<Commit[]> {
+    return this.gitStorage.listCommitsForPath(rootId, relativePath, limit);
+  }
+
+  /** Two-ended content for a document so the browser can diff it (B4).
+   *  against="baseline" compares the working tree with the last common base;
+   *  against=<commit> compares the working tree with that historical version. */
+  async getEntryDiff(entryId: string, against: string = "baseline"): Promise<{ relativePath: string; against: string; baseContent: string; currentContent: string }> {
+    const binding = await this.metaStorage.findBindingById(entryId);
+    if (!binding) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
+    if (binding.kind !== "document") throw Object.assign(new Error("Only document entries can be diffed"), { statusCode: 400 });
+    const root = await this.metaStorage.getRoot(binding.rootId);
+    if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
+    const currentContent = await this.local.readText(root, binding.relativePath);
+    const baseContent = against === "baseline"
+      ? await this.gitStorage.getBaseline(binding.rootId, binding.relativePath) ?? ""
+      : await this.gitStorage.readBlobAt(binding.rootId, against, binding.relativePath) ?? "";
+    return { relativePath: binding.relativePath, against, baseContent, currentContent };
+  }
+
+  /** Roll a document's local file back to a historical commit, re-arm it as
+   *  pending and queue a manual round so the remote follows (B4). Deliberately
+   *  writes the blob + re-syncs rather than git.checkout, keeping the baseline
+   *  linear and letting the normal push path propagate the restored content. */
+  async rollbackEntry(entryId: string, commit: string): Promise<{ ok: boolean; entryId: string; relativePath: string }> {
+    const binding = await this.metaStorage.findBindingById(entryId);
+    if (!binding) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
+    if (binding.kind !== "document") throw Object.assign(new Error("Only document entries can be rolled back"), { statusCode: 400 });
+    const root = await this.metaStorage.getRoot(binding.rootId);
+    if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
+    const content = await this.gitStorage.readBlobAt(binding.rootId, commit, binding.relativePath);
+    if (content === undefined) throw Object.assign(new Error(`No such version for this entry: ${commit}`), { statusCode: 404 });
+    await this.local.writeText(root, binding.relativePath, content);
+    await this.metaStorage.setBinding(binding.rootId, binding.relativePath, { ...binding, status: "pending", updatedAt: new Date().toISOString() });
+    await this.enqueue(root.id, () => this.scanAndSync(root, 'manual'));
+    return { ok: true, entryId, relativePath: binding.relativePath };
+  }
+
+  /** Folder bindings for a root, enriched with the number of bound child files
+   *  so the UI can show how much each mapped directory carries (B3). */
+  async listFolderBindings(rootId: string): Promise<Array<FolderBinding & { childCount: number }>> {
+    const folders = await this.metaStorage.listFolderBindings(rootId);
+    const bindings = await this.metaStorage.listBindings(rootId);
+    return folders
+      .map((folder) => ({ ...folder, childCount: bindings.filter((item) => item.relativePath.startsWith(`${folder.relativePath}/`)).length }))
+      .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  }
+
+  /** Manually (re)bind a local directory to a remote folder token, e.g. after
+   *  the folder was recreated on the drive or the mapping went stale (B3). */
+  async rebindFolder(rootId: string, relativePath: string, remoteToken: string): Promise<FolderBinding> {
+    const root = await this.metaStorage.getRoot(rootId);
+    if (!root) throw Object.assign(new Error(`Root not found: ${rootId}`), { statusCode: 404 });
+    const binding: FolderBinding = { relativePath, remoteToken, createdAt: new Date().toISOString() };
+    await this.metaStorage.setFolderBinding(rootId, relativePath, binding);
+    return binding;
+  }
+
   /** Single-entry forced sync (issue workbench / docs view retry):
    *  local-missing re-pulls the remote document, remote-missing re-creates
    *  the remote side, everything else is re-evaluated from scratch. */
@@ -278,6 +458,25 @@ export class SyncRuntime {
     await this.metaStorage.setBinding(binding.rootId, binding.relativePath, next);
     this.broadcast({ type: "sync", rootId: binding.rootId });
     return (await this.metaStorage.findBindingById(entryId)) ?? next;
+  }
+
+  /** Apply a bulk action to a set of entries (B6.3): "retry" re-syncs each one,
+   *  "ignore"/"unignore" flips the ignored flag. Failures on individual entries
+   *  are counted, not thrown, so one bad id cannot abort the whole batch. */
+  async batchEntries(entryIds: string[], action: "retry" | "ignore" | "unignore"): Promise<{ accepted: number; total: number; failed: number }> {
+    let accepted = 0;
+    let failed = 0;
+    for (const entryId of entryIds) {
+      try {
+        if (action === "retry") await this.syncEntryNow(entryId);
+        else await this.setEntryIgnored(entryId, action === "ignore");
+        accepted += 1;
+      } catch (error) {
+        failed += 1;
+        this.log("warn", "batch entry action failed", { entryId, action, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return { accepted, total: entryIds.length, failed };
   }
 
   /** One-click resync of every local-missing / remote-missing entry of a
@@ -321,21 +520,28 @@ export class SyncRuntime {
     return result;
   }
 
-  private async scanAndSync(root: SyncRoot, trigger: SyncTrigger = 'manual'): Promise<unknown> {
+  private async scanAndSync(root: SyncRoot, trigger: SyncTrigger = 'manual', scope?: SyncScope): Promise<unknown> {
     const startedAt = Date.now();
     this.currentTrigger = trigger;
+    const mode: SyncMode = root.mode ?? "bidirectional";
     // Unified entry-point signal (manual/poll/watcher/event channel alike) so
-    // the UI can show per-root progress instead of silent syncing.
-    this.broadcast({ type: "sync-started", rootId: root.id, trigger });
+    // the UI can show per-root progress instead of silent syncing. mode lets the
+    // running bar phrase the round (bidirectional / pull-only / push-only).
+    this.broadcast({ type: "sync-started", rootId: root.id, trigger, mode });
     let scan: Awaited<ReturnType<SyncEngine["scan"]>>;
     try {
-      scan = await this.engine.scan(root, trigger);
+      scan = await this.engine.scan(root, trigger, scope);
     } catch (error) {
       if (isAuthError(error)) { this.log("warn", "scan aborted: Feishu credentials invalid", { rootId: root.id }); await this.flagAuthInvalid(); return { rootId: root.id, authInvalid: true }; }
       this.log("error", "scan failed", { rootId: root.id, error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
-    this.log("info", "sync round started", { rootId: root.id, localPath: root.localPath, trigger });
+    this.log("info", "sync round started", { rootId: root.id, localPath: root.localPath, trigger, mode });
+    // Outer loop re-lists pending entries so cascading re-arms (a synced asset
+    // re-arming the documents that reference it, link maps) are processed in the
+    // same round; the per-entry attempt cap bounds pathological cascades. Each
+    // entry owns one operation record whose retryCount climbs on transient
+    // failures via syncEntryWithRetry's exponential backoff.
     const attempts = new Map<string, number>();
     while (true) {
       const pending = (await this.metaStorage.listBindings(root.id))
@@ -345,27 +551,9 @@ export class SyncRuntime {
       if (pending.length === 0) break;
       for (const binding of pending) {
         attempts.set(binding.entryId, (attempts.get(binding.entryId) ?? 0) + 1);
-        let operation;
-        try {
-          operation = await this.metaStorage.addOperation({ entryId: binding.entryId, rootId: root.id, direction: "merge", operation: "sync-entry", trigger });
-          await this.metaStorage.updateOperation(operation.id, { status: "running" });
-          await this.engine.syncEntry(binding, root);
-          await this.metaStorage.updateOperation(operation.id, { status: "succeeded", completedAt: new Date().toISOString() });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (operation) await this.metaStorage.updateOperation(operation.id, { status: "failed", error: message, completedAt: new Date().toISOString() });
-          this.broadcast({ type: "error", rootId: root.id, entryId: binding.entryId, error: message });
-          this.log("warn", "entry sync failed", { rootId: root.id, entryId: binding.entryId, error: message });
-          // Credential failures fail every entry; surface them once and stop
-          // burning retries until the user refreshes the token.
-          if (isAuthError(error)) {
-            await this.flagAuthInvalid();
-            return { ...scan, entries: await this.metaStorage.listBindings(root.id), authInvalid: true };
-          }
-          // Surface the failure on the entry itself; the next scan resets
-          // "error" entries to "pending" so they are retried.
-          const failed = await this.metaStorage.findBindingById(binding.entryId);
-          if (failed) await this.metaStorage.setBinding(root.id, failed.relativePath, { ...failed, status: "error", updatedAt: new Date().toISOString() });
+        // Credential failures fail every entry; surface once and stop the round.
+        if (await this.syncEntryWithRetry(binding, root, trigger)) {
+          return { ...scan, entries: await this.metaStorage.listBindings(root.id), authInvalid: true };
         }
       }
     }
@@ -387,6 +575,170 @@ export class SyncRuntime {
     this.broadcast({ type: "sync", rootId: root.id, trigger });
     this.log("info", "sync round completed", { rootId: root.id, elapsedMs: Date.now() - startedAt, trigger });
     return { ...scan, entries: finalBindings };
+  }
+
+  /** Sync one entry behind a single operation record with per-round exponential
+   *  backoff (1s/2s/4s) for transient failures. Emits operation-queued/started/
+   *  completed/failed/retrying so the task center can track progress live.
+   *  Returns true when the round must abort because credentials are invalid
+   *  (auth/permission fail fast and are never auto-retried). */
+  private async syncEntryWithRetry(binding: EntryBinding, root: SyncRoot, trigger: SyncTrigger): Promise<boolean> {
+    const operation = await this.metaStorage.addOperation({
+      entryId: binding.entryId, rootId: root.id, direction: "merge", operation: "sync-entry",
+      trigger, startedAt: new Date().toISOString(), maxRetries: 3
+    });
+    this.broadcast({ type: "operation-queued", rootId: root.id, operation });
+    const maxRetries = operation.maxRetries ?? 3;
+    let retryCount = 0;
+    for (;;) {
+      const running = await this.metaStorage.updateOperation(operation.id, { status: "running", startedAt: new Date().toISOString() });
+      this.broadcast({ type: "operation-started", rootId: root.id, operation: running });
+      try {
+        await this.engine.syncEntry(binding, root);
+        const direction = this.engine.takeDirection(binding.entryId) ?? "merge";
+        // Register echo guards for the side we just wrote so the watcher /
+        // drive-event channel ignores our own change instead of looping it back.
+        const after = await this.metaStorage.findBindingById(binding.entryId);
+        if (direction === "pull") this.registerLocalWrite(root, binding.relativePath);
+        if ((direction === "push" || direction === "merge") && after?.remoteToken) this.registerRemotePush(after.remoteToken);
+        const succeeded = await this.metaStorage.updateOperation(operation.id, { status: "succeeded", direction, completedAt: new Date().toISOString() });
+        this.broadcast({ type: "operation-completed", rootId: root.id, operation: succeeded });
+        return false;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const category: ErrorCategory = categorizeError(error, binding.status);
+        if (isAuthError(error) || category === "auth") {
+          const failedOp = await this.metaStorage.updateOperation(operation.id, { status: "failed", error: message, errorCategory: "auth", retryCount, completedAt: new Date().toISOString(), ...failedDirection(this.engine, binding.entryId) });
+          this.broadcast({ type: "operation-failed", rootId: root.id, operation: failedOp });
+          this.broadcast({ type: "error", rootId: root.id, entryId: binding.entryId, error: message });
+          this.log("warn", "entry sync aborted: credentials invalid", { rootId: root.id, entryId: binding.entryId });
+          await this.flagAuthInvalid();
+          return true;
+        }
+        // Transient categories (network/rate_limit/unknown) auto-retry with
+        // exponential backoff; conflict/not_found/permission fail fast for the
+        // user to resolve. Backoff delays are injectable so tests never wait.
+        if (retryCount < maxRetries && RETRIABLE_ERROR_CATEGORIES.has(category)) {
+          const scheduled = this.backoffMs[Math.min(retryCount, this.backoffMs.length - 1)] ?? 0;
+          // A 429 may carry Retry-After; honor it as the delay floor so we do
+          // not hammer a rate-limited API before its window resets (B6.2).
+          const retryAfterMs = error instanceof FeishuApiError ? error.retryAfterMs : undefined;
+          const delayMs = retryAfterMs !== undefined ? Math.max(scheduled, retryAfterMs) : scheduled;
+          retryCount += 1;
+          const queued = await this.metaStorage.updateOperation(operation.id, { status: "queued", error: message, errorCategory: category, retryCount });
+          if (category === "rate_limit") this.broadcast({ type: "rate-limited", rootId: root.id, operationId: operation.id, retryAfterMs: delayMs, retryCount });
+          this.broadcast({ type: "operation-retrying", rootId: root.id, operation: queued, delayMs, retryCount });
+          this.log("warn", "entry sync failed; auto-retrying with backoff", { rootId: root.id, entryId: binding.entryId, retryCount, delayMs, category, error: message });
+          await this.sleep(delayMs);
+          continue;
+        }
+        const failedOp = await this.metaStorage.updateOperation(operation.id, { status: "failed", error: message, errorCategory: category, retryCount, completedAt: new Date().toISOString(), ...failedDirection(this.engine, binding.entryId) });
+        this.broadcast({ type: "operation-failed", rootId: root.id, operation: failedOp });
+        this.broadcast({ type: "error", rootId: root.id, entryId: binding.entryId, error: message });
+        this.log("warn", "entry sync failed", { rootId: root.id, entryId: binding.entryId, category, retryCount, error: message });
+        // Surface the failure on the entry itself; the next scan resets "error"
+        // entries to "pending" so they are retried.
+        const failed = await this.metaStorage.findBindingById(binding.entryId);
+        if (failed) await this.metaStorage.setBinding(root.id, failed.relativePath, { ...failed, status: "error", updatedAt: new Date().toISOString() });
+        return false;
+      }
+    }
+  }
+
+  /** Task-center view over operation records. status="active" groups queued +
+   *  running; concrete statuses pass through to the storage filter. Each task is
+   *  joined with its entry path/kind for display. Cursor paging stays stable by
+   *  deriving nextCursor from the raw page rather than the in-memory filter. */
+  async listTasks(options: { status?: TaskStatus; rootId?: string; limit?: number; cursor?: string } = {}): Promise<{ tasks: TaskView[]; nextCursor?: string }> {
+    const limit = options.limit ?? 100;
+    const concrete = options.status && options.status !== "active" && options.status !== "all" ? options.status : undefined;
+    const operations = await this.metaStorage.listOperations({ rootId: options.rootId, limit, cursor: options.cursor, status: concrete });
+    const visible = options.status === "active"
+      ? operations.filter((operation) => operation.status === "queued" || operation.status === "running")
+      : operations;
+    const tasks: TaskView[] = [];
+    for (const operation of visible) {
+      const binding = operation.entryId ? await this.metaStorage.findBindingById(operation.entryId) : undefined;
+      tasks.push({ ...operation, relativePath: binding?.relativePath, kind: binding?.kind });
+    }
+    const nextCursor = operations.length === limit ? operations[operations.length - 1]!.id : undefined;
+    return { tasks, nextCursor };
+  }
+
+  /** Re-arm the entry behind a failed/cancelled operation and queue a manual
+   *  round so the task center's retry button reprocesses it immediately. */
+  async retryTask(operationId: string): Promise<{ ok: boolean; operationId: string }> {
+    const operation = await this.metaStorage.getOperation(operationId);
+    if (!operation) throw Object.assign(new Error(`Operation not found: ${operationId}`), { statusCode: 404 });
+    if (!operation.entryId) throw Object.assign(new Error("Operation is not bound to an entry"), { statusCode: 400 });
+    const binding = await this.metaStorage.findBindingById(operation.entryId);
+    if (!binding) throw Object.assign(new Error(`Entry not found: ${operation.entryId}`), { statusCode: 404 });
+    const root = await this.metaStorage.getRoot(binding.rootId);
+    if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
+    // Re-arm as pending (and un-ignore) so the next round re-evaluates it.
+    await this.metaStorage.setBinding(binding.rootId, binding.relativePath, { ...binding, status: "pending", ignoredAt: undefined, updatedAt: new Date().toISOString() });
+    await this.enqueue(root.id, () => this.scanAndSync(root, 'manual'));
+    return { ok: true, operationId };
+  }
+
+  /** Mark a queued/running operation cancelled. The in-flight engine call is
+   *  not interrupted; cancellation is advisory and drops it from the active
+   *  task-center group. */
+  async cancelTask(operationId: string): Promise<{ ok: boolean; operationId: string }> {
+    const operation = await this.metaStorage.getOperation(operationId);
+    if (!operation) throw Object.assign(new Error(`Operation not found: ${operationId}`), { statusCode: 404 });
+    if (operation.status !== "queued" && operation.status !== "running") throw Object.assign(new Error("Only queued or running tasks can be cancelled"), { statusCode: 400 });
+    const cancelled = await this.metaStorage.updateOperation(operationId, { status: "cancelled", completedAt: new Date().toISOString() });
+    this.broadcast({ type: "operation-cancelled", rootId: operation.rootId, operation: cancelled });
+    return { ok: true, operationId };
+  }
+
+  /** Retry a batch of operations; returns how many were accepted (re-armed and
+   *  queued). Failures on individual ids are logged and skipped. */
+  async batchRetryTasks(operationIds: string[]): Promise<{ accepted: number; total: number }> {
+    let accepted = 0;
+    for (const operationId of operationIds) {
+      try { await this.retryTask(operationId); accepted += 1; }
+      catch (error) { this.log("warn", "batch retry skipped an operation", { operationId, error: error instanceof Error ? error.message : String(error) }); }
+    }
+    return { accepted, total: operationIds.length };
+  }
+
+  /** Injectable sleep so auto-retry backoff never blocks tests on real timers. */
+  private sleep(ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    return this.sleepImpl(ms);
+  }
+
+  /** Remember a local path we just pulled so the watcher ignores our own write. */
+  private registerLocalWrite(root: SyncRoot, relativePath: string): void {
+    this.pruneEchoMap(this.recentLocalWrites);
+    this.recentLocalWrites.set(join(root.localPath, relativePath), Date.now() + SyncRuntime.ECHO_TTL_MS);
+  }
+
+  /** Remember a remote token we just pushed so drive events ignore the echo. */
+  private registerRemotePush(remoteToken: string): void {
+    this.pruneEchoMap(this.recentRemotePushes);
+    this.recentRemotePushes.set(remoteToken, Date.now() + SyncRuntime.ECHO_TTL_MS);
+  }
+
+  private isRecentLocalWrite(absolutePath: string): boolean {
+    const expiry = this.recentLocalWrites.get(absolutePath);
+    if (expiry === undefined) return false;
+    if (expiry < Date.now()) { this.recentLocalWrites.delete(absolutePath); return false; }
+    return true;
+  }
+
+  private isRecentRemotePush(remoteToken: string): boolean {
+    const expiry = this.recentRemotePushes.get(remoteToken);
+    if (expiry === undefined) return false;
+    if (expiry < Date.now()) { this.recentRemotePushes.delete(remoteToken); return false; }
+    return true;
+  }
+
+  private pruneEchoMap(map: Map<string, number>): void {
+    const now = Date.now();
+    for (const [key, expiry] of map) if (expiry < now) map.delete(key);
   }
 
   private enqueue(id: string, callback: () => Promise<unknown>): Promise<void> {

@@ -1,11 +1,13 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
+  DEFAULT_NOTIFICATIONS,
   type ActivityItem,
   type AppConfigPatch,
   type AppConfigView,
   type Conflict,
   type CredentialPatch,
+  type NotificationPreferences,
   type Operation,
   type PruneResult,
   type RedactedSettings,
@@ -14,33 +16,50 @@ import {
   type RootPatch,
   type RootStats,
   type ServerEvent,
+  type SyncMode,
+  type SyncTrigger,
   type TestConnectionResult,
   type TreeResponse
 } from "./api";
 import { Dashboard } from "./components/Dashboard";
 import { GuideModal } from "./components/GuideModal";
+import { OnboardingWizard, QuickStartCard } from "./components/OnboardingWizard";
 import { RootDetail, type DetailTab } from "./components/RootDetail";
-import { NOTIFY_STORAGE_KEY, SettingsView } from "./components/SettingsView";
+import { SettingsView } from "./components/SettingsView";
+import { TaskCenter } from "./components/TaskCenter";
+import { BindRootForm, type CreateRootInput } from "./components/BindRootForm";
 import { Icon, type IconName } from "./components/Icon";
+import {
+  computeOnboarding,
+  readOnboardingDismissed,
+  shouldShowOnboardingWizard,
+  shouldShowQuickStart,
+  writeOnboardingDismissed,
+  type OnboardingSnapshot,
+  type OnboardingStepId
+} from "./onboarding";
 import "./styles.css";
 
 /** Primary views (nav items). The root detail page is reached from the dashboard. */
-type View = "dashboard" | "detail" | "settings";
-type NavView = "dashboard" | "settings";
+type View = "dashboard" | "detail" | "tasks" | "settings";
+type NavView = "dashboard" | "tasks" | "settings";
 
 const VIEW_LABELS: Record<NavView, string> = {
   dashboard: "仪表盘",
+  tasks: "任务中心",
   settings: "设置"
 };
 
 /** Compact labels for the mobile tab bar. */
 const TAB_LABELS: Record<NavView, string> = {
   dashboard: "仪表盘",
+  tasks: "任务",
   settings: "设置"
 };
 
 const VIEW_ICONS: Record<NavView, IconName> = {
   dashboard: "dashboard",
+  tasks: "tasks",
   settings: "settings"
 };
 
@@ -77,14 +96,23 @@ export function App(): React.JSX.Element {
   const [syncing, setSyncing] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [addSubmitting, setAddSubmitting] = useState(false);
   const [live, setLive] = useState(false);
-  const [notifyEnabled, setNotifyEnabled] = useState(() => window.localStorage.getItem(NOTIFY_STORAGE_KEY) === "1");
-  const [newLocalPath, setNewLocalPath] = useState("");
-  const [newRemoteToken, setNewRemoteToken] = useState("");
-  const [newRemoteType, setNewRemoteType] = useState<"folder" | "wiki">("folder");
-  const [newIntervalSec, setNewIntervalSec] = useState("");
+  /** Browser Notification permission, or "unsupported" where the API is absent (B6.8). */
+  const [notifyPermission, setNotifyPermission] = useState(() => (typeof Notification === "undefined" ? "unsupported" : Notification.permission));
+  /** Live 429 backoff window surfaced as a topbar badge (B6.2). */
+  const [rateLimit, setRateLimit] = useState<{ rootId: string; retryAfterMs: number; until: number }>();
+  /** Re-read every second while the badge is up so its countdown actually ticks. */
+  const [rateLimitNow, setRateLimitNow] = useState(() => Date.now());
+  /** First-run wizard dismissal, persisted per browser (B6.1). */
+  const [onboardingDismissed, setOnboardingDismissed] = useState(() => readOnboardingDismissed(window.localStorage));
+  const [wizardOpen, setWizardOpen] = useState(false);
+  /** Bumped on every operation-* socket event so the task center refetches. */
+  const [taskRevision, setTaskRevision] = useState(0);
   /** Roots with a sync round in flight (from sync-started until sync/error). */
   const [runningRoots, setRunningRoots] = useState<ReadonlySet<string>>(new Set());
+  /** Trigger + mode of the in-flight round per root, for the running-bar wording. */
+  const [runningMeta, setRunningMeta] = useState<Record<string, { trigger: SyncTrigger; mode?: SyncMode }>>({});
   /** Live activity feed shown in the issue workbench and history tab. */
   const [activity, setActivity] = useState<ActivityItem[]>([]);
 
@@ -107,12 +135,16 @@ export function App(): React.JSX.Element {
   useEffect(() => { viewRef.current = view; }, [view]);
   const selectedRootRef = useRef<string | undefined>(undefined);
   useEffect(() => { selectedRootRef.current = selectedRootId; }, [selectedRootId]);
-  const notifyEnabledRef = useRef(notifyEnabled);
-  useEffect(() => { notifyEnabledRef.current = notifyEnabled; }, [notifyEnabled]);
+  // Notification switches live server-side (B6.8); the ref keeps `notify`
+  // referentially stable so the socket effect is not torn down on every poll.
+  const notifications = appConfig?.preferences.notifications ?? DEFAULT_NOTIFICATIONS;
+  const notificationsRef = useRef(notifications);
+  useEffect(() => { notificationsRef.current = notifications; }, [notifications]);
   const conflictCountRef = useRef(0);
 
-  const notify = useCallback((title: string, body: string) => {
-    if (!notifyEnabledRef.current || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  const notify = useCallback((category: keyof NotificationPreferences, title: string, body: string) => {
+    if (!notificationsRef.current[category]) return;
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
     try { new Notification(title, { body }); } catch { /* some browsers require SW */ }
   }, []);
 
@@ -137,7 +169,7 @@ export function App(): React.JSX.Element {
         const [nextTree, nextStats, nextOperations] = await Promise.all([
           api.getTree(currentRoot).catch(() => undefined),
           api.getRootStats(currentRoot).catch(() => undefined),
-          api.listOperations().catch(() => [] as Operation[])
+          api.listOperations({ limit: 100 }).catch(() => [] as Operation[])
         ]);
         if (nextTree) setTree(nextTree);
         if (nextStats) setStats(nextStats);
@@ -155,7 +187,7 @@ export function App(): React.JSX.Element {
       // Browser notification when the open-conflict count grows.
       if (nextConflicts.length > conflictCountRef.current) {
         const fresh = nextConflicts[nextConflicts.length - 1];
-        notify("发现新冲突", fresh?.relativePath ? `${fresh.relativePath} 需要处理` : "冲突工作台有待处理项");
+        notify("conflict", "发现新冲突", fresh?.relativePath ? `${fresh.relativePath} 需要处理` : "冲突工作台有待处理项");
       }
       conflictCountRef.current = nextConflicts.length;
     } catch (error) {
@@ -175,7 +207,8 @@ export function App(): React.JSX.Element {
       if (!payload) return;
       if (payload.type === "sync-started") {
         setRootRunning(payload.rootId, true);
-        pushActivity({ kind: "sync-started", text: `根目录 ${shortRootId(payload.rootId)} 开始检测远端变更与本地差异` });
+        setRunningMeta((current) => ({ ...current, [payload.rootId]: { trigger: payload.trigger, mode: payload.mode } }));
+        pushActivity({ kind: "sync-started", text: `根目录 ${shortRootId(payload.rootId)} 开始${payload.mode === "pull-only" ? "拉取远端变更" : payload.mode === "push-only" ? "推送本地变更" : "检测远端变更与本地差异"}` });
       }
       if (payload.type === "sync") {
         setRootRunning(payload.rootId, false);
@@ -184,6 +217,29 @@ export function App(): React.JSX.Element {
       if (payload.type === "scan") {
         setRootRunning(payload.rootId, false);
         pushActivity({ kind: "scan", text: `根目录 ${shortRootId(payload.rootId)} 完成远端检测` });
+      }
+      if (
+        payload.type === "operation-queued"
+        || payload.type === "operation-started"
+        || payload.type === "operation-completed"
+        || payload.type === "operation-failed"
+        || payload.type === "operation-retrying"
+        || payload.type === "operation-cancelled"
+      ) {
+        // Any operation lifecycle change refreshes the task center groups.
+        setTaskRevision((value) => value + 1);
+      }
+      if (payload.type === "operation-failed") {
+        pushActivity({ kind: "error", text: `任务失败：${shortRootId(payload.operation.entryId ?? payload.operation.id)}${payload.operation.errorCategory ? `（${payload.operation.errorCategory}）` : ""}` });
+        notify("failure", "同步失败", `${payload.operation.relativePath ?? shortRootId(payload.operation.entryId ?? payload.operation.id)}：${payload.operation.error ?? "未知错误"}`);
+      }
+      if (payload.type === "operation-retrying") {
+        pushActivity({ kind: "sync", text: `任务重试：${shortRootId(payload.operation.entryId ?? payload.operation.id)} 第 ${payload.retryCount} 次，${Math.round(payload.delayMs / 1000)}s 后重试` });
+      }
+      // 429 backoff: keep the announced window visible until it elapses (B6.2).
+      if (payload.type === "rate-limited") {
+        setRateLimit({ rootId: payload.rootId, retryAfterMs: payload.retryAfterMs, until: Date.now() + payload.retryAfterMs });
+        pushActivity({ kind: "rate-limit", text: `飞书限流：根目录 ${shortRootId(payload.rootId)} 第 ${payload.retryCount} 次重试将在 ${Math.round(payload.retryAfterMs / 1000)}s 后自动进行` });
       }
       if (payload.type === "error") {
         if (payload.rootId) setRootRunning(payload.rootId, false);
@@ -196,11 +252,11 @@ export function App(): React.JSX.Element {
       if (payload.type === "conflict-aborted") pushActivity({ kind: "conflict", text: "冲突已搁置，等待下次变更重新评估" });
       if (payload.type === "auth-invalid") {
         setGuideOpen(true);
-        notify("飞书凭证已失效", "同步已暂停，点击页面顶部徽章更新凭证");
+        notify("credential", "飞书凭证已失效", "同步已暂停，点击页面顶部徽章更新凭证");
       }
-      if (payload.type === "auth-restored") notify("飞书凭证已恢复", "同步继续进行");
-      if (payload.type === "conflict-resolved") notify("冲突已解决", "合并结果已写入本地与飞书");
-      if (payload.type === "error") notify("同步出错", payload.error);
+      if (payload.type === "auth-restored") notify("credential", "飞书凭证已恢复", "同步继续进行");
+      if (payload.type === "conflict-resolved") notify("conflict", "冲突已解决", "合并结果已写入本地与飞书");
+      if (payload.type === "error") notify("failure", "同步出错", payload.error);
     };
     socket.onopen = () => { setLive(true); setMessage("实时连接已建立"); };
     socket.onclose = () => { setLive(false); setMessage("实时连接已断开，使用轮询"); };
@@ -236,24 +292,19 @@ export function App(): React.JSX.Element {
     setView("dashboard");
   };
 
-  const addRoot = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!newLocalPath || !newRemoteToken) return;
-    const interval = Number.parseInt(newIntervalSec, 10);
+  const createRoot = async (input: CreateRootInput) => {
+    setAddSubmitting(true);
     try {
-      const root = await api.createRoot({
-        localPath: newLocalPath,
-        remoteToken: newRemoteToken,
-        remoteType: newRemoteType,
-        pollIntervalMs: Number.isFinite(interval) && interval >= 1 ? interval * 1000 : undefined
-      });
-      setNewLocalPath("");
-      setNewRemoteToken("");
-      setNewIntervalSec("");
+      const root = await api.createRoot(input);
       setAddOpen(false);
       await refresh();
       openRoot(root.id);
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    } catch (error) {
+      // Re-throw so BindRootForm surfaces the message inline next to the form.
+      throw error instanceof Error ? error : new Error(String(error));
+    } finally {
+      setAddSubmitting(false);
+    }
   };
 
   const syncEntryNow = async (entryId: string) => {
@@ -342,9 +393,40 @@ export function App(): React.JSX.Element {
     return result;
   };
 
-  const toggleNotify = (enabled: boolean) => {
-    setNotifyEnabled(enabled);
-    window.localStorage.setItem(NOTIFY_STORAGE_KEY, enabled ? "1" : "0");
+  /** Task center「清空已完成」: deletes the finished records right away, unlike
+   *  pruneHistory whose retention window means nothing is usually old enough. */
+  const clearCompletedTasks = async (): Promise<{ cleared: number }> => {
+    const result = await api.clearCompletedTasks();
+    setTaskRevision((current) => current + 1);
+    await refresh();
+    return result;
+  };
+
+  /** Persist one notification category server-side; it now follows the
+   *  installation instead of a single browser's localStorage (B6.8). */
+  const toggleNotification = async (category: keyof NotificationPreferences, enabled: boolean) => {
+    const saved = await api.saveAppConfig({ notifications: { [category]: enabled } });
+    setAppConfig(saved);
+  };
+
+  const requestNotifyPermission = () => {
+    if (typeof Notification === "undefined") return;
+    void Notification.requestPermission().then((permission) => setNotifyPermission(permission));
+  };
+
+  /** 「不再显示」— persisted per browser; only hides the modal wizard (B6.1). */
+  const dismissOnboarding = () => {
+    writeOnboardingDismissed(window.localStorage, true);
+    setOnboardingDismissed(true);
+    setWizardOpen(false);
+  };
+
+  /** Route a wizard / quick-start step to the screen that satisfies it (B6.1). */
+  const runOnboardingStep = (stepId: OnboardingStepId) => {
+    setWizardOpen(false);
+    if (stepId === "credential") { setView("settings"); return; }
+    if (stepId === "bind-root") { closeRoot(); setAddOpen(true); return; }
+    closeRoot();
   };
 
   const inspectedRoot = view === "detail" ? roots.find((root) => root.id === selectedRootId) : undefined;
@@ -355,6 +437,39 @@ export function App(): React.JSX.Element {
   const topbarTitle = view === "detail" && inspectedRoot ? rootName(inspectedRoot) : VIEW_LABELS[view === "detail" ? "dashboard" : view];
   const dashboardActive = view === "dashboard" || view === "detail";
 
+  // First-run guided flow (B6.1): credentials → bind a root → first sync.
+  const onboardingSnapshot = useMemo<OnboardingSnapshot>(() => ({
+    credentialReady: settings?.authStatus === "ok",
+    rootBound: roots.length > 0,
+    synced: Object.values(rootStats).some((item) => item.lastSyncAt !== undefined) || operations.some((item) => item.status === "succeeded")
+  }), [settings?.authStatus, roots.length, rootStats, operations]);
+  const onboarding = useMemo(() => computeOnboarding(onboardingSnapshot), [onboardingSnapshot]);
+  const workspaceLoaded = settings !== undefined;
+
+  // Open the welcome wizard once per visit, as soon as the workspace state
+  // resolves with steps still pending. It is advisory: closing without
+  // dismissing simply reopens it on the next visit.
+  const wizardAutoOpened = useRef(false);
+  useEffect(() => {
+    if (wizardAutoOpened.current) return;
+    if (!shouldShowOnboardingWizard({ snapshot: onboardingSnapshot, dismissed: onboardingDismissed, loaded: workspaceLoaded })) return;
+    wizardAutoOpened.current = true;
+    setWizardOpen(true);
+  }, [onboardingSnapshot, onboardingDismissed, workspaceLoaded]);
+
+  // Count the rate-limit badge down to zero, then drop it once the announced
+  // backoff window elapsed (B6.2). A single timeout left the label frozen on the
+  // original Retry-After value, so "25s 后重试" never became "24s".
+  useEffect(() => {
+    if (!rateLimit) return;
+    const remaining = rateLimit.until - Date.now();
+    if (remaining <= 0) { setRateLimit(undefined); return; }
+    setRateLimitNow(Date.now());
+    const tick = window.setInterval(() => setRateLimitNow(Date.now()), 1000);
+    const timer = window.setTimeout(() => setRateLimit(undefined), remaining);
+    return () => { window.clearInterval(tick); window.clearTimeout(timer); };
+  }, [rateLimit]);
+
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand">
@@ -363,7 +478,7 @@ export function App(): React.JSX.Element {
       </div>
       <nav className="side-nav">
         {NAV_VIEWS.map((key) => (
-          <button key={key} className={`nav-item${(key === "dashboard" ? dashboardActive : view === key) ? " active" : ""}`} onClick={() => { if (key === "dashboard") closeRoot(); else setView("settings"); }}>
+          <button key={key} className={`nav-item${(key === "dashboard" ? dashboardActive : view === key) ? " active" : ""}`} onClick={() => { if (key === "dashboard") closeRoot(); else setView(key); }}>
             <Icon name={VIEW_ICONS[key]} />
             <span>{VIEW_LABELS[key]}</span>
             {key === "dashboard" && conflicts.length > 0 && <span className="badge">{conflicts.length}</span>}
@@ -379,6 +494,10 @@ export function App(): React.JSX.Element {
         <h2 className="topbar-title">{topbarTitle}</h2>
         <div className="connection">
           {authBadge && <button className={`auth-badge ${authBadge.className}`} title="点击打开凭证引导" onClick={() => setGuideOpen(true)}>{authBadge.label}</button>}
+          {rateLimit && <span
+            className="rate-limit-badge"
+            title="飞书返回 429，同步已按 Retry-After 退避，到点自动重试"
+          >限流 · {Math.max(0, Math.round((rateLimit.until - rateLimitNow) / 1000))}s 后重试</span>}
           <span className={`status-dot${live ? "" : " off"}`} />
           <span className="status-text">{countdown ?? message}</span>
           <button className="secondary sync-button" disabled={syncing || roots.length === 0} onClick={() => void syncNow()}>
@@ -400,6 +519,14 @@ export function App(): React.JSX.Element {
           onToggleRoot={toggleRoot}
           onSyncNow={(rootId) => syncNow(rootId)}
           onRefresh={() => void refresh()}
+          quickStart={shouldShowQuickStart({ snapshot: onboardingSnapshot, loaded: workspaceLoaded })
+            ? <QuickStartCard
+              state={onboarding}
+              onStepAction={runOnboardingStep}
+              onDismiss={dismissOnboarding}
+              onReopenWizard={() => setWizardOpen(true)}
+            />
+            : undefined}
         />}
         {view === "detail" && inspectedRoot && <RootDetail
           root={inspectedRoot}
@@ -408,19 +535,29 @@ export function App(): React.JSX.Element {
           conflicts={detailConflicts}
           operations={detailOperations}
           running={runningRoots.has(inspectedRoot.id)}
+          runningTrigger={runningMeta[inspectedRoot.id]?.trigger}
+          runningMode={runningMeta[inspectedRoot.id]?.mode}
           initialTab={initialTab}
           activity={activity}
           syncing={syncing}
           onBack={closeRoot}
           onSyncNow={(rootId) => syncNow(rootId)}
           onToggleRoot={toggleRoot}
+          onPatchRoot={patchRoot}
           onResolve={resolveConflict}
-          onRetryRoot={(rootId) => syncNow(rootId)}
           onSyncEntry={syncEntryNow}
           onIgnoreEntry={setEntryIgnored}
           onSyncMissing={syncMissing}
           onPrune={pruneHistory}
           onRefresh={() => void refresh()}
+        />}
+        {view === "tasks" && <TaskCenter
+          roots={roots}
+          revision={taskRevision}
+          syncing={syncing}
+          onOpenSettings={() => setView("settings")}
+          onOpenIssues={(rootId) => openRoot(rootId, "issues-conflicts")}
+          onClearCompleted={clearCompletedTasks}
         />}
         {view === "settings" && <SettingsView
           settings={settings}
@@ -432,14 +569,16 @@ export function App(): React.JSX.Element {
           onPatchRoot={patchRoot}
           onPrune={pruneHistory}
           onOpenGuide={() => setGuideOpen(true)}
-          notifyEnabled={notifyEnabled}
-          onToggleNotify={toggleNotify}
+          notifications={notifications}
+          onToggleNotification={toggleNotification}
+          notifyPermission={notifyPermission}
+          onRequestNotifyPermission={requestNotifyPermission}
         />}
       </main>
     </div>
 
     <nav className="tabbar">
-      {NAV_VIEWS.map((key) => <button key={key} className={`tab${(key === "dashboard" ? dashboardActive : view === key) ? " active" : ""}`} onClick={() => { if (key === "dashboard") closeRoot(); else setView("settings"); }}>
+      {NAV_VIEWS.map((key) => <button key={key} className={`tab${(key === "dashboard" ? dashboardActive : view === key) ? " active" : ""}`} onClick={() => { if (key === "dashboard") closeRoot(); else setView(key); }}>
         <span className="tab-icon">
           <Icon name={VIEW_ICONS[key]} size={21} />
           {key === "dashboard" && conflicts.length > 0 && <i className="tab-badge">{conflicts.length > 9 ? "9+" : conflicts.length}</i>}
@@ -454,32 +593,22 @@ export function App(): React.JSX.Element {
           <div><h3>绑定同步根目录</h3><span className="muted">一个本地目录 ↔ 一个飞书文件夹/知识空间节点</span></div>
           <button className="secondary" onClick={() => setAddOpen(false)}>关闭</button>
         </div>
-        <form className="add-root-form" onSubmit={addRoot}>
-          <input value={newLocalPath} onChange={(event) => setNewLocalPath(event.target.value)} placeholder="本地目录绝对路径，如 /home/me/docs" />
-          <div className="add-root-row">
-            <select value={newRemoteType} onChange={(event) => setNewRemoteType(event.target.value as "folder" | "wiki")}>
-              <option value="folder">云空间文件夹</option>
-              <option value="wiki">知识空间（Wiki）节点</option>
-            </select>
-            <input
-              className="interval-input"
-              type="number"
-              min={1}
-              value={newIntervalSec}
-              onChange={(event) => setNewIntervalSec(event.target.value)}
-              placeholder={`轮询秒数（默认 ${appConfig?.preferences.defaultPollIntervalMs ? Math.round(appConfig.preferences.defaultPollIntervalMs / 1000) : 15}）`}
-            />
-          </div>
-          <input value={newRemoteToken} onChange={(event) => setNewRemoteToken(event.target.value)} placeholder={newRemoteType === "wiki" ? "Wiki 节点 token（wiki space node）" : "飞书文件夹 token"} />
-          <p className="muted form-hint">
-            token 获取：在飞书云空间打开目标文件夹，或知识空间打开目标节点，复制浏览器地址栏末尾的 token；
-            也可用 <a href="https://open.feishu.cn/api-explorer/" target="_blank" rel="noreferrer">API 调试台 ↗</a> 调用「获取根文件夹元信息 / 获取知识空间列表」查询。轮询间隔留空则使用设置页中的全局默认值。
-          </p>
-          <button className="primary" type="submit" disabled={!newLocalPath || !newRemoteToken}>绑定根目录</button>
-        </form>
+        <BindRootForm
+          defaultIntervalMs={appConfig?.preferences.defaultPollIntervalMs}
+          submitting={addSubmitting}
+          onSubmit={createRoot}
+          onCancel={() => setAddOpen(false)}
+        />
       </div>
     </div>}
 
     {guideOpen && settings && <GuideModal settings={settings} onClose={() => setGuideOpen(false)} onSaved={() => void refresh()} />}
+
+    {wizardOpen && <OnboardingWizard
+      state={onboarding}
+      onStepAction={runOnboardingStep}
+      onClose={() => setWizardOpen(false)}
+      onDismiss={dismissOnboarding}
+    />}
   </div>;
 }

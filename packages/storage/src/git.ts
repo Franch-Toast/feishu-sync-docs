@@ -258,6 +258,37 @@ export class GitStorageImpl implements GitStorage {
     }
   }
 
+  async readBlobAt(rootId: string, commit: string, relativePath: string): Promise<string | undefined> {
+    const dir = this.rootPaths.get(rootId);
+    if (!dir) return undefined;
+    try {
+      const { blob } = await git.readBlob({ fs, dir, oid: commit, filepath: relativePath });
+      return Buffer.from(blob).toString('utf-8');
+    } catch {
+      return undefined; // Path did not exist at that commit
+    }
+  }
+
+  async listCommitsForPath(rootId: string, relativePath: string, limit = 50): Promise<Commit[]> {
+    const dir = this.rootPaths.get(rootId);
+    if (!dir) return [];
+    try {
+      // git.log({ filepath }) follows only commits that changed this path,
+      // giving the per-document version timeline (newest first). isomorphic-git
+      // applies `depth` to the DAG walk rather than the path-filtered result, so
+      // walk the path history and slice to the most recent `limit` ourselves.
+      const commits = await git.log({ fs, dir, filepath: relativePath });
+      return commits.slice(0, limit).map((c) => ({
+        hash: c.oid,
+        message: c.commit.message,
+        timestamp: new Date(c.commit.author.timestamp * 1000).toISOString(),
+        trigger: this.parseTrigger(c.commit.message),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   private parseTrigger(message: string): SyncTrigger {
     if (message.includes('[trigger=manual]')) return 'manual';
     if (message.includes('[trigger=event]')) return 'event';

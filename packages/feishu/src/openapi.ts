@@ -4,7 +4,7 @@ import type {
   DocumentPatch, MutationResult, ProviderCapabilities, RemoteAsset, RemoteDocument,
   RemoteNode, RemoteProvider, RemoteTree, SyncRoot
 } from "@feishu-sync/core";
-import { FeishuApiError, FeishuOAuthError, PERMANENT_REFRESH_OAUTH_CODES, classifyFeishuFailure, networkError } from "./errors.js";
+import { FeishuApiError, FeishuOAuthError, PERMANENT_REFRESH_OAUTH_CODES, classifyFeishuFailure, networkError, parseRetryAfterMs } from "./errors.js";
 
 /** Refresh the user access token this long before its advertised expiry. */
 const USER_TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
@@ -279,7 +279,10 @@ export class FeishuOpenApiProvider implements RemoteProvider {
       throw networkError(error);
     }
     if (!response.ok) {
-      throw new FeishuApiError(classifyFeishuFailure(undefined, response.status), `Feishu HTTP ${response.status}: ${await response.text()}`, undefined, response.status);
+      // A 429 carries Retry-After; surface it so the runtime can honor the
+      // server's rate-limit window instead of retrying on the fixed backoff.
+      const retryAfterMs = response.status === 429 ? parseRetryAfterMs(response.headers.get("Retry-After")) : undefined;
+      throw new FeishuApiError(classifyFeishuFailure(undefined, response.status), `Feishu HTTP ${response.status}: ${await response.text()}`, undefined, response.status, retryAfterMs);
     }
     return response;
   }

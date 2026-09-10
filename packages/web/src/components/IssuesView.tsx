@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { markdown } from "@codemirror/lang-markdown";
 import { oneDark } from "@codemirror/theme-one-dark";
 import CodeMirror from "@uiw/react-codemirror";
-import { formatDateTime, type Conflict, type Entry, type Resolution } from "../api";
+import { api, formatDateTime, type Conflict, type Entry, type Resolution } from "../api";
 import { applyHunks, clashingHunkIndices, computeHunks, lineDiff, type DiffRow, type Hunk } from "../diff";
 import { MarkdownPreview } from "./MarkdownPreview";
 
@@ -97,6 +97,11 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
   const [editorValue, setEditorValue] = useState("");
   const [busyEntry, setBusyEntry] = useState<string | undefined>();
   const [missingBusy, setMissingBusy] = useState(false);
+  /** Checked entry ids for the bulk toolbar of the current group (B6.3);
+   *  named apart from the `selected` conflict prop. */
+  const [checkedIds, setCheckedIds] = useState<ReadonlySet<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchNotice, setBatchNotice] = useState<string>();
 
   // Follow the requested group when the detail page re-opens with a target.
   useEffect(() => {
@@ -107,6 +112,45 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
   const localMissing = useMemo(() => entries.filter((entry) => entry.status === "local-missing" && !entry.ignoredAt), [entries]);
   const ignored = useMemo(() => entries.filter((entry) => entry.ignoredAt), [entries]);
   const missingCount = remoteMissing.length + localMissing.length;
+
+  /** Entries listed by a group; the conflict group has no bulk actions. */
+  const groupEntries = (key: IssueGroup): Entry[] =>
+    key === "remote-missing" ? remoteMissing : key === "local-missing" ? localMissing : key === "ignored" ? ignored : [];
+
+  // Switching group or root drops a selection that no longer maps to visible rows.
+  useEffect(() => { setCheckedIds(new Set()); setBatchNotice(undefined); }, [group, rootId]);
+
+  const toggleSelect = (id: string, on: boolean) => setCheckedIds((current) => {
+    const next = new Set(current);
+    if (on) next.add(id); else next.delete(id);
+    return next;
+  });
+
+  const toggleSelectAll = (items: Entry[], on: boolean) => setCheckedIds((current) => {
+    const next = new Set(current);
+    for (const item of items) { if (on) next.add(item.entryId); else next.delete(item.entryId); }
+    return next;
+  });
+
+  /** Apply one bulk action to the selected entries of the open group (B6.3). */
+  const runBatch = async (action: "retry" | "ignore" | "unignore") => {
+    const ids = groupEntries(group).filter((entry) => checkedIds.has(entry.entryId)).map((entry) => entry.entryId);
+    if (ids.length === 0) return;
+    if (action !== "retry" && !window.confirm(`${action === "ignore" ? "忽略" : "恢复"}选中的 ${ids.length} 个条目？`)) return;
+    setBatchBusy(true);
+    setBatchNotice(undefined);
+    try {
+      const result = await api.batchEntries(ids, action);
+      const verb = action === "retry" ? "已重新同步" : action === "ignore" ? "已忽略" : "已恢复";
+      setBatchNotice(`${verb} ${result.accepted}/${result.total} 个条目${result.failed > 0 ? `，${result.failed} 个失败` : ""}。`);
+      setCheckedIds(new Set());
+      onRefresh();
+    } catch (error) {
+      setBatchNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
 
   // Reset the workspace whenever another conflict is opened.
   useEffect(() => {
@@ -166,9 +210,11 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
       ignored: ignored.length
     };
     const missingEntries = group === "remote-missing" ? remoteMissing : group === "local-missing" ? localMissing : [];
+    const selectable = groupEntries(group);
+    const selectedCount = selectable.filter((entry) => checkedIds.has(entry.entryId)).length;
     return <>
       <div className="page-heading">
-        <div><span className="eyebrow">WORKSPACE / ISSUES</span><h2>异常工作台</h2><p>冲突与缺失条目集中在这里：逐个解决，或一键同步全部缺失。</p></div>
+        <div><span className="eyebrow">WORKSPACE / ISSUES</span><h2>异常工作台</h2><p>冲突与缺失条目集中在这里：逐个解决，或勾选后批量处理。</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => onRefresh()}>刷新状态</button></div>
       </div>
       <div className="root-tabs">
@@ -185,11 +231,28 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
             <span className="muted">{
               group === "conflicts" ? "选择一个文档开始合并"
               : group === "ignored" ? "恢复后重新参与扫描与同步"
-              : "单条同步或忽略，也可以一键处理全部缺失"}</span>
+              : "单条同步或忽略，也可以勾选后批量处理"}</span>
           </div>
+          {selectable.length > 0 && <div className="batch-bar">
+            <label className="select-all">
+              <input
+                type="checkbox"
+                aria-label="全选当前分组"
+                checked={selectable.every((entry) => checkedIds.has(entry.entryId))}
+                onChange={(event) => toggleSelectAll(selectable, event.target.checked)}
+              />
+              全选
+            </label>
+            <span className="muted">已选 {selectedCount} 项</span>
+            {group !== "ignored" && <button className="secondary" disabled={batchBusy || selectedCount === 0} onClick={() => void runBatch("retry")}>{batchBusy ? "处理中…" : "批量同步"}</button>}
+            {group !== "ignored" && <button className="danger-ghost" disabled={batchBusy || selectedCount === 0} onClick={() => void runBatch("ignore")}>批量忽略</button>}
+            {group === "ignored" && <button className="secondary" disabled={batchBusy || selectedCount === 0} onClick={() => void runBatch("unignore")}>{batchBusy ? "处理中…" : "批量恢复"}</button>}
+            {selectedCount > 0 && <button className="link-button" onClick={() => setCheckedIds(new Set())}>取消选择</button>}
+          </div>}
           {(group === "remote-missing" || group === "local-missing") && missingEntries.length > 0 &&
             <button className="primary" disabled={missingBusy} onClick={() => void runSyncMissing()}>{missingBusy ? "同步中…" : "一键同步全部缺失"}</button>}
         </div>
+        {batchNotice && <div className="form-notice">{batchNotice}</div>}
         {group === "conflicts" && (conflicts.length === 0
           ? <div className="empty-state"><div className="check">✓</div><strong>{GROUP_EMPTY[group].title}</strong><span>{GROUP_EMPTY[group].hint}</span></div>
           : <div className="conflict-list">
@@ -208,15 +271,22 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
           ? <div className="empty-state"><div className="check">✓</div><strong>{GROUP_EMPTY[group].title}</strong><span>{GROUP_EMPTY[group].hint}</span></div>
           : <div className="conflict-list">
             {missingEntries.map((entry) => (
-              <div key={entry.id} className="conflict-row issue-row">
+              <div key={entry.entryId} className={`conflict-row issue-row${checkedIds.has(entry.entryId) ? " selected" : ""}`}>
+                <input
+                  type="checkbox"
+                  className="row-select"
+                  aria-label={`选择 ${entry.relativePath}`}
+                  checked={checkedIds.has(entry.entryId)}
+                  onChange={(event) => toggleSelect(entry.entryId, event.target.checked)}
+                />
                 <span className="conflict-icon">{group === "remote-missing" ? "☁" : "💻"}</span>
                 <span className="conflict-info">
                   <strong>{entry.relativePath}</strong>
                   <small>{group === "remote-missing" ? "飞书侧已不存在，同步将重新创建远端文档" : "本地文件已不存在，同步将从飞书拉回"}</small>
                 </span>
                 <span className="issue-row-actions">
-                  <button className="secondary" disabled={busyEntry === entry.id} onClick={() => void runEntryAction(entry.id, () => onSyncEntry(entry.id))}>{busyEntry === entry.id ? "同步中…" : "同步"}</button>
-                  <button className="danger-ghost" disabled={busyEntry === entry.id} onClick={() => void runEntryAction(entry.id, () => onIgnoreEntry(entry.id, true))}>忽略</button>
+                  <button className="secondary" disabled={busyEntry === entry.entryId} onClick={() => void runEntryAction(entry.entryId, () => onSyncEntry(entry.entryId))}>{busyEntry === entry.entryId ? "同步中…" : "同步"}</button>
+                  <button className="danger-ghost" disabled={busyEntry === entry.entryId} onClick={() => void runEntryAction(entry.entryId, () => onIgnoreEntry(entry.entryId, true))}>忽略</button>
                 </span>
               </div>
             ))}
@@ -225,14 +295,21 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
           ? <div className="empty-state"><div className="check">✓</div><strong>{GROUP_EMPTY[group].title}</strong><span>{GROUP_EMPTY[group].hint}</span></div>
           : <div className="conflict-list">
             {ignored.map((entry) => (
-              <div key={entry.id} className="conflict-row issue-row">
+              <div key={entry.entryId} className={`conflict-row issue-row${checkedIds.has(entry.entryId) ? " selected" : ""}`}>
+                <input
+                  type="checkbox"
+                  className="row-select"
+                  aria-label={`选择 ${entry.relativePath}`}
+                  checked={checkedIds.has(entry.entryId)}
+                  onChange={(event) => toggleSelect(entry.entryId, event.target.checked)}
+                />
                 <span className="conflict-icon">⊘</span>
                 <span className="conflict-info">
                   <strong>{entry.relativePath}</strong>
                   <small>忽略于 {formatDateTime(entry.ignoredAt)} · 当前状态 {entry.status}</small>
                 </span>
                 <span className="issue-row-actions">
-                  <button className="secondary" disabled={busyEntry === entry.id} onClick={() => void runEntryAction(entry.id, () => onIgnoreEntry(entry.id, false))}>{busyEntry === entry.id ? "恢复中…" : "恢复"}</button>
+                  <button className="secondary" disabled={busyEntry === entry.entryId} onClick={() => void runEntryAction(entry.entryId, () => onIgnoreEntry(entry.entryId, false))}>{busyEntry === entry.entryId ? "恢复中…" : "恢复"}</button>
                 </span>
               </div>
             ))}
@@ -283,13 +360,13 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
             <div key={hunk.key} className={`hunk-item${applied.has(hunk.key) ? " applied" : ""}${clashedKeys.has(hunk.key) ? " clash" : ""}`}>
               <span className={`hunk-side ${hunk.side}`}>{hunk.side === "local" ? "本地" : "飞书"}</span>
               <span className="hunk-desc">@ 第 {hunk.baseStart + 1} 行 · {describeHunk(hunk)}</span>
-              {clashedKeys.has(hunk.key) && <span className="hunk-warning">与另一侧重叠，后采用的会覆盖</span>}
+              {clashedKeys.has(hunk.key) && <span className="hunk-warning">与另一侧重叠</span>}
               <button className="secondary" onClick={() => toggleHunk(hunk.key)}>{applied.has(hunk.key) ? "撤回" : "采用"}</button>
             </div>
           ))}
         </div>
       </div>}
-      <div className="diff-grid two">
+      <div className={showBase ? "diff-grid three" : "diff-grid two"}>
         {showBase && <BasePane content={selected.baseContent} />}
         <SplitPane base={selected.baseContent} target={selected.localContent} side="local" label="LOCAL / 本地版本" />
         <SplitPane base={selected.baseContent} target={selected.remoteContent} side="remote" label="REMOTE / 飞书版本" />
@@ -303,6 +380,9 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
     {mode === "edit" && <div className="merge-panel">
       <div className="merge-heading">
         <div><h3>合并结果</h3><span className="muted">已应用 {appliedHunks.length} / {allHunks.length} 个变更块；编辑结果会同时写入本地和飞书</span></div>
+        <div className="heading-actions">
+          <button className="secondary" onClick={() => { setEditorValue(selected.baseContent); setApplied(new Set()); }}>基于基线重新编辑</button>
+        </div>
       </div>
       <CodeMirror value={editorValue} height="380px" extensions={[markdown(), oneDark]} onChange={setEditorValue} theme="dark" />
     </div>}

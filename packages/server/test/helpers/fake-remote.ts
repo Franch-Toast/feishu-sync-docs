@@ -3,6 +3,7 @@ import type {
   DocumentPatch, MutationResult, ProviderCapabilities, RemoteAsset, RemoteDocument,
   RemoteNode, RemoteProvider, RemoteTree, SyncRoot
 } from "@feishu-sync/core";
+import { FeishuApiError } from "@feishu-sync/feishu";
 
 /**
  * In-memory RemoteProvider shared by the server test-suite. Mirrors the
@@ -20,8 +21,37 @@ export class FakeRemote implements RemoteProvider {
   simulateH1Title = false;
   listTreeCalls = 0;
   createFolderCalls = 0;
+  getDocumentCalls = 0;
+  /** When set, getDocument throws it instead of resolving; exercises the
+   *  validate-token permission/auth branches without a live Feishu call. */
+  getDocumentError?: Error;
+  /** When true every applyPatch throws until cleared; exercises the runtime's
+   *  auto-retry exhaustion path (a one-shot failNextWrite is retried into
+   *  success within the same round). */
+  failWrites = false;
+  /** When true applyPatch throws an auth FeishuApiError; auth failures must
+   *  never be auto-retried (they fail fast and flag the credential state). */
+  failWritesAuth = false;
+  /** When > 0, that many applyPatch calls throw a 429 rate-limit error carrying
+   *  a Retry-After hint (B6.2); the runtime must honour it as a backoff floor. */
+  rateLimitRemaining = 0;
+  rateLimitRetryAfterMs = 0;
+  private writeFailuresRemaining = 0;
   private revision = 0;
   private pendingWriteError?: Error;
+
+  /** Fail the next `count` applyPatch calls (transient), then recover; used to
+   *  exercise the exponential-backoff auto-retry succeeding mid-round. */
+  failWritesTimes(count: number): void {
+    this.writeFailuresRemaining = count;
+  }
+
+  /** Simulate Feishu answering 429 with a Retry-After header for the next
+   *  `count` writes (B6.2). */
+  failWritesRateLimit(count: number, retryAfterMs: number): void {
+    this.rateLimitRemaining = count;
+    this.rateLimitRetryAfterMs = retryAfterMs;
+  }
 
   /** Make the next applyPatch call fail to exercise runtime error handling. */
   failNextWrite(message = "simulated remote write failure"): void {
@@ -41,6 +71,8 @@ export class FakeRemote implements RemoteProvider {
   }
 
   async getDocument(token: string): Promise<RemoteDocument> {
+    this.getDocumentCalls += 1;
+    if (this.getDocumentError) throw this.getDocumentError;
     const document = this.documents.get(token);
     if (!document) throw new Error(`HTTP 404 notfound: ${token}`);
     return structuredClone(document);
@@ -60,6 +92,16 @@ export class FakeRemote implements RemoteProvider {
   }
 
   async applyPatch(token: string, patch: DocumentPatch): Promise<MutationResult> {
+    if (this.failWritesAuth) throw new FeishuApiError("auth", "simulated invalid token on write");
+    if (this.rateLimitRemaining > 0) {
+      this.rateLimitRemaining -= 1;
+      throw new FeishuApiError("rate_limit", "simulated rate limit", undefined, 429, this.rateLimitRetryAfterMs);
+    }
+    if (this.failWrites) throw new Error("simulated persistent remote write failure");
+    if (this.writeFailuresRemaining > 0) {
+      this.writeFailuresRemaining -= 1;
+      throw new Error("simulated transient remote write failure");
+    }
     if (this.pendingWriteError) {
       const error = this.pendingWriteError;
       this.pendingWriteError = undefined;

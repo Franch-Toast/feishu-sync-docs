@@ -9,6 +9,17 @@ export interface AppConfigPreferences {
   /** Poll interval applied when a root is created without an explicit one. */
   defaultPollIntervalMs: number;
   logLevel: LogLevel;
+  /** Which in-app notifications are enabled (B6.8). Stored server-side so the
+   *  preference follows the user across browsers instead of per-device
+   *  localStorage. No sound option is provided (explicitly out of scope). */
+  notifications: NotificationPreferences;
+}
+
+/** Per-category notification toggles (B6.8). */
+export interface NotificationPreferences {
+  conflict: boolean;
+  failure: boolean;
+  credential: boolean;
 }
 
 /** Full config.json shape. Credentials live next to the global preferences so
@@ -19,7 +30,8 @@ export interface AppConfigDocument {
   preferences: AppConfigPreferences;
 }
 
-export const DEFAULT_PREFERENCES: AppConfigPreferences = { defaultPollIntervalMs: 15000, logLevel: "info" };
+export const DEFAULT_NOTIFICATIONS: NotificationPreferences = { conflict: true, failure: true, credential: true };
+export const DEFAULT_PREFERENCES: AppConfigPreferences = { defaultPollIntervalMs: 15000, logLevel: "info", notifications: { ...DEFAULT_NOTIFICATIONS } };
 export const LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
 
 /** Auth lifecycle flags: shared literal keys so the runtime, the credential
@@ -52,11 +64,12 @@ export class AppConfigStore implements AuthStateStore {
   }
 
   get preferences(): AppConfigPreferences {
-    return { ...DEFAULT_PREFERENCES, ...this.doc().preferences };
+    const stored = this.doc().preferences;
+    return { ...DEFAULT_PREFERENCES, ...stored, notifications: { ...DEFAULT_NOTIFICATIONS, ...stored.notifications } };
   }
 
   /** Validate and persist a preferences patch; returns the effective values. */
-  async setPreferences(patch: { defaultPollIntervalMs?: number; logLevel?: LogLevel }): Promise<AppConfigPreferences> {
+  async setPreferences(patch: { defaultPollIntervalMs?: number; logLevel?: LogLevel; notifications?: Partial<NotificationPreferences> }): Promise<AppConfigPreferences> {
     const doc = this.doc();
     if (patch.defaultPollIntervalMs !== undefined) {
       const value = patch.defaultPollIntervalMs;
@@ -70,6 +83,9 @@ export class AppConfigStore implements AuthStateStore {
         throw Object.assign(new Error(`logLevel must be one of ${LOG_LEVELS.join(", ")}`), { statusCode: 400 });
       }
       doc.preferences.logLevel = patch.logLevel;
+    }
+    if (patch.notifications !== undefined) {
+      doc.preferences.notifications = { ...DEFAULT_NOTIFICATIONS, ...doc.preferences.notifications, ...patch.notifications };
     }
     this.flush();
     return this.preferences;
@@ -108,14 +124,14 @@ export class AppConfigStore implements AuthStateStore {
   /** Parse config.json once per process; missing file means pure defaults. */
   private doc(): AppConfigDocument {
     if (this.cache) return this.cache;
-    let doc: AppConfigDocument = { version: 1, credentials: {}, preferences: { ...DEFAULT_PREFERENCES } };
+    let doc: AppConfigDocument = { version: 1, credentials: {}, preferences: { ...DEFAULT_PREFERENCES, notifications: { ...DEFAULT_NOTIFICATIONS } } };
     try {
       if (existsSync(this.configPath)) {
         const raw = JSON.parse(readFileSync(this.configPath, "utf-8")) as Partial<AppConfigDocument>;
         doc = {
           version: 1,
           credentials: { ...raw.credentials },
-          preferences: { ...DEFAULT_PREFERENCES, ...raw.preferences }
+          preferences: { ...DEFAULT_PREFERENCES, ...raw.preferences, notifications: { ...DEFAULT_NOTIFICATIONS, ...raw.preferences?.notifications } }
         };
       }
     } catch {

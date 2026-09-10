@@ -30,6 +30,9 @@ export class EventChannelService {
   /** Bumps on every rebuild/stop; events from stale clients are dropped. */
   private generation = 0;
   private readonly pending = new Map<string, NodeJS.Timeout>();
+  /** Token scope for each pending (debouncing) round; undefined means a burst
+   *  of differing tokens widened the round to a full event sync. */
+  private readonly pendingTokens = new Map<string, string | undefined>();
 
   constructor(
     private readonly credentials: CredentialStore,
@@ -102,6 +105,7 @@ export class EventChannelService {
     this.closeClient();
     for (const timer of this.pending.values()) clearTimeout(timer);
     this.pending.clear();
+    this.pendingTokens.clear();
     this.state = { status: "disabled" };
   }
 
@@ -124,7 +128,7 @@ export class EventChannelService {
         this.log("debug", "drive event ignored: no matching root", { kind, fileToken, folderToken });
         return;
       }
-      for (const root of roots) this.scheduleSync(root, kind);
+      for (const root of roots) this.scheduleSync(root, kind, fileToken);
     } catch (error) {
       this.log("warn", "drive event handling failed", { kind, error: error instanceof Error ? error.message : String(error) });
     }
@@ -151,12 +155,23 @@ export class EventChannelService {
     return [...hits.values()];
   }
 
-  private scheduleSync(root: SyncRoot, kind: string): void {
-    if (!root.enabled || this.pending.has(root.id)) return;
-    this.log("info", "drive event scheduled sync", { rootId: root.id, kind, debounceMs: EVENT_SYNC_DEBOUNCE_MS });
+  private scheduleSync(root: SyncRoot, kind: string, fileToken?: string): void {
+    if (!root.enabled) return;
+    if (this.pending.has(root.id)) {
+      // Coalesce a burst: a differing token widens the pending round to a full
+      // event sync (undefined scope) so no changed file is missed while debouncing.
+      if (this.pendingTokens.get(root.id) !== fileToken) this.pendingTokens.set(root.id, undefined);
+      return;
+    }
+    this.pendingTokens.set(root.id, fileToken);
+    this.log("info", "drive event scheduled sync", { rootId: root.id, kind, fileToken, debounceMs: EVENT_SYNC_DEBOUNCE_MS });
     const timer = setTimeout(() => {
       this.pending.delete(root.id);
-      void this.runtime.requestSync(root.id);
+      const token = this.pendingTokens.get(root.id);
+      this.pendingTokens.delete(root.id);
+      // Passing the token narrows the round to that entry and lets the runtime
+      // skip it entirely when it merely echoes a push we just made.
+      void this.runtime.requestSync(root.id, token);
     }, EVENT_SYNC_DEBOUNCE_MS);
     timer.unref();
     this.pending.set(root.id, timer);
