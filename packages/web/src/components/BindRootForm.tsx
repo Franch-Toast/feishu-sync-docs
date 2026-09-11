@@ -12,6 +12,9 @@ export interface BindFormValues {
   mode: SyncMode;
   /** Raw exclude textarea; parsed into globs on submit (B6.5). */
   exclude: string;
+  /** G3: what to do with a `.feishu-sync/` left behind by a deleted root.
+   *  `adopt` (default) keeps history; `reset` archives it and starts clean. */
+  metadataAction?: "adopt" | "reset";
 }
 
 export interface BindFormIssues {
@@ -27,6 +30,7 @@ export interface CreateRootInput {
   pollIntervalMs?: number;
   mode: SyncMode;
   exclude?: string[];
+  metadataAction?: "adopt" | "reset";
 }
 
 /** Pure client-side validation for the bind form. Returns per-field issue
@@ -56,7 +60,9 @@ export function toCreateRootInput(values: BindFormValues): CreateRootInput {
     remoteType: values.remoteType,
     pollIntervalMs: Number.isFinite(parsed) && parsed >= 1 ? parsed * 1000 : undefined,
     mode: values.mode,
-    exclude: exclude.length > 0 ? exclude : undefined
+    exclude: exclude.length > 0 ? exclude : undefined,
+    // G3: `undefined` keeps the server's safe default (adopt the leftovers).
+    metadataAction: values.metadataAction
   };
 }
 
@@ -96,6 +102,24 @@ export function describeTokenProblem(result: ValidateTokenResult): string {
   return result.error ?? "未知错误";
 }
 
+/** G6: everything the probe learned about what the directory already carries —
+ *  an existing git repo, an ignored-or-not metadata folder, a previous binding.
+ *  Returned as plain Chinese lines so the form can list them verbatim. */
+export function describeBindHints(result: ValidatePathResult): string[] {
+  const hints: string[] = [];
+  if (result.boundRootId) hints.push("该目录已经绑定过：提交后将直接切换到现有绑定，不会新建第二个根目录。");
+  if (result.hasGit) hints.push(result.gitBranch ? `检测到 git 仓库（当前分支 ${result.gitBranch}）：基线提交写入该仓库，不会改变工作区文件。` : "检测到 git 仓库：基线提交写入该仓库，不会改变工作区文件。");
+  if (result.hasGit && result.metaIgnored === false) hints.push("元数据尚未被 .gitignore 忽略：绑定时会自动追加 .feishu-sync/，并取消已跟踪的元数据。");
+  if (result.orphanMeta) hints.push(`检测到上一次绑定遗留的元数据${result.metaRootId ? `（${result.metaRootId.slice(0, 8)}）` : ""}，可选择接管历史或归档后重新开始。`);
+  return hints;
+}
+
+/** G3: the 「接管 / 重新绑定」 choice only appears for orphaned metadata that no
+ *  live root owns; anything else takes the server default. */
+export function needsMetaChoice(result: ValidatePathResult): boolean {
+  return result.orphanMeta === true && !result.boundRootId;
+}
+
 /** Three-group bind form (📁 本地 / ☁️ 远端 / ⚙️ 高级) reusing the settings
  *  `.form-row` visual language. Both the local path and the remote token are
  *  probed on blur so mistakes surface before the root is created. */
@@ -111,8 +135,10 @@ export function BindRootForm({ defaultIntervalMs, submitting, onSubmit, onCancel
   const [tokenCheck, setTokenCheck] = useState<TokenCheck>();
   const [pathCheck, setPathCheck] = useState<PathCheck>();
   const [error, setError] = useState<string>();
+  /** G3: how to treat orphaned metadata found by the path probe. */
+  const [metadataAction, setMetadataAction] = useState<"adopt" | "reset">("adopt");
 
-  const values: BindFormValues = { localPath, remoteToken, remoteType, intervalSec, mode, exclude };
+  const values: BindFormValues = { localPath, remoteToken, remoteType, intervalSec, mode, exclude, metadataAction };
   const defaultHint = defaultIntervalMs ? Math.round(defaultIntervalMs / 1000) : 15;
 
   /** Blur handler for the local path: client-side shape check first, then a
@@ -181,7 +207,23 @@ export function BindRootForm({ defaultIntervalMs, submitting, onSubmit, onCancel
       {issues.localPath && <p className="form-issue">{issues.localPath}</p>}
       {pathCheck?.state === "checking" && <div className="test-result ok">正在检查目录…</div>}
       {pathCheck?.state === "done" && <div className={`test-result ${pathCheck.result.ok ? "ok" : "fail"}`}>{describePathCheck(pathCheck.result)}</div>}
-      <p className="muted form-hint">同步会在此目录内创建 <code>.feishu-sync</code> 元数据与 <code>.git</code> 基线仓库，请确保可写。</p>
+      {pathCheck?.state === "done" && describeBindHints(pathCheck.result).length > 0 && <ul className="bind-hints">
+        {describeBindHints(pathCheck.result).map((hint, index) => <li key={index}>{hint}</li>)}
+      </ul>}
+      {pathCheck?.state === "done" && needsMetaChoice(pathCheck.result) && <div className="form-row meta-choice">
+        <span className="form-label">遗留元数据</span>
+        <div className="radio-column">
+          <label className="radio-row">
+            <input type="radio" name="meta-action" checked={metadataAction === "adopt"} onChange={() => setMetadataAction("adopt")} />
+            <span>接管（推荐）<small className="muted">保留历史绑定、操作记录与 git 基线，下一轮直接续用</small></span>
+          </label>
+          <label className="radio-row">
+            <input type="radio" name="meta-action" checked={metadataAction === "reset"} onChange={() => setMetadataAction("reset")} />
+            <span>重新绑定<small className="muted">把现有 .feishu-sync/ 整份移入 backup-时间戳/ 备份目录后重建（不删文件，不动 .git）</small></span>
+          </label>
+        </div>
+      </div>}
+      <p className="muted form-hint">同步会在此目录内创建 <code>.feishu-sync</code> 元数据与 <code>.git</code> 基线仓库，请确保可写。删除绑定不会删除本地文件与 git 历史。</p>
     </fieldset>
 
     <fieldset className="form-group">

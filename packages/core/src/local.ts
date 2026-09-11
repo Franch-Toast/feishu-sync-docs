@@ -2,15 +2,51 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/p
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { sha256 } from "./hash.js";
 import { matchesAnyGlob } from "./glob.js";
-import type { LocalFile, LocalProvider, SyncRoot } from "./types.js";
+import type { LocalFile, LocalProvider, LocalScanOptions, SyncRoot } from "./types.js";
 
 const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]);
 
 export class FilesystemProvider implements LocalProvider {
-  async scan(root: SyncRoot): Promise<LocalFile[]> {
+  async scan(root: SyncRoot, options?: LocalScanOptions): Promise<LocalFile[]> {
+    // E1: `onlyPaths` turns a whole-tree walk into a per-file stat+read. Missing
+    // paths are simply absent from the result; the caller decides whether that
+    // means `local-missing`.
+    if (options?.onlyPaths) {
+      const files: LocalFile[] = [];
+      for (const relativePath of new Set(options.onlyPaths)) {
+        const file = await this.statOne(root, relativePath);
+        if (file) files.push(file);
+      }
+      return files;
+    }
     const files: LocalFile[] = [];
     await this.walk(resolve(root.localPath), resolve(root.localPath), files, root.exclude ?? []);
     return files;
+  }
+
+  /** Describe a single path, or undefined when it is gone, not a file, or a
+   *  type the sync does not track. Never throws for a missing file. */
+  private async statOne(root: SyncRoot, relativePath: string): Promise<LocalFile | undefined> {
+    let absolutePath: string;
+    let metadata;
+    try {
+      absolutePath = this.safePath(root, relativePath);
+      metadata = await stat(absolutePath);
+    } catch {
+      return undefined;
+    }
+    if (!metadata.isFile()) return undefined;
+    const extension = extname(relativePath).toLowerCase();
+    if (extension !== ".md" && !imageExtensions.has(extension)) return undefined;
+    const data = await readFile(absolutePath);
+    return {
+      relativePath,
+      absolutePath,
+      kind: extension === ".md" ? "document" : "asset",
+      size: metadata.size,
+      mtimeMs: metadata.mtimeMs,
+      contentHash: sha256(data)
+    };
   }
 
   async readText(root: SyncRoot, relativePath: string): Promise<string> {

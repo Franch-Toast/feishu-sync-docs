@@ -12,6 +12,7 @@ import {
   type TaskView
 } from "../api";
 import { Icon } from "./Icon";
+import type { RoundSummary } from "../api";
 
 interface TaskCenterProps {
   roots: Root[];
@@ -26,6 +27,28 @@ interface TaskCenterProps {
 }
 
 const PAGE = 25;
+
+/** A4: counters rendered as badges on a `sync-round` row. Zero-valued buckets
+ *  are dropped so a quiet round stays readable. */
+const ROUND_SUMMARY_LABELS: Array<{ key: keyof RoundSummary; label: string; tone?: string }> = [
+  { key: "scanned", label: "扫描 {n}" },
+  { key: "pushed", label: "推送 {n}", tone: "ok-badge" },
+  { key: "pulled", label: "拉取 {n}", tone: "ok-badge" },
+  { key: "merged", label: "合并 {n}", tone: "ok-badge" },
+  { key: "conflicts", label: "冲突 {n}", tone: "conflict-badge" },
+  { key: "failed", label: "失败 {n}", tone: "conflict-badge" },
+  { key: "skipped", label: "跳过 {n}", tone: "paused-badge" }
+];
+
+function roundSummary(task: TaskView): React.JSX.Element | null {
+  const summary = task.summary;
+  if (!summary) return null;
+  const items = ROUND_SUMMARY_LABELS
+    .map((item) => ({ ...item, value: summary[item.key] }))
+    .filter((item) => item.value > 0);
+  if (items.length === 0) return <span className="badge paused-badge">无变更</span>;
+  return <span className="round-summary">{items.map((item) => <span key={item.key} className={`badge ${item.tone ?? ""}`}>{item.label.replace("{n}", String(item.value))}</span>)}</span>;
+}
 
 /** Guidance for a failed task, derived from its semantic error category. */
 interface Guidance {
@@ -206,7 +229,7 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
   const batchIgnore = async () => {
     const entryIds = failed.filter((task) => selected.has(task.id) && task.entryId).map((task) => task.entryId!);
     if (entryIds.length === 0) { setNotice("选中的任务没有对应条目，无法忽略。"); return; }
-    if (!window.confirm(`忽略选中的 ${entryIds} 个条目？忽略后不再参与同步评估，可在异常工作台恢复。`)) return;
+    if (!window.confirm(`忽略选中的 ${entryIds.length} 个条目？忽略后不再参与同步评估，并会离开「失败待处理」队列，可在异常工作台恢复。`)) return;
     setBusy(new Set(entryIds));
     setNotice(undefined);
     try {
@@ -238,7 +261,11 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
         {group === "failed" && <td data-label="选择" className="select-cell">
           <input type="checkbox" aria-label={`选择 ${task.relativePath ?? task.id}`} checked={selected.has(task.id)} onChange={(event) => toggleSelected(task.id, event.target.checked)} />
         </td>}
-        <td data-label="文件" className="task-file">{task.relativePath ?? <span className="muted">（整轮同步）</span>}{task.kind === "asset" && <small className="muted"> · 附件</small>}</td>
+        <td data-label="文件" className="task-file">
+          {task.relativePath
+            ? <>{task.relativePath}{task.kind === "asset" && <small className="muted"> · 附件</small>}</>
+            : <><span className="muted">整轮同步 · {rootName(task.rootId)}</span>{roundSummary(task)}</>}
+        </td>
         <td data-label="根目录" className="muted">{rootName(task.rootId)}</td>
         <td data-label="方向" className="muted">{DIRECTION_LABELS[task.direction] ?? task.direction}</td>
         <td data-label="触发源" className="muted">{task.trigger ? TRIGGER_LABELS[task.trigger] : "—"}</td>
@@ -284,7 +311,7 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
 
   return <div className="task-center">
     <div className="page-heading">
-      <div><span className="eyebrow">WORKSPACE / TASKS</span><h2>任务中心</h2><p>集中查看进行中、失败待处理与最近完成的同步任务，按错误类别给出修复引导。</p></div>
+      <div><span className="eyebrow">WORKSPACE / TASKS</span><h2>任务中心</h2><p>每一轮同步都会以「整轮同步」任务出现在进行中；失败的任务自动重试 3 次后停在失败待处理，直到你重试或忽略。</p></div>
       <div className="heading-actions">
         <button className="secondary" disabled={loading} onClick={() => void load()}><Icon name="sync" size={14} />{loading ? "刷新中…" : "刷新"}</button>
         <button className="danger-ghost" disabled={done.length === 0} onClick={() => void clearCompleted()}>清空已完成</button>
@@ -294,13 +321,13 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
     {notice && <div className="form-notice">{notice}</div>}
 
     <div className="panel task-group">
-      <div className="panel-heading"><div><h3>进行中</h3><span className="muted">排队与正在同步的任务（{active.length}）</span></div></div>
+      <div className="panel-heading"><div><h3>进行中</h3><span className="muted">排队与正在同步的任务，含本轮整轮同步（{active.length}）</span></div></div>
       {table(active, "active", "当前没有进行中的任务")}
     </div>
 
     <div className="panel task-group">
       <div className="panel-heading">
-        <div><h3>失败待处理</h3><span className="muted">需要人工介入的失败任务（{failed.length}）</span></div>
+        <div><h3>失败待处理</h3><span className="muted">每个条目只保留一条，重试或忽略后立即离开本队列（{failed.length}）</span></div>
         {failed.length > 0 && <div className="batch-bar">
           <span className="muted">已选 {selectedFailed.length} 项</span>
           <button className="secondary" disabled={selectedFailed.length === 0} onClick={() => void batchRetry()}>批量重试</button>

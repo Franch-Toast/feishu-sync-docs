@@ -1,6 +1,7 @@
 export * from "./types.js";
 export * from "./hash.js";
 export * from "./glob.js";
+export * from "./pathsafe.js";
 export * from "./markdown.js";
 export * from "./merge.js";
 export * from "./local.js";

@@ -14,7 +14,7 @@ test("preferences default, round-trip on disk and validation", async () => {
     assert.ok(!existsSync(configPath), "no file is written until the first save");
 
     const saved = await config.setPreferences({ defaultPollIntervalMs: 30000, logLevel: "debug" });
-    assert.deepEqual(saved, { defaultPollIntervalMs: 30000, logLevel: "debug", notifications: { ...DEFAULT_NOTIFICATIONS } });
+    assert.deepEqual(saved, { defaultPollIntervalMs: 30000, logLevel: "debug", notifications: { ...DEFAULT_NOTIFICATIONS }, notificationChannel: "none" });
     assert.ok(existsSync(configPath), "the first save must create config.json");
 
     // A second instance re-reads the file: persistence really happened.
@@ -29,30 +29,37 @@ test("preferences default, round-trip on disk and validation", async () => {
   }
 });
 
-test("notification preferences default on, persist per category and survive a partial patch (B6.8)", async () => {
+test("notification preferences default off, persist per category and survive a partial patch (B6.8/D)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "feishu-appconfig-"));
   try {
     const configPath = join(dir, "config.json");
     const config = new AppConfigStore(configPath);
-    assert.deepEqual(config.preferences.notifications, { conflict: true, failure: true, credential: true });
+    // D: the workbench is silent out of the box.
+    assert.deepEqual(config.preferences.notifications, { conflict: false, failure: false, credential: false });
+    assert.equal(config.preferences.notificationChannel, "none");
 
     // A partial patch only flips the named categories.
-    const saved = await config.setPreferences({ notifications: { conflict: false } });
-    assert.deepEqual(saved.notifications, { conflict: false, failure: true, credential: true });
-    await config.setPreferences({ notifications: { credential: false } });
-    assert.deepEqual(config.preferences.notifications, { conflict: false, failure: true, credential: false });
+    const saved = await config.setPreferences({ notifications: { conflict: true } });
+    assert.deepEqual(saved.notifications, { conflict: true, failure: false, credential: false });
+    await config.setPreferences({ notifications: { credential: true } });
+    assert.deepEqual(config.preferences.notifications, { conflict: true, failure: false, credential: true });
 
     // The toggles live server-side, so a second instance (another browser or a
     // restarted process) reads the same values instead of per-device defaults.
     const reopened = new AppConfigStore(configPath);
-    assert.deepEqual(reopened.preferences.notifications, { conflict: false, failure: true, credential: false });
+    assert.deepEqual(reopened.preferences.notifications, { conflict: true, failure: false, credential: true });
     const disk = JSON.parse(readFileSync(configPath, "utf8")) as { preferences: { notifications: Record<string, boolean> } };
-    assert.deepEqual(disk.preferences.notifications, { conflict: false, failure: true, credential: false });
+    assert.deepEqual(disk.preferences.notifications, { conflict: true, failure: false, credential: true });
 
-    // Turning one back on works, and an unrelated patch leaves them untouched.
+    // Turning one back off works, and an unrelated patch leaves them untouched.
     await config.setPreferences({ logLevel: "warn" });
-    assert.deepEqual(config.preferences.notifications, { conflict: false, failure: true, credential: false });
-    assert.equal((await config.setPreferences({ notifications: { conflict: true } })).notifications.conflict, true);
+    assert.deepEqual(config.preferences.notifications, { conflict: true, failure: false, credential: true });
+    assert.equal((await config.setPreferences({ notifications: { conflict: false } })).notifications.conflict, false);
+
+    // The channel is a closed set: anything else is a client error, not a typo
+    // that silently disables delivery.
+    await assert.rejects(config.setPreferences({ notificationChannel: "email" as never }), /notificationChannel must be one of/);
+    assert.equal((await config.setPreferences({ notificationChannel: "browser" })).notificationChannel, "browser");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -66,10 +73,13 @@ test("a config.json written before notifications existed still yields all defaul
     // no migration step required).
     writeFileSync(configPath, JSON.stringify({ version: 1, credentials: {}, preferences: { defaultPollIntervalMs: 20000, logLevel: "error" } }), "utf8");
     const config = new AppConfigStore(configPath);
-    assert.deepEqual(config.preferences, { defaultPollIntervalMs: 20000, logLevel: "error", notifications: { ...DEFAULT_NOTIFICATIONS } });
+    assert.deepEqual(config.preferences, { ...DEFAULT_PREFERENCES, defaultPollIntervalMs: 20000, logLevel: "error" });
     // A partially written notifications object is merged over the defaults too.
-    writeFileSync(configPath, JSON.stringify({ version: 1, credentials: {}, preferences: { notifications: { failure: false } } }), "utf8");
-    assert.deepEqual(new AppConfigStore(configPath).preferences.notifications, { conflict: true, failure: false, credential: true });
+    writeFileSync(configPath, JSON.stringify({ version: 1, credentials: {}, preferences: { notifications: { failure: true } } }), "utf8");
+    assert.deepEqual(new AppConfigStore(configPath).preferences.notifications, { conflict: false, failure: true, credential: false });
+    // A legacy file that had the old "all on" switches still needs a channel;
+    // without one nothing is delivered (D: no silent behaviour change on upgrade).
+    assert.equal(new AppConfigStore(configPath).preferences.notificationChannel, "none");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

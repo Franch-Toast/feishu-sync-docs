@@ -27,6 +27,11 @@ export interface FeishuOpenApiOptions {
   /** Refresh token obtained from the OAuth v3 flow; enables automatic renewal
    *  of the user access token when paired with appId/appSecret. */
   refreshToken?: string;
+  /** Escape hatch for the two-step document creation (B2). When true, the
+   *  legacy single `docs_ai` call is used, which lets Feishu derive the title
+   *  from the markdown H1. Kept so the behaviour can be rolled back without a
+   *  code change if the `docx` create endpoint turns out to be unavailable. */
+  legacyCreateDocument?: boolean;
   fetchImpl?: typeof fetch;
   /** Invoked after a successful token rotation. Must persist the new refresh
    *  token promptly: the previous one is already invalidated server-side. */
@@ -62,6 +67,43 @@ interface DocxBlockResponse {
   items?: DocxBlock[];
   page_token?: string;
   has_more?: boolean;
+}
+
+/** The scope that makes a user token renewable instead of 2-hour disposable. */
+export const OAUTH_DEFAULT_SCOPE = "offline_access";
+
+/** C2: `POST /oauth/v3/token` with `grant_type=authorization_code`. */
+interface AuthorizationCodeTokenResponse {
+  code?: number;
+  msg?: string;
+  error?: string;
+  error_description?: string;
+  access_token?: string;
+  expires_in?: number;
+  refresh_token?: string;
+  refresh_token_expires_in?: number;
+  scope?: string;
+}
+
+/** Server-side failures of the code exchange, phrased for the settings page. */
+export const AUTHORIZATION_CODE_ERROR_LABELS: Record<number, string> = {
+  20002: "App Secret 不正确，请检查开发者后台的凭证",
+  20003: "授权码无效，请重新获取（授权码只能使用一次）",
+  20004: "授权码已过期，请重新点击「前往飞书授权」",
+  20005: "grant_type 不受支持",
+  20010: "当前用户没有该应用的使用权限，请在应用可用范围内添加自己",
+  20049: "该应用要求 PKCE，本工具未使用 PKCE，请改用手工粘贴 refresh token",
+  20065: "授权码已被使用过，请重新发起授权",
+  20071: "回调地址与开发者后台登记的重定向 URL 不一致，请核对 http://127.0.0.1:<端口>/oauth/callback"
+};
+
+/** C2: the tokens a successful authorization-code exchange yields. */
+export interface OAuthTokenSet {
+  accessToken: string;
+  refreshToken?: string;
+  tokenExpiresAt: number;
+  refreshTokenExpiresAt?: number;
+  scope?: string;
 }
 
 export class FeishuOpenApiProvider implements RemoteProvider {
@@ -134,7 +176,60 @@ export class FeishuOpenApiProvider implements RemoteProvider {
     return { token, name: data.file?.name ?? name, type: "folder", parentToken };
   }
 
+  /**
+   * Create a document with a *controlled* title (B2).
+   *
+   * The `docs_ai` import endpoint ignores the requested name and derives the
+   * drive-visible title from the markdown H1, which breaks the identity
+   * contract: two files sharing a first heading become two identically named
+   * documents, and a title is no longer a reversible function of the file name.
+   * So creation is split in two steps:
+   *   1. `POST /open-apis/docx/v1/documents` with an explicit `title`;
+   *   2. the existing `docs_ai` overwrite command writes the markdown body.
+   * Step 1 succeeding is enough to hand the token back, so the caller can
+   * persist the binding before the body is pushed and never orphans a document.
+   */
   async createDocument(parentToken: string, name: string, content: string): Promise<RemoteDocument> {
+    if (this.options.legacyCreateDocument) {
+      return this.createDocumentViaImport(parentToken, name, content);
+    }
+    const created = await this.request<{ document?: { document_id?: string; revision_id?: number; title?: string } }>(
+      "POST", "/open-apis/docx/v1/documents", { folder_token: parentToken, title: name }
+    );
+    const token = created.document?.document_id;
+    if (!token) throw new Error("Feishu did not return the created document token");
+    const stub: RemoteDocument = {
+      token,
+      name: created.document?.title ?? name,
+      type: "document",
+      parentToken,
+      content: "",
+      blocks: [],
+      contentHash: createHash("sha256").update("").digest("hex"),
+      revisionId: created.document?.revision_id
+    };
+    if (!content) return stub;
+    try {
+      await this.request("PUT", `/open-apis/docs_ai/v1/documents/${encodeURIComponent(token)}`, {
+        format: "markdown",
+        command: "overwrite",
+        content,
+        revision_id: stub.revisionId ?? -1
+      });
+    } catch {
+      // The empty document exists and its title is right; return the stub so
+      // the caller binds the token and retries the content push next round.
+      return stub;
+    }
+    try {
+      return await this.getDocument(token);
+    } catch {
+      return stub;
+    }
+  }
+
+  /** The pre-B2 single-call creation, kept behind `legacyCreateDocument`. */
+  private async createDocumentViaImport(parentToken: string, name: string, content: string): Promise<RemoteDocument> {
     const data = await this.request<{ document?: { document_id?: string; revision_id?: number; title?: string } }>("POST", "/open-apis/docs_ai/v1/documents", { format: "markdown", content, parent_token: parentToken });
     const token = data.document?.document_id;
     if (!token) throw new Error("Feishu did not return the created document token");
@@ -387,6 +482,66 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   private accountsBaseUrl(): string {
     const mapped = this.baseUrl.replace(/^https:\/\/open\./, "https://accounts.");
     return mapped === this.baseUrl ? "https://accounts.feishu.cn" : mapped;
+  }
+
+  /** C2: authorization URL for the OAuth 2.0 authorization-code flow. The
+   *  `offline_access` scope is what makes the returned refresh token usable
+   *  for unlimited renewal, so it is always requested. */
+  buildAuthorizeUrl(input: { appId: string; redirectUri: string; state: string; scope?: string }): string {
+    const params = new URLSearchParams({
+      client_id: input.appId,
+      redirect_uri: input.redirectUri,
+      scope: input.scope ?? OAUTH_DEFAULT_SCOPE,
+      state: input.state
+    });
+    return `${this.accountsBaseUrl()}/open-apis/authen/v1/authorize?${params.toString()}`;
+  }
+
+  /** C2: turn a single-use authorization code into an access/refresh token pair.
+   *  The caller supplies the same `redirectUri` that was authorized; Feishu
+   *  rejects a mismatch with code 20071. */
+  async exchangeAuthorizationCode(input: { code: string; redirectUri: string }): Promise<OAuthTokenSet> {
+    if (!this.options.appId || !this.options.appSecret) {
+      throw new FeishuOAuthError("缺少 App ID 或 App Secret，无法换取授权码");
+    }
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.accountsBaseUrl()}/oauth/v3/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: this.options.appId,
+          client_secret: this.options.appSecret,
+          code: input.code,
+          redirect_uri: input.redirectUri
+        })
+      });
+    } catch (error) {
+      throw new FeishuOAuthError(networkError(error).message);
+    }
+    let body: AuthorizationCodeTokenResponse;
+    try {
+      body = await response.json() as AuthorizationCodeTokenResponse;
+    } catch {
+      body = { error: `HTTP ${response.status}` };
+    }
+    if (!response.ok || (body.code !== undefined && body.code !== 0) || !body.access_token) {
+      const code = body.code;
+      const raw = body.error_description ?? body.error ?? body.msg ?? `HTTP ${response.status}`;
+      const label = code !== undefined ? AUTHORIZATION_CODE_ERROR_LABELS[code] : undefined;
+      throw new FeishuOAuthError(label ? `${label}（${raw}）` : raw, code);
+    }
+    const tokenExpiresAt = Date.now() + Math.max(1, body.expires_in ?? 7200) * 1000;
+    return {
+      accessToken: body.access_token,
+      refreshToken: body.refresh_token,
+      tokenExpiresAt,
+      refreshTokenExpiresAt: body.refresh_token_expires_in !== undefined
+        ? Date.now() + body.refresh_token_expires_in * 1000
+        : undefined,
+      scope: body.scope
+    };
   }
 
   private async requestTenantToken(): Promise<string> {

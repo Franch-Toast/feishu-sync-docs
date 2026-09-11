@@ -51,11 +51,14 @@ function extractTitle(content: string): string | undefined {
 
 function extractLinks(content: string): MarkdownLink[] {
   const links: MarkdownLink[] = [];
-  const expression = /!?(?:\[([^\]]*)\])\(([^\s)]+)(?:\s+["'][^"']*["'])?\)/g;
+  // B6: `<...>` wrapped targets are legal CommonMark and the only way to write a
+  // path containing spaces, so extraction has to accept them or the reference is
+  // invisible to everything downstream (asset upload, back-link marking).
+  const expression = /!?\[([^\]]*)\]\(\s*(?:<([^>]+)>(|\s[^)]*)|([^\s)]+)(?:\s+["'][^"']*["'])?)\s*\)/g;
   for (const match of content.matchAll(expression)) {
     if (match.index !== undefined && isInsideFence(content, match.index)) continue;
     if (match[0]?.startsWith("!")) continue;
-    const target = match[2];
+    const target = match[2] ?? match[4];
     if (!target || match.index === undefined) continue;
     const link: MarkdownLink = { target, start: match.index, end: match.index + match[0].length };
     if (match[1] !== undefined) link.label = match[1];
@@ -76,10 +79,10 @@ function extractLinks(content: string): MarkdownLink[] {
 
 function extractAssets(content: string): MarkdownAssetReference[] {
   const assets: MarkdownAssetReference[] = [];
-  const expression = /!\[([^\]]*)\]\(([^\s)]+)(?:\s+["'][^"']*["'])?\)/g;
+  const expression = /!\[([^\]]*)\]\(\s*(?:<([^>]+)>(|\s[^)]*)|([^\s)]+)(?:\s+["'][^"']*["'])?)\s*\)/g;
   for (const match of content.matchAll(expression)) {
     if (match.index !== undefined && isInsideFence(content, match.index)) continue;
-    const target = match[2];
+    const target = match[2] ?? match[4];
     if (target && match.index !== undefined && !/^https?:\/\//i.test(target)) {
       assets.push({ target, start: match.index, end: match.index + match[0].length });
     }
@@ -143,9 +146,11 @@ export function rewriteInternalLinks(
     return undefined;
   };
   return replaceOutsideFences(content, (line) => {
-    let rewritten = line.replace(/(!?)\[([^\]]*)\]\(([^\s)]+)([^)]*)\)/g, (whole, image: string, label: string, target: string) => {
+    // `<...>` wrapped targets are legal CommonMark and are the only way to
+    // write a link whose path contains spaces or parentheses.
+    let rewritten = line.replace(/(!?)\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^\s)]+))([^)]*)\)/g, (whole, image: string, label: string, angleTarget: string, bareTarget: string) => {
       if (image) return whole;
-      const replacement = resolve(target);
+      const replacement = resolve(angleTarget ?? bareTarget);
       return replacement ?? whole;
     });
     rewritten = rewritten.replace(/\[\[([^\]|#]+)(#[^\]|]+)?(?:\|([^\]]+))?\]\]/g, (whole, target: string) => resolve(target) ?? whole);
@@ -158,7 +163,7 @@ export function restoreInternalLinks(content: string, reverseMap: Map<string, st
     const path = reverseMap.get(token);
     if (!path) return whole;
     const relativePath = currentPath ? relativeReferencePath(currentPath, path) : path;
-    return `[${relativePath}](${relativePath})`;
+    return `[${sanitizeLabel(relativePath)}](${encodeReference(relativePath)})`;
   });
 }
 
@@ -178,8 +183,8 @@ export function rewriteAssetReferences(
     }
     return undefined;
   };
-  return replaceOutsideFences(content, (line) => line.replace(/!\[([^\]]*)\]\(([^\s)]+)([^)]*)\)/g, (whole, label: string, target: string) => {
-    const token = resolve(target);
+  return replaceOutsideFences(content, (line) => line.replace(/!\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^\s)]+))([^)]*)\)/g, (whole, label: string, angleTarget: string, bareTarget: string) => {
+    const token = resolve(angleTarget ?? bareTarget);
     return token ? `<img src="${escapeAttribute(token)}" caption="${escapeAttribute(label)}"/>` : whole;
   }));
 }
@@ -191,7 +196,7 @@ export function restoreAssetReferences(content: string, reverseMap: Map<string, 
     if (!path) return whole;
     const label = attributes.match(/caption="([^"]*)"/)?.[1] ?? "";
     const relativePath = currentPath ? relativeReferencePath(currentPath, path) : path;
-    return `![${label}](${relativePath})`;
+    return `![${sanitizeLabel(label)}](${encodeReference(relativePath)})`;
   });
 }
 
@@ -199,14 +204,51 @@ function escapeAttribute(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Undo a percent-encoding that never survives a drive round trip unchanged.
+ *  An invalid sequence (a lone `%`) is left as written rather than throwing. */
+function decodeReference(value: string): string {
+  try {
+    return decodeURI(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Turn a link target into the plain, NFC-normalised relative path used as the
+ *  key of the link maps. Without the decode step a remote `my%20doc.md` or a
+ *  percent-encoded CJK name could never find its entry. */
 function normalizeReferencePath(value: string): string {
-  const normalized = posix.normalize(value.replace(/\\/g, "/").replace(/^\.\//, ""));
+  const decoded = decodeReference(value).normalize("NFC");
+  const normalized = posix.normalize(decoded.replace(/\\/g, "/").replace(/^\.\//, ""));
   return normalized.startsWith("/") ? normalized.slice(1) : normalized;
+}
+
+/** Escape a local relative path for use as a markdown link target. `encodeURI`
+ *  covers spaces and non-ASCII; parentheses are escaped by hand because they
+ *  terminate the link, and `[`/`]` because they terminate the label. */
+function encodeReference(path: string): string {
+  return encodeURI(path.normalize("NFC")).replace(/[()\[\]]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/** Strip characters that would break out of an inline link's label. */
+function sanitizeLabel(label: string): string {
+  return label.replace(/[\[\]\r\n]/g, " ").trim();
 }
 
 function relativeReferencePath(currentPath: string, targetPath: string): string {
   const relativePath = posix.relative(posix.dirname(currentPath), targetPath).replace(/\\/g, "/");
   return relativePath || posix.basename(targetPath);
+}
+
+/** Resolve a link/asset target written inside `currentPath` to the relative path
+ *  of the file it points at. Percent-encoding and Unicode normalisation are
+ *  undone first (B6), so a target that came back from the drive still finds the
+ *  local file it names. The raw `MarkdownLink.target` stays as written. */
+export function resolveReferencePath(currentPath: string, target: string): string {
+  const cleanTarget = target.split("#", 1)[0]?.split("?", 1)[0] ?? target;
+  const normalized = normalizeReferencePath(cleanTarget);
+  const joined = posix.join(posix.dirname(currentPath), normalized);
+  return posix.normalize(joined === "" ? "." : joined).replace(/^\.\//, "");
 }
 
 function isInsideFence(content: string, index: number): boolean {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FeishuOpenApiProvider, FeishuApiError, parseRetryAfterMs } from "../src/index.js";
+import { FeishuOpenApiProvider, FeishuApiError, FeishuOAuthError, parseRetryAfterMs } from "../src/index.js";
 import type { UserTokenUpdate } from "../src/index.js";
 import type { SyncRoot } from "@feishu-sync/core";
 
@@ -157,7 +157,9 @@ test("parses the flat create_folder response and soft-deletes with a type", asyn
   assert.match(deleted.path, /type=folder$/);
 });
 
-test("returns a stub document when the post-create read fails", async () => {
+// B2 moved creation to a two-step flow; this case pins the escape hatch that
+// keeps the old single `docs_ai` import call reachable (`legacyCreateDocument`).
+test("legacy creation still returns a stub document when the post-create read fails", async () => {
   let createCalls = 0;
   const fetchImpl: typeof fetch = async (input) => {
     const url = new URL(String(input));
@@ -170,13 +172,148 @@ test("returns a stub document when the post-create read fails", async () => {
     }
     throw new Error(`unexpected request: ${url.pathname}`);
   };
-  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", legacyCreateDocument: true, fetchImpl });
   // The document exists remotely; a failed follow-up read must not throw or
   // the caller would re-create a duplicate on the next attempt.
   const created = await provider.createDocument("fld-parent", "notes", "# Notes\n\nbody");
   assert.equal(created.token, "doc-new");
   assert.equal(created.content, "");
   assert.equal(createCalls, 1);
+});
+
+test("creates with an explicit title first, then overwrites the markdown body (B2)", async () => {
+  const calls: Array<{ method: string; path: string; body?: string }> = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const body = init?.body === undefined ? undefined : String(init.body);
+    calls.push({ method: init?.method ?? "GET", path: url.pathname, body });
+    if (url.pathname === "/open-apis/docx/v1/documents" && init?.method === "POST") {
+      return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: 1, title: "notes" } } });
+    }
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new" && init?.method === "PUT") {
+      return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: 2 } } });
+    }
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new/fetch") {
+      return json({ code: 0, data: { document: { document_id: "doc-new", title: "notes", revision_id: 2, content: "# Notes\n\nbody" } } });
+    }
+    if (url.pathname === "/open-apis/docx/v1/documents/doc-new/blocks") return json({ code: 0, data: { items: [], has_more: false } });
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
+  const created = await provider.createDocument("fld-parent", "notes", "# Notes\n\nbody");
+  // Step 1 carries the title, which is what makes the drive name a function of
+  // the file name instead of the markdown H1.
+  assert.deepEqual(calls.map((call) => `${call.method} ${call.path}`), [
+    "POST /open-apis/docx/v1/documents",
+    "PUT /open-apis/docs_ai/v1/documents/doc-new",
+    "POST /open-apis/docs_ai/v1/documents/doc-new/fetch",
+    "GET /open-apis/docx/v1/documents/doc-new/blocks"
+  ]);
+  const create = calls[0]!;
+  assert.match(create.body ?? "", /"title":"notes"/);
+  assert.match(create.body ?? "", /"folder_token":"fld-parent"/);
+  assert.match(calls[1]!.body ?? "", /"command":"overwrite"/);
+  assert.equal(created.token, "doc-new");
+  assert.equal(created.name, "notes");
+  assert.equal(created.content, "# Notes\n\nbody");
+});
+
+test("an empty content skips the overwrite call entirely (B2)", async () => {
+  const paths: string[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    paths.push(`${init?.method ?? "GET"} ${url.pathname}`);
+    if (url.pathname === "/open-apis/docx/v1/documents") return json({ code: 0, data: { document: { document_id: "doc-empty", revision_id: 1, title: "blank" } } });
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
+  const created = await provider.createDocument("fld-parent", "blank", "");
+  assert.deepEqual(paths, ["POST /open-apis/docx/v1/documents"]);
+  assert.equal(created.token, "doc-empty");
+  assert.equal(created.content, "");
+});
+
+test("a failed content push still returns the token so the binding can be persisted (B2)", async () => {
+  const paths: string[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    paths.push(`${init?.method ?? "GET"} ${url.pathname}`);
+    if (url.pathname === "/open-apis/docx/v1/documents") return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: 1, title: "notes" } } });
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new") return json({ code: 9499, msg: "Invalid parameter" });
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
+  const created = await provider.createDocument("fld-parent", "notes", "# Notes\n\nbody");
+  assert.equal(created.token, "doc-new");
+  assert.equal(created.name, "notes");
+  assert.equal(created.content, "", "the stub reports an empty body, so the next round re-pushes");
+  assert.deepEqual(paths, ["POST /open-apis/docx/v1/documents", "PUT /open-apis/docs_ai/v1/documents/doc-new"]);
+});
+
+test("buildAuthorizeUrl targets the accounts host with offline_access and state (C2)", () => {
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", baseUrl: "https://open.feishu.cn" });
+  const url = new URL(provider.buildAuthorizeUrl({
+    appId: "cli_x",
+    redirectUri: "http://127.0.0.1:8790/oauth/callback",
+    state: "st-1"
+  }));
+  assert.equal(url.origin, "https://accounts.feishu.cn");
+  assert.equal(url.pathname, "/open-apis/authen/v1/authorize");
+  assert.equal(url.searchParams.get("client_id"), "cli_x");
+  assert.equal(url.searchParams.get("scope"), "offline_access");
+  assert.equal(url.searchParams.get("state"), "st-1");
+  assert.equal(url.searchParams.get("redirect_uri"), "http://127.0.0.1:8790/oauth/callback");
+
+  // Lark tenants must authorize against their own accounts host.
+  const lark = new FeishuOpenApiProvider({ accessToken: "token", baseUrl: "https://open.larksuite.com" });
+  assert.match(lark.buildAuthorizeUrl({ appId: "cli_x", redirectUri: "http://127.0.0.1:1/cb", state: "s" }), /^https:\/\/accounts\.larksuite\.com\//);
+});
+
+test("exchangeAuthorizationCode posts the code and returns both tokens (C2)", async () => {
+  const requests: Array<{ url: URL; body: string }> = [];
+  const provider = new FeishuOpenApiProvider({
+    appId: "cli_x",
+    appSecret: "secret",
+    fetchImpl: async (input, init) => {
+      const url = new URL(String(input));
+      requests.push({ url, body: String(init?.body ?? "") });
+      return json({ code: 0, access_token: "at-new", expires_in: 7200, refresh_token: "rt-new", refresh_token_expires_in: 604800, scope: "offline_access docx" });
+    }
+  });
+  const tokens = await provider.exchangeAuthorizationCode({ code: "code-1", redirectUri: "http://127.0.0.1:8790/oauth/callback" });
+  assert.equal(requests.length, 1, "the exchange is a single request");
+  assert.equal(requests[0]!.url.host, "accounts.feishu.cn");
+  assert.equal(requests[0]!.url.pathname, "/oauth/v3/token");
+  const form = new URLSearchParams(requests[0]!.body);
+  assert.equal(form.get("grant_type"), "authorization_code");
+  assert.equal(form.get("code"), "code-1");
+  assert.equal(form.get("client_id"), "cli_x");
+  assert.equal(form.get("client_secret"), "secret");
+  assert.equal(form.get("redirect_uri"), "http://127.0.0.1:8790/oauth/callback");
+  assert.equal(tokens.accessToken, "at-new");
+  assert.equal(tokens.refreshToken, "rt-new");
+  assert.ok(tokens.tokenExpiresAt > Date.now());
+  assert.ok(tokens.refreshTokenExpiresAt && tokens.refreshTokenExpiresAt > tokens.tokenExpiresAt);
+  assert.equal(tokens.scope, "offline_access docx");
+});
+
+test("a rejected authorization code surfaces a Chinese hint and never persists tokens (C2)", async () => {
+  const provider = new FeishuOpenApiProvider({
+    appId: "cli_x",
+    appSecret: "secret",
+    fetchImpl: async () => json({ code: 20071, error: "redirect_uri mismatch", error_description: "invalid redirect_uri" })
+  });
+  const error = await provider.exchangeAuthorizationCode({ code: "c", redirectUri: "http://127.0.0.1:8790/oauth/callback" })
+    .then(() => undefined, (caught: unknown) => caught);
+  assert.ok(error instanceof FeishuOAuthError);
+  assert.equal(error.code, 20071);
+  assert.match(error.message, /重定向 URL/);
+
+  // Without app credentials the call must fail before touching the network.
+  let touched = 0;
+  const blind = new FeishuOpenApiProvider({ fetchImpl: async () => { touched += 1; return json({ code: 0 }); } });
+  await assert.rejects(blind.exchangeAuthorizationCode({ code: "c", redirectUri: "http://127.0.0.1/x" }), /App Secret/);
+  assert.equal(touched, 0);
 });
 
 test("classifies Feishu failures into semantic kinds", async () => {

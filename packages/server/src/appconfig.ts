@@ -13,7 +13,17 @@ export interface AppConfigPreferences {
    *  preference follows the user across browsers instead of per-device
    *  localStorage. No sound option is provided (explicitly out of scope). */
   notifications: NotificationPreferences;
+  /** Delivery channel for those notifications. `none` is the default: this is a
+   *  desktop workbench whose badges and task centre already show every failure,
+   *  and popping OS notifications on top of that was noise. The per-category
+   *  `notifications` switches only apply once a channel other than `none` is
+   *  selected. */
+  notificationChannel: NotificationChannel;
 }
+
+export type NotificationChannel = "none" | "browser" | "feishu-bot";
+
+export const NOTIFICATION_CHANNELS: readonly NotificationChannel[] = ["none", "browser", "feishu-bot"];
 
 /** Per-category notification toggles (B6.8). */
 export interface NotificationPreferences {
@@ -30,8 +40,16 @@ export interface AppConfigDocument {
   preferences: AppConfigPreferences;
 }
 
-export const DEFAULT_NOTIFICATIONS: NotificationPreferences = { conflict: true, failure: true, credential: true };
-export const DEFAULT_PREFERENCES: AppConfigPreferences = { defaultPollIntervalMs: 15000, logLevel: "info", notifications: { ...DEFAULT_NOTIFICATIONS } };
+/** Default off (D4): notifications must be opted into, never imposed. Existing
+ *  configs that stored `true` stay harmless — with `notificationChannel: "none"`
+ *  nothing is delivered regardless, so no data migration is needed. */
+export const DEFAULT_NOTIFICATIONS: NotificationPreferences = { conflict: false, failure: false, credential: false };
+export const DEFAULT_PREFERENCES: AppConfigPreferences = {
+  defaultPollIntervalMs: 15000,
+  logLevel: "info",
+  notifications: { ...DEFAULT_NOTIFICATIONS },
+  notificationChannel: "none"
+};
 export const LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
 
 /** Auth lifecycle flags: shared literal keys so the runtime, the credential
@@ -69,7 +87,7 @@ export class AppConfigStore implements AuthStateStore {
   }
 
   /** Validate and persist a preferences patch; returns the effective values. */
-  async setPreferences(patch: { defaultPollIntervalMs?: number; logLevel?: LogLevel; notifications?: Partial<NotificationPreferences> }): Promise<AppConfigPreferences> {
+  async setPreferences(patch: { defaultPollIntervalMs?: number; logLevel?: LogLevel; notifications?: Partial<NotificationPreferences>; notificationChannel?: NotificationChannel }): Promise<AppConfigPreferences> {
     const doc = this.doc();
     if (patch.defaultPollIntervalMs !== undefined) {
       const value = patch.defaultPollIntervalMs;
@@ -86,6 +104,12 @@ export class AppConfigStore implements AuthStateStore {
     }
     if (patch.notifications !== undefined) {
       doc.preferences.notifications = { ...DEFAULT_NOTIFICATIONS, ...doc.preferences.notifications, ...patch.notifications };
+    }
+    if (patch.notificationChannel !== undefined) {
+      if (!NOTIFICATION_CHANNELS.includes(patch.notificationChannel)) {
+        throw Object.assign(new Error(`notificationChannel must be one of ${NOTIFICATION_CHANNELS.join(", ")}`), { statusCode: 400 });
+      }
+      doc.preferences.notificationChannel = patch.notificationChannel;
     }
     this.flush();
     return this.preferences;

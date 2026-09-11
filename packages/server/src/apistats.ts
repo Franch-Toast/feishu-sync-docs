@@ -65,41 +65,45 @@ export class ApiCallStats {
  * Wrap a provider so every remote call is tallied.
  *
  * `name` / `capabilities` stay live getters: the credential-backed registry
- * resolves them lazily, so copying the values would freeze a stale view.
+ * resolves them lazily, so copying the values would freeze a stale view. The
+ * methods are looked up on the delegate *per call* for the same reason — a
+ * provider patched or swapped after wrapping (an embedded host, a test that
+ * injects a failure into `createDocument`) has to stay patchable; binding the
+ * function once at wrap time silently routes those calls around the injection.
  */
 export function instrumentRemote(remote: RemoteProvider, stats: ApiCallStats): RemoteProvider {
-  const wrap = <Args extends unknown[], Result>(method: string, fn: ((...args: Args) => Promise<Result>) | undefined) => {
-    if (!fn) return undefined;
-    const bound = fn.bind(remote);
-    return async (...args: Args): Promise<Result> => {
+  const wrap = <Args extends unknown[], Result>(method: keyof RemoteProvider) =>
+    async (...args: Args): Promise<Result> => {
+      const delegate = remote[method] as unknown as ((...callArgs: Args) => Promise<Result>) | undefined;
+      if (typeof delegate !== "function") throw new Error(`Provider ${remote.name} does not implement ${String(method)}`);
       const started = Date.now();
       try {
-        const result = await bound(...args);
-        stats.record(method, { ok: true, durationMs: Date.now() - started });
+        const result = await delegate.apply(remote, args);
+        stats.record(String(method), { ok: true, durationMs: Date.now() - started });
         return result;
       } catch (error) {
         const rateLimited = error instanceof FeishuApiError && error.httpStatus === 429;
-        stats.record(method, { ok: false, durationMs: Date.now() - started, rateLimited });
+        stats.record(String(method), { ok: false, durationMs: Date.now() - started, rateLimited });
         throw error;
       }
     };
-  };
 
   const instrumented: RemoteProvider = {
     get name() { return remote.name; },
     get capabilities() { return remote.capabilities; },
-    listTree: wrap("listTree", remote.listTree)!,
-    getDocument: wrap("getDocument", remote.getDocument)!,
-    createFolder: wrap("createFolder", remote.createFolder)!,
-    createDocument: wrap("createDocument", remote.createDocument)!,
-    applyPatch: wrap("applyPatch", remote.applyPatch)!,
-    uploadAsset: wrap("uploadAsset", remote.uploadAsset)!,
-    downloadAsset: wrap("downloadAsset", remote.downloadAsset)!,
-    softDelete: wrap("softDelete", remote.softDelete)!
+    listTree: wrap("listTree"),
+    getDocument: wrap("getDocument"),
+    createFolder: wrap("createFolder"),
+    createDocument: wrap("createDocument"),
+    applyPatch: wrap("applyPatch"),
+    uploadAsset: wrap("uploadAsset"),
+    downloadAsset: wrap("downloadAsset"),
+    softDelete: wrap("softDelete")
   };
-  // Optional capability: only expose it when the underlying provider has it,
-  // otherwise callers' `if (remote.uploadInlineAsset)` feature check would lie.
-  const uploadInlineAsset = wrap("uploadInlineAsset", remote.uploadInlineAsset);
-  if (uploadInlineAsset) instrumented.uploadInlineAsset = uploadInlineAsset;
+  // Optional capability: only exposed when the underlying provider has it, so
+  // callers' `if (remote.uploadInlineAsset)` feature check — and even `"in"` —
+  // keeps telling the truth about provider support. Dispatch inside `wrap` is
+  // still resolved per call, so replacing the implementation works.
+  if (remote.uploadInlineAsset) instrumented.uploadInlineAsset = wrap("uploadInlineAsset");
   return instrumented;
 }

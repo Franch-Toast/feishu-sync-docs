@@ -39,6 +39,17 @@ export interface Entry {
   ignoredAt?: string;
 }
 
+/** A4: what one sync round did, shown as badges on the round task. */
+export interface RoundSummary {
+  scanned: number;
+  pushed: number;
+  pulled: number;
+  merged: number;
+  conflicts: number;
+  failed: number;
+  skipped: number;
+}
+
 export interface Operation {
   id: string;
   entryId?: string;
@@ -53,6 +64,11 @@ export interface Operation {
   error?: string;
   /** Semantic failure bucket driving task-center guidance and retry policy. */
   errorCategory?: ErrorCategory;
+  /** A3: a failed record stays in「失败待处理」until the user retries or ignores
+   *  it. Absent means true, matching records written before the field existed. */
+  needsAction?: boolean;
+  /** A4: per-round counters on a `sync-round` record. */
+  summary?: RoundSummary;
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
@@ -98,7 +114,36 @@ export interface ValidatePathResult {
   exclude?: string[];
   /** Whether the service can write .feishu-sync/.git and pulled edits there. */
   writable?: boolean;
+  /** G6: what the directory already carries, so the bind form can warn first. */
+  hasGit?: boolean;
+  gitBranch?: string;
+  hasMeta?: boolean;
+  /** rootId recorded in `<path>/.feishu-sync/state.json`, if any. */
+  metaRootId?: string;
+  /** Metadata exists but no live root owns it — a deleted root's leftovers. */
+  orphanMeta?: boolean;
+  /** rootId of the sync root already bound to this directory. */
+  boundRootId?: string;
+  /** `.gitignore` already lists `.feishu-sync/`. */
+  metaIgnored?: boolean;
   error?: string;
+}
+
+/** C2: `GET /api/oauth/start` — where to send the browser and what to expect back. */
+export interface OAuthStartResult {
+  url: string;
+  state: string;
+  redirectUri: string;
+}
+
+/** C2: the outcome of a completed authorization-code exchange. */
+export interface OAuthCompleteResult {
+  ok: true;
+  expiresAt: string;
+  /** False means the app lacks `offline_access`: no auto-renewal. */
+  refreshTokenReceived: boolean;
+  scope?: string;
+  settings?: RedactedSettings;
 }
 
 export interface Conflict {
@@ -112,6 +157,12 @@ export interface Conflict {
   createdAt: string;
   resolvedAt?: string;
   resolution?: Resolution;
+  /** Why the entry needs a human (B3/B4), e.g. 远端同名文档已绑定到另一路径. */
+  reason?: string;
+  /** B4: set when the conflict is a title collision — the remote document that
+   *  already owns the derived title, and the entry it is bound to. */
+  collidingToken?: string;
+  collidingOwnerPath?: string;
   /** Joined server-side for display. */
   relativePath?: string;
   localRoot?: string;
@@ -194,17 +245,23 @@ export interface RootPatch {
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
-/** Per-category in-app notification toggles, stored server-side (B6.8). */
+/** Per-category notification toggles, stored server-side (B6.8). They only
+ *  matter once a channel is selected, and every one defaults to off (D). */
 export interface NotificationPreferences {
   conflict: boolean;
   failure: boolean;
   credential: boolean;
 }
 
+/** D: where notifications go. `none` is the default; `feishu-bot` is a
+ *  placeholder the server exposes but does not deliver through yet. */
+export type NotificationChannel = "none" | "browser" | "feishu-bot";
+
 export interface AppConfigPreferences {
   defaultPollIntervalMs: number;
   logLevel: LogLevel;
   notifications: NotificationPreferences;
+  notificationChannel: NotificationChannel;
 }
 
 /** GET /api/app-config: global preferences plus the resolved storage paths. */
@@ -218,6 +275,7 @@ export interface AppConfigPatch {
   logLevel?: LogLevel;
   /** Partial: only the named categories are flipped. */
   notifications?: Partial<NotificationPreferences>;
+  notificationChannel?: NotificationChannel;
 }
 
 export interface EntryContent {
@@ -336,8 +394,11 @@ function queryString(params: Record<string, string | number | undefined>): strin
 export const api = {
   // roots
   listRoots: () => json<Root[]>("/api/roots"),
-  createRoot: (input: { localPath: string; remoteToken: string; remoteType?: "folder" | "wiki"; pollIntervalMs?: number; mode?: SyncMode; exclude?: string[] }) =>
-    json<Root>("/api/roots", { method: "POST", body: JSON.stringify(input) }),
+  createRoot: (input: { localPath: string; remoteToken: string; remoteType?: "folder" | "wiki"; pollIntervalMs?: number; mode?: SyncMode; exclude?: string[]; metadataAction?: "adopt" | "reset" }) =>
+    // G1: re-binding a directory that is already bound answers 200 with
+    // `{ reused, root }` instead of creating a second root over the same
+    // `.feishu-sync` directory.
+    json<Root | { reused: true; root: Root }>("/api/roots", { method: "POST", body: JSON.stringify(input) }),
   patchRoot: (id: string, patch: RootPatch) =>
     json<Root>(`/api/roots/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   deleteRoot: (id: string) => json<void>(`/api/roots/${id}`, { method: "DELETE" }),
@@ -373,6 +434,12 @@ export const api = {
   saveSettings: (patch: CredentialPatch) =>
     json<SettingsSaveResult>("/api/settings", { method: "PUT", body: JSON.stringify(patch) }),
   testConnection: (patch?: CredentialPatch) => post<TestConnectionResult>("/api/settings/test-connection", patch ?? {}),
+  /** C2: ask the server to open an authorization-code flow. The URL is a
+   *  first-party Feishu page; the loopback callback is handled server-side. */
+  oauthStart: () => json<OAuthStartResult>("/api/oauth/start"),
+  /** C2: fallback when the browser cannot reach the loopback callback — paste
+   *  the `code` from the redirect URL by hand. */
+  oauthCode: (code: string) => post<OAuthCompleteResult>("/api/oauth/code", { code }),
   // global preferences (config.json)
   getAppConfig: () => json<AppConfigView>("/api/app-config"),
   saveAppConfig: (patch: AppConfigPatch) =>
@@ -483,7 +550,17 @@ export const NOTIFICATION_LABELS: Record<keyof NotificationPreferences, { label:
 };
 
 /** Fallback used before config.json resolves; mirrors the server default. */
-export const DEFAULT_NOTIFICATIONS: NotificationPreferences = { conflict: true, failure: true, credential: true };
+export const DEFAULT_NOTIFICATIONS: NotificationPreferences = { conflict: false, failure: false, credential: false };
+
+/** D: the channel radio in the settings page. Only `none` and `browser` are
+ *  real today; `feishu-bot` is shown as 即将支持 so the roadmap is honest. */
+export const NOTIFICATION_CHANNEL_LABELS: Record<NotificationChannel, { label: string; hint: string }> = {
+  none: { label: "已关闭", hint: "不发送任何通知，只在工作台内显示徽章与列表" },
+  browser: { label: "浏览器通知", hint: "由服务端统一投递（当前落到服务日志），不再向浏览器申请弹窗权限" },
+  "feishu-bot": { label: "飞书机器人（即将支持）", hint: "推送到群自定义机器人，接入位置：packages/server/src/notify-feishu-bot.ts" }
+};
+
+export const DEFAULT_NOTIFICATION_CHANNEL: NotificationChannel = "none";
 
 /** Per-method remote API counters behind the settings-page tally (B6.2). */
 export interface ApiMethodStats {

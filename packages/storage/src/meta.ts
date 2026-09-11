@@ -45,11 +45,39 @@ export class JsonMetaStorage implements MetaStorage {
   // ============================================================================
 
   async createRoot(input: Omit<SyncRoot, 'id'>): Promise<SyncRoot> {
-    const root: SyncRoot = { id: randomUUID(), ...input };
     const roots = await this.listRoots();
+    const localPath = await canonicalLocalPath(input.localPath);
+    // G1: one directory can only have one root. Metadata lives in
+    // `<localPath>/.feishu-sync`, so a second record for the same directory
+    // would silently share and overwrite the first one's bindings. Re-binding
+    // the same path therefore reuses the existing record.
+    const existing = roots.find((r) => r.localPath === localPath);
+    if (existing) {
+      return this.updateRoot(existing.id, { ...input, localPath });
+    }
+    const root: SyncRoot = { id: randomUUID(), ...input, localPath };
     roots.push(root);
     await this.writeJson(this.getRootsPath(), roots);
     return root;
+  }
+
+  /** The root already bound to this directory, if any (G1/G6). */
+  async findRootByLocalPath(localPath: string): Promise<SyncRoot | undefined> {
+    const resolved = await canonicalLocalPath(localPath);
+    const roots = await this.listRoots();
+    for (const root of roots) {
+      if (root.localPath === resolved || (await canonicalLocalPath(root.localPath)) === resolved) return root;
+    }
+    return undefined;
+  }
+
+  /** The retired root id recorded inside `<localPath>/.feishu-sync/state.json`
+   *  when no live root owns it any more — an orphan metadata directory (G3). */
+  async findOrphanMetaOwner(localPath: string): Promise<string | undefined> {
+    const state = await this.readJson<Partial<RootState>>(path.join(await canonicalLocalPath(localPath), '.feishu-sync', 'state.json'), {});
+    if (!state?.rootId) return undefined;
+    const roots = await this.listRoots();
+    return roots.some((r) => r.id === state.rootId) ? undefined : state.rootId;
   }
 
   async listRoots(): Promise<SyncRoot[]> {
@@ -74,8 +102,18 @@ export class JsonMetaStorage implements MetaStorage {
 
   async deleteRoot(id: string): Promise<void> {
     const roots = await this.listRoots();
+    const target = roots.find((r) => r.id === id);
     const filtered = roots.filter((r) => r.id !== id);
     await this.writeJson(this.getRootsPath(), filtered);
+    if (target) {
+      const resolved = await canonicalLocalPath(target.localPath);
+      const stillClaimed = filtered.some((r) => r.localPath === resolved || r.localPath === target.localPath);
+      if (stillClaimed) {
+        // Another root still owns the directory's metadata; forget it, never wipe it.
+        this.metaDirs.delete(id);
+        return;
+      }
+    }
     await this.deleteRootMeta(id);
   }
 
@@ -106,18 +144,81 @@ export class JsonMetaStorage implements MetaStorage {
         await this.writeJson(filePath, file.default);
       }
     }
+
+    // G2: the metadata belongs to the directory, not to one record. `state.json`
+    // names its owner; when that differs from the root being initialised the
+    // previous record was deleted and this one takes the history over instead of
+    // starting from scratch next to a stale copy.
+    const state = await this.readJson<Partial<RootState>>(path.join(metaDir, 'state.json'), {});
+    if (state.rootId && state.rootId !== rootId) {
+      await this.migrateMetaOwnership(state.rootId, rootId, metaDir);
+    }
+    if (state.rootId !== rootId || state.localPath !== localPath) {
+      await this.writeJson(path.join(metaDir, 'state.json'), { ...state, rootId, localPath, initialized: true });
+    }
   }
 
+  /** G2: rewrite every persisted `rootId` from the retired root to the new one,
+   *  after copying the originals into `backup-<timestamp>/`. Bindings are keyed
+   *  by relative path but carry a `rootId` field, and operations/records carry
+   *  theirs; conflicts and blocks are keyed by entryId and therefore survive
+   *  untouched. */
+  private async migrateMetaOwnership(fromRootId: string, toRootId: string, metaDir: string): Promise<void> {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupDir = path.join(metaDir, `backup-${stamp}`);
+    await fsp.mkdir(backupDir, { recursive: true });
+    const rewrite = async (name: string, visit: (record: unknown) => unknown) => {
+      const filePath = path.join(metaDir, name);
+      if (!await this.fileExists(filePath)) return;
+      await fsp.copyFile(filePath, path.join(backupDir, name));
+      await this.writeJson(filePath, visit(await this.readJson<unknown>(filePath, null)));
+    };
+    await rewrite('bindings.json', (raw) => {
+      const map = (raw ?? {}) as Record<string, EntryBinding>;
+      return Object.fromEntries(Object.entries(map).map(([key, binding]) =>
+        [key, binding && binding.rootId === fromRootId ? { ...binding, rootId: toRootId } : binding]));
+    });
+    await rewrite('operations.json', (raw) => {
+      const list = Array.isArray(raw) ? (raw as Array<OperationRecord>) : [];
+      return list.map((item) => (item && item.rootId === fromRootId ? { ...item, rootId: toRootId } : item));
+    });
+  }
+
+  /** G5: retiring a root never destroys user data. The metadata is moved into a
+   *  timestamped backup inside its own directory, and `.git` is untouched. */
   async deleteRootMeta(rootId: string): Promise<void> {
     const metaDir = this.metaDirs.get(rootId);
-    if (metaDir) {
-      try {
-        await fsp.rm(metaDir, { recursive: true, force: true });
-      } catch {
-        // Directory may not exist
+    if (!metaDir) return;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupName = `backup-${stamp}`;
+    try {
+      await fsp.mkdir(path.join(metaDir, backupName), { recursive: true });
+      for (const entry of await fsp.readdir(metaDir)) {
+        if (entry.startsWith('backup-')) continue;
+        await fsp.rename(path.join(metaDir, entry), path.join(metaDir, backupName, entry));
       }
-      this.metaDirs.delete(rootId);
+    } catch {
+      // Directory may not exist; nothing to retire.
     }
+    this.metaDirs.delete(rootId);
+  }
+
+  /** G3: the bind form's「重新绑定」choice. Everything currently in the directory's
+   *  `.feishu-sync/` (including a state.json owned by a deleted root) is moved
+   *  into `backup-<timestamp>/`, so the next `initRootMeta` starts from a clean
+   *  slate instead of adopting history the user just rejected. Nothing is
+   *  deleted and `.git` is never touched. */
+  async archiveRootMeta(localPath: string): Promise<boolean> {
+    const metaDir = path.join(localPath, '.feishu-sync');
+    if (!await this.fileExists(metaDir)) return false;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupName = `backup-${stamp}`;
+    await fsp.mkdir(path.join(metaDir, backupName), { recursive: true });
+    for (const entry of await fsp.readdir(metaDir)) {
+      if (entry === backupName || entry.startsWith('backup-')) continue;
+      await fsp.rename(path.join(metaDir, entry), path.join(metaDir, backupName, entry));
+    }
+    return true;
   }
 
   // ============================================================================
@@ -261,7 +362,7 @@ export class JsonMetaStorage implements MetaStorage {
     return operation;
   }
 
-  async updateOperation(id: string, patch: Partial<Pick<OperationRecord, 'status' | 'error' | 'errorCategory' | 'completedAt' | 'startedAt' | 'retryCount' | 'maxRetries' | 'direction' | 'trigger'>>): Promise<OperationRecord> {
+  async updateOperation(id: string, patch: Partial<Pick<OperationRecord, 'status' | 'error' | 'errorCategory' | 'completedAt' | 'startedAt' | 'retryCount' | 'maxRetries' | 'direction' | 'trigger' | 'needsAction' | 'summary'>>): Promise<OperationRecord> {
     for (const metaDir of this.metaDirs.values()) {
       const opsPath = path.join(metaDir, 'operations.json');
       const ops = await this.readJson<OperationRecord[]>(opsPath, []);
@@ -279,7 +380,7 @@ export class JsonMetaStorage implements MetaStorage {
 
   async listOperations(options: number | ListOperationsOptions = {}): Promise<OperationRecord[]> {
     const opts: ListOperationsOptions = typeof options === 'number' ? { limit: options } : options;
-    const { rootId, limit = 100, cursor, status, trigger, errorCategory } = opts;
+    const { rootId, limit = 100, cursor, status, trigger, errorCategory, needsAction } = opts;
     const allOps: OperationRecord[] = [];
     for (const [rid, metaDir] of this.metaDirs) {
       // Scope to a single root's ring buffer when the caller filters by root.
@@ -291,7 +392,10 @@ export class JsonMetaStorage implements MetaStorage {
     const filtered = allOps.filter((op) =>
       (status === undefined || op.status === status)
       && (trigger === undefined || op.trigger === trigger)
-      && (errorCategory === undefined || op.errorCategory === errorCategory));
+      && (errorCategory === undefined || op.errorCategory === errorCategory)
+      // Records written before `needsAction` existed are treated as awaiting a
+      // human, so an upgrade never empties the「失败待处理」queue.
+      && (needsAction === undefined || (op.needsAction ?? true) === needsAction));
     // Newest first; tie-break on id so cursor paging is stable across equal timestamps.
     const sorted = filtered.sort((a, b) =>
       new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
@@ -378,7 +482,7 @@ export class JsonMetaStorage implements MetaStorage {
     return filtered.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 
-  async updateConflict(id: string, patch: Partial<Pick<ConflictRecord, 'baseContent' | 'localContent' | 'remoteContent' | 'mergedContent' | 'remoteRevision' | 'remoteContentHash'>>): Promise<ConflictRecord> {
+  async updateConflict(id: string, patch: Partial<Pick<ConflictRecord, 'baseContent' | 'localContent' | 'remoteContent' | 'mergedContent' | 'remoteRevision' | 'remoteContentHash' | 'reason' | 'collidingToken' | 'collidingOwnerPath'>>): Promise<ConflictRecord> {
     for (const metaDir of this.metaDirs.values()) {
       const conflictPath = path.join(metaDir, 'conflicts', `${id}.json`);
       if (await this.fileExists(conflictPath)) {
@@ -619,5 +723,18 @@ export class JsonMetaStorage implements MetaStorage {
     const tmpPath = `${filePath}.tmp`;
     await fsp.writeFile(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
     await fsp.rename(tmpPath, filePath); // Atomic write
+  }
+}
+
+/** Resolve a directory to the form roots.json should store: absolute, with
+ *  symlinks followed, so `/tmp/x` and `/private/tmp/x` are one and the same
+ *  directory and cannot host two roots. Falls back to the plain resolution for
+ *  paths that do not exist yet. */
+async function canonicalLocalPath(localPath: string): Promise<string> {
+  const resolved = path.resolve(localPath);
+  try {
+    return await fsp.realpath(resolved);
+  } catch {
+    return resolved;
   }
 }

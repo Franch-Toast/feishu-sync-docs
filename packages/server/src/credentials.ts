@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import type { FastifyBaseLogger } from "fastify";
 import { FeishuOpenApiProvider, LarkCliProvider } from "@feishu-sync/feishu";
@@ -82,6 +83,23 @@ const DEFAULT_GUIDE_TENANT = "https://open.feishu.cn/app";
 /** Optional hook for probing the lark-cli executable; tests inject a fake. */
 export type CliProbe = (executable: string) => Promise<void>;
 
+/** What `GET /api/oauth/start` hands the browser. */
+export interface OAuthStartResult {
+  /** Feishu authorization page to open in a new tab. */
+  url: string;
+  state: string;
+  redirectUri: string;
+}
+
+/** What a completed authorization reports back to the workbench. */
+export interface OAuthCompleteResult {
+  ok: true;
+  expiresAt: string;
+  /** False when the app lacks `offline_access`, i.e. no auto-renewal. */
+  refreshTokenReceived: boolean;
+  scope?: string;
+}
+
 /** Persists Feishu credentials in the AppConfigStore (config.json) with
  *  env-var fallback, builds providers from the resolved config and runs
  *  lightweight connectivity probes. */
@@ -89,6 +107,10 @@ export class CredentialStore {
   private readonly fetchImpl: typeof fetch;
   private readonly probeCli?: CliProbe;
   private readonly logger?: FastifyBaseLogger;
+  /** In-flight authorization-code attempts, keyed by CSRF `state`. */
+  private readonly pendingOAuth = new Map<string, { redirectUri: string; createdAt: number }>();
+  private lastOAuthRedirectUri?: string;
+  private static readonly OAUTH_STATE_TTL_MS = 10 * 60_000;
 
   constructor(private readonly config: AppConfigStore, fetchImpl?: typeof fetch, probeCli?: CliProbe, logger?: FastifyBaseLogger) {
     this.fetchImpl = fetchImpl ?? fetch;
@@ -139,6 +161,10 @@ export class CredentialStore {
       refreshToken: config.refreshToken,
       appId: config.appId,
       appSecret: config.appSecret,
+      // The same transport the store was built with: an injected fetch (tests,
+      // embedded hosts, a proxy) must also cover the token endpoint, otherwise a
+      // refresh or an authorization-code exchange silently bypasses it.
+      fetchImpl: this.fetchImpl,
       onTokenRefresh: (update) => this.persistUserTokenUpdate(update),
       onRefreshInvalid: (reason) => this.handleRefreshInvalid(reason)
     });
@@ -180,10 +206,65 @@ export class CredentialStore {
     }
   }
 
+  /** C2: start an OAuth 2.0 authorization-code flow. The `state` and the exact
+   *  `redirectUri` we advertised live in memory only — they are CSRF guards and
+   *  a token-exchange parameter, never durable configuration. */
+  async beginOAuth(redirectUri: string): Promise<OAuthStartResult> {
+    const config = await this.load();
+    if (!config.appId || !config.appSecret) {
+      throw Object.assign(new Error("前往飞书授权前需要先填写 App ID 与 App Secret"), { statusCode: 400 });
+    }
+    const state = randomBytes(16).toString("hex");
+    this.prunePendingOAuth();
+    const createdAt = Date.now();
+    this.pendingOAuth.set(state, { redirectUri, createdAt });
+    this.lastOAuthRedirectUri = redirectUri;
+    const provider = new FeishuOpenApiProvider({ baseUrl: config.baseUrl, appId: config.appId, appSecret: config.appSecret, fetchImpl: this.fetchImpl });
+    return { url: provider.buildAuthorizeUrl({ appId: config.appId, redirectUri, state }), state, redirectUri };
+  }
+
+  /** C2: finish the flow. `state` is required for the browser callback; the
+   *  paste-the-code fallback may omit it and then reuses the redirect URI of the
+   *  last `beginOAuth`, which is what the authorization request was bound to. */
+  async completeOAuth(input: { code: string; state?: string }): Promise<OAuthCompleteResult> {
+    const code = input.code?.trim();
+    if (!code) throw Object.assign(new Error("授权码为空"), { statusCode: 400 });
+    const pending = input.state ? this.pendingOAuth.get(input.state) : undefined;
+    if (input.state && !pending) {
+      throw Object.assign(new Error("授权会话已过期或不匹配，请重新发起授权"), { statusCode: 400 });
+    }
+    const redirectUri = pending?.redirectUri ?? this.lastOAuthRedirectUri;
+    if (!redirectUri) {
+      throw Object.assign(new Error("没有进行中的授权会话，请先点击「前往飞书授权」"), { statusCode: 400 });
+    }
+    if (input.state) this.pendingOAuth.delete(input.state);
+    const config = await this.load();
+    const provider = this.buildUserProvider({ ...config, accessToken: undefined });
+    const tokens = await provider.exchangeAuthorizationCode({ code, redirectUri });
+    // Authorization replaces the whole user-token pair, and it only makes sense
+    // in user mode: the refresh token we just got is what keeps syncing alive.
+    await this.config.setCredentials([[KEYS.mode, "user"], [KEYS.accessToken, ""]]);
+    await this.persistUserTokenUpdate(tokens);
+    await this.setAuthStatus("ok");
+    return { ok: true, scope: tokens.scope, refreshTokenReceived: Boolean(tokens.refreshToken), expiresAt: new Date(tokens.tokenExpiresAt).toISOString() };
+  }
+
+  /** The redirect URI a future callback will be matched against, if any. */
+  get hasOAuthSession(): boolean {
+    return this.pendingOAuth.size > 0;
+  }
+
+  private prunePendingOAuth(): void {
+    const deadline = Date.now() - CredentialStore.OAUTH_STATE_TTL_MS;
+    for (const [state, attempt] of this.pendingOAuth) {
+      if (attempt.createdAt < deadline) this.pendingOAuth.delete(state);
+    }
+  }
+
   async buildProvider(): Promise<RemoteProvider> {
     const config = await this.load();
     if (config.mode === "cli") return new LarkCliProvider({ executable: config.larkCliBin, apiVersion: process.env.LARK_CLI_API_VERSION === "v2" ? "v2" : "v1" });
-    if (config.mode === "tenant" && config.appId && config.appSecret) return new FeishuOpenApiProvider({ baseUrl: config.baseUrl, appId: config.appId, appSecret: config.appSecret });
+    if (config.mode === "tenant" && config.appId && config.appSecret) return new FeishuOpenApiProvider({ baseUrl: config.baseUrl, appId: config.appId, appSecret: config.appSecret, fetchImpl: this.fetchImpl });
     return this.buildUserProvider(config);
   }
 
@@ -287,7 +368,12 @@ function nonEmpty(value: string | undefined): string | undefined {
 
 function omitUndefined<T extends object>(input: T | undefined): Partial<T> {
   if (!input) return {};
-  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as Partial<T>;
+  // C1: an empty or whitespace-only field means "leave the stored credential
+  // alone", exactly like `undefined`. The settings form always renders the
+  // saved secrets masked, so submitting the untouched form must never blank a
+  // working token — `test-connection` has to probe with the value on disk.
+  return Object.fromEntries(Object.entries(input).filter(([, value]) =>
+    value !== undefined && !(typeof value === "string" && value.trim() === ""))) as Partial<T>;
 }
 
 /** Never return a full secret: show the first 6 and last 4 characters only. */

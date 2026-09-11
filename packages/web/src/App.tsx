@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   api,
   DEFAULT_NOTIFICATIONS,
+  DEFAULT_NOTIFICATION_CHANNEL,
   type ActivityItem,
   type AppConfigPatch,
   type AppConfigView,
   type Conflict,
   type CredentialPatch,
+  type NotificationChannel,
   type NotificationPreferences,
   type Operation,
   type PruneResult,
@@ -98,8 +100,6 @@ export function App(): React.JSX.Element {
   const [addOpen, setAddOpen] = useState(false);
   const [addSubmitting, setAddSubmitting] = useState(false);
   const [live, setLive] = useState(false);
-  /** Browser Notification permission, or "unsupported" where the API is absent (B6.8). */
-  const [notifyPermission, setNotifyPermission] = useState(() => (typeof Notification === "undefined" ? "unsupported" : Notification.permission));
   /** Live 429 backoff window surfaced as a topbar badge (B6.2). */
   const [rateLimit, setRateLimit] = useState<{ rootId: string; retryAfterMs: number; until: number }>();
   /** Re-read every second while the badge is up so its countdown actually ticks. */
@@ -135,18 +135,17 @@ export function App(): React.JSX.Element {
   useEffect(() => { viewRef.current = view; }, [view]);
   const selectedRootRef = useRef<string | undefined>(undefined);
   useEffect(() => { selectedRootRef.current = selectedRootId; }, [selectedRootId]);
-  // Notification switches live server-side (B6.8); the ref keeps `notify`
-  // referentially stable so the socket effect is not torn down on every poll.
-  const notifications = appConfig?.preferences.notifications ?? DEFAULT_NOTIFICATIONS;
-  const notificationsRef = useRef(notifications);
-  useEffect(() => { notificationsRef.current = notifications; }, [notifications]);
   const conflictCountRef = useRef(0);
 
-  const notify = useCallback((category: keyof NotificationPreferences, title: string, body: string) => {
-    if (!notificationsRef.current[category]) return;
-    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-    try { new Notification(title, { body }); } catch { /* some browsers require SW */ }
-  }, []);
+  // Notification switches and the delivery channel live server-side (B6.8/D),
+  // so they follow the installation rather than one browser's localStorage.
+  const notifications = appConfig?.preferences.notifications ?? DEFAULT_NOTIFICATIONS;
+  const notificationChannel = appConfig?.preferences.notificationChannel ?? DEFAULT_NOTIFICATION_CHANNEL;
+
+  // D: the workbench no longer raises browser Notifications. "Something
+  // noteworthy happened" is a server-side concern now — the runtime emits a
+  // NotificationEvent into a configurable sink — while the socket events below
+  // keep driving the in-page badges and activity feed.
 
   const refresh = useCallback(async () => {
     try {
@@ -184,16 +183,13 @@ export function App(): React.JSX.Element {
         setRootStats(map);
       }
 
-      // Browser notification when the open-conflict count grows.
-      if (nextConflicts.length > conflictCountRef.current) {
-        const fresh = nextConflicts[nextConflicts.length - 1];
-        notify("conflict", "发现新冲突", fresh?.relativePath ? `${fresh.relativePath} 需要处理` : "冲突工作台有待处理项");
-      }
+      // The open-conflict count only drives the badge; the server decides
+      // whether a notification is warranted (D).
       conflictCountRef.current = nextConflicts.length;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     }
-  }, [notify]);
+  }, []);
 
   useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 5000); return () => window.clearInterval(timer); }, [refresh]);
 
@@ -230,8 +226,7 @@ export function App(): React.JSX.Element {
         setTaskRevision((value) => value + 1);
       }
       if (payload.type === "operation-failed") {
-        pushActivity({ kind: "error", text: `任务失败：${shortRootId(payload.operation.entryId ?? payload.operation.id)}${payload.operation.errorCategory ? `（${payload.operation.errorCategory}）` : ""}` });
-        notify("failure", "同步失败", `${payload.operation.relativePath ?? shortRootId(payload.operation.entryId ?? payload.operation.id)}：${payload.operation.error ?? "未知错误"}`);
+        pushActivity({ kind: "error", text: `任务失败：${payload.operation.relativePath ?? shortRootId(payload.operation.entryId ?? payload.operation.id)}${payload.operation.error ? `：${payload.operation.error}` : ""}` });
       }
       if (payload.type === "operation-retrying") {
         pushActivity({ kind: "sync", text: `任务重试：${shortRootId(payload.operation.entryId ?? payload.operation.id)} 第 ${payload.retryCount} 次，${Math.round(payload.delayMs / 1000)}s 后重试` });
@@ -252,16 +247,14 @@ export function App(): React.JSX.Element {
       if (payload.type === "conflict-aborted") pushActivity({ kind: "conflict", text: "冲突已搁置，等待下次变更重新评估" });
       if (payload.type === "auth-invalid") {
         setGuideOpen(true);
-        notify("credential", "飞书凭证已失效", "同步已暂停，点击页面顶部徽章更新凭证");
+        pushActivity({ kind: "error", text: "飞书凭证已失效，同步已暂停，请点击页面顶部徽章更新凭证" });
       }
-      if (payload.type === "auth-restored") notify("credential", "飞书凭证已恢复", "同步继续进行");
-      if (payload.type === "conflict-resolved") notify("conflict", "冲突已解决", "合并结果已写入本地与飞书");
-      if (payload.type === "error") notify("failure", "同步出错", payload.error);
+      if (payload.type === "auth-restored") pushActivity({ kind: "sync", text: "飞书凭证已恢复，同步继续" });
     };
     socket.onopen = () => { setLive(true); setMessage("实时连接已建立"); };
     socket.onclose = () => { setLive(false); setMessage("实时连接已断开，使用轮询"); };
     return () => socket.close();
-  }, [refresh, notify, pushActivity, setRootRunning]);
+  }, [refresh, pushActivity, setRootRunning]);
 
   // Reload view-specific data when the view or inspected root changes.
   useEffect(() => { void refresh(); }, [view, selectedRootId, refresh]);
@@ -295,9 +288,16 @@ export function App(): React.JSX.Element {
   const createRoot = async (input: CreateRootInput) => {
     setAddSubmitting(true);
     try {
-      const root = await api.createRoot(input);
+      const result = await api.createRoot(input);
       setAddOpen(false);
       await refresh();
+      // G1: re-binding a directory that already has a root reuses that record
+      // instead of creating a second one that would fight over `.feishu-sync/`.
+      const root = "reused" in result ? result.root : result;
+      if ("reused" in result) {
+        setMessage(`该目录已绑定，已为你切换到现有绑定：${root.localPath}`);
+        pushActivity({ kind: "sync", text: `目录 ${root.localPath} 已有绑定，已复用现有根目录 ${shortRootId(root.id)}` });
+      }
       openRoot(root.id);
     } catch (error) {
       // Re-throw so BindRootForm surfaces the message inline next to the form.
@@ -409,9 +409,11 @@ export function App(): React.JSX.Element {
     setAppConfig(saved);
   };
 
-  const requestNotifyPermission = () => {
-    if (typeof Notification === "undefined") return;
-    void Notification.requestPermission().then((permission) => setNotifyPermission(permission));
+  /** D: the delivery channel is a server preference too, so switching it in one
+   *  tab stops notifications for every user of this installation. */
+  const setNotificationChannel = async (channel: NotificationChannel) => {
+    const saved = await api.saveAppConfig({ notificationChannel: channel });
+    setAppConfig(saved);
   };
 
   /** 「不再显示」— persisted per browser; only hides the modal wizard (B6.1). */
@@ -513,6 +515,7 @@ export function App(): React.JSX.Element {
           conflictsCount={conflicts.length}
           syncing={syncing}
           authStatus={settings?.authStatus}
+          activeRounds={runningRoots.size}
           onOpenRoot={openRoot}
           onOpenAdd={() => setAddOpen(true)}
           onDeleteRoot={deleteRoot}
@@ -570,9 +573,9 @@ export function App(): React.JSX.Element {
           onPrune={pruneHistory}
           onOpenGuide={() => setGuideOpen(true)}
           notifications={notifications}
+          notificationChannel={notificationChannel}
+          onSetNotificationChannel={setNotificationChannel}
           onToggleNotification={toggleNotification}
-          notifyPermission={notifyPermission}
-          onRequestNotifyPermission={requestNotifyPermission}
         />}
       </main>
     </div>

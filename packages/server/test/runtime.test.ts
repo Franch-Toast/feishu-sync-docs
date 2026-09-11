@@ -157,7 +157,7 @@ test("aborting a conflict re-evaluates it with fresh three-way data", async () =
   }
 });
 
-test("records failures on the entry and recovers on the next sync", async () => {
+test("records failures on the entry and recovers on a human retry", async () => {
   const scenario = createScenario();
   try {
     const root = await createRoot(scenario, "shared line\n");
@@ -179,10 +179,17 @@ test("records failures on the entry and recovers on the next sync", async () => 
     assert.equal(failedOperation.errorCategory, "unknown");
     assert.equal(failedOperation.retryCount, failedOperation.maxRetries ?? 3);
 
-    // The next scan re-arms error entries; with writes healthy the retry succeeds.
+    // A1: `error` is terminal. Even with writes healthy again, a plain round
+    // must not quietly re-push a file nobody touched — that is what made one
+    // broken file burn every round and hid that it was waiting for a human.
     scenario.remote.failWrites = false;
-    const recovered = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
-    assert.equal(recovered.entries[0]?.status, "clean");
+    const idle = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(idle.entries.find((entry) => entry.entryId === entryId)?.status, "error");
+    assert.equal(scenario.remote.documents.get(token)?.content, "shared line\n", "the un-armed round wrote nothing remote");
+
+    // The 「重试」 action re-arms it and the push finally lands.
+    const retried = await scenario.runtime.syncEntryNow(entryId);
+    assert.equal(retried.status, "clean");
     assert.equal(scenario.remote.documents.get(token)?.content, "local edit\n");
   } finally {
     cleanup(scenario);
@@ -745,6 +752,44 @@ test("a baseline commit does not retrigger the watcher into an endless loop (B1)
     // Proves the loop precondition really happened: that watch round committed,
     // so the index was rewritten and would have retriggered the watcher.
     assert.ok(statSync(indexPath).mtimeMs > indexBefore, "the watch round committed a new baseline");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("a save that lands while a round is in flight is pushed next, never rolled back", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "first version\n");
+    // The round reads `first version` and creates the document; the user saves
+    // again before the round-end commit. A live editor does this constantly.
+    const createDocument = scenario.remote.createDocument.bind(scenario.remote);
+    let saved = false;
+    scenario.remote.createDocument = async (parentToken: string, name: string, content: string) => {
+      const created = await createDocument(parentToken, name, content);
+      if (!saved) {
+        saved = true;
+        writeFileSync(join(scenario.directory, "notes.md"), "second version\n", "utf8");
+      }
+      return created;
+    };
+
+    const first = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const token = first.entries.find((entry) => entry.remoteToken)?.remoteToken;
+    assert.ok(token, "the round created the document");
+    assert.equal(scenario.remote.documents.get(token)?.content, "first version\n");
+    // The regression: staging the working tree here recorded `second version` as
+    // the baseline of a push that only ever carried `first version`, so the next
+    // round read base === local, believed the remote had moved on and pulled it
+    // back over the user's edit.
+    assert.equal(await scenario.gitStorage.getBaseline(root.id, "notes.md"), "first version\n", "the baseline is what reached the drive");
+
+    const second = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entry = second.entries.find((item) => item.remoteToken === token);
+    assert.equal(entry?.status, "clean");
+    assert.equal(scenario.remote.documents.get(token)?.content, "second version\n", "the mid-round edit is pushed as a local change");
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "second version\n", "and the local file keeps it");
+    assert.equal(scenario.remote.documents.size, 1, "without duplicating the document");
   } finally {
     cleanup(scenario);
   }

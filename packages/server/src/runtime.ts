@@ -8,12 +8,21 @@ import { sha256, matchesAnyGlob } from "@feishu-sync/core";
 import { categorizeError, FeishuApiError, RETRIABLE_ERROR_CATEGORIES } from "@feishu-sync/feishu";
 import type { AuthStateStore } from "./appconfig.js";
 import { ApiCallStats, instrumentRemote, type ApiStatsSnapshot } from "./apistats.js";
-import type { Commit, ConflictRecord, EntryBinding, ErrorCategory, FolderBinding, GitStorage, LocalProvider, MetaStorage, OperationRecord, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger } from "@feishu-sync/core";
+import { NoopSink, shouldNotify, type NotificationCategory, type NotificationSink } from "./notify.js";
+import type { Commit, ConflictRecord, EntryBinding, ErrorCategory, FolderBinding, GitStorage, LocalProvider, MetaStorage, OperationRecord, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, RoundSummary, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger } from "@feishu-sync/core";
 
 /** Task-center status filter; "active" groups queued + running operations. */
 export type TaskStatus = "active" | "queued" | "running" | "succeeded" | "failed" | "cancelled" | "all";
 /** An operation record joined with its entry's relativePath/kind for display. */
 export type TaskView = OperationRecord & { relativePath?: string; kind?: string };
+/** What one entry attempt produced, tallied into the round's `summary`. */
+type EntryOutcome = { authInvalid: boolean; status: "pushed" | "pulled" | "merged" | "failed" | "skipped" };
+/** Notification routing comes from config.json through a thunk, so a settings
+ *  change takes effect on the next event without rebuilding the runtime. */
+export interface NotificationSettings {
+  channel: string;
+  enabled: Partial<Record<NotificationCategory, boolean>>;
+}
 
 /** Directories the sync engine writes inside the user's tree. */
 const METADATA_DIRECTORIES = new Set([".git", ".feishu-sync"]);
@@ -75,6 +84,10 @@ export class SyncRuntime {
   private readonly queues = new Map<string, Promise<void>>();
   private readonly engine: SyncEngine;
   private maintenanceTimer?: NodeJS.Timeout;
+  /** Set by `stop()`: nothing new is scheduled, and `stop()` waits for the work
+   *  already queued. Without it a closing process kept writing bindings after
+   *  `app.close()` resolved, because binding a root starts a round right away. */
+  private stopped = false;
   private currentTrigger: SyncTrigger = 'manual';
   /** Echo guards (TTL 5s): local paths we just pulled and remote tokens we just
    *  pushed, so the watcher / drive-event channel ignores our own writes instead
@@ -87,6 +100,11 @@ export class SyncRuntime {
   /** Tally of remote API calls, surfaced as the settings-page 调用统计 (B6.2). */
   private readonly apiStats = new ApiCallStats();
   private readonly countedRemote: RemoteProvider;
+  private readonly notificationSink: NotificationSink;
+  private readonly notificationSettings: () => NotificationSettings;
+  /** Conflicts already announced through the sink, so one long-running conflict
+   *  notifies once instead of on every round. */
+  private readonly announcedConflicts = new Set<string>();
 
   constructor(
     private readonly gitStorage: GitStorage,
@@ -100,7 +118,10 @@ export class SyncRuntime {
     /** Auth lifecycle flags live in config.json; absent in bare-runtime tests. */
     private readonly authState?: AuthStateStore,
     /** Injectable auto-retry backoff schedule/sleep so tests never wait for real. */
-    retryOptions?: { backoffMs?: number[]; sleep?: (ms: number) => Promise<void> }
+    retryOptions?: { backoffMs?: number[]; sleep?: (ms: number) => Promise<void> },
+    /** Notification delivery (D). Default `NoopSink`: the workbench is silent
+     *  unless the user selects a channel in config.json. */
+    notificationOptions?: { sink?: NotificationSink; settings?: () => NotificationSettings }
   ) {
     // Every remote call goes through the instrumented provider so the engine
     // and the runtime's own probes share one tally.
@@ -108,6 +129,8 @@ export class SyncRuntime {
     this.engine = new SyncEngine(gitStorage, metaStorage, local, this.countedRemote);
     this.backoffMs = retryOptions?.backoffMs ?? [1_000, 2_000, 4_000];
     this.sleepImpl = retryOptions?.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.notificationSink = notificationOptions?.sink ?? new NoopSink();
+    this.notificationSettings = notificationOptions?.settings ?? (() => ({ channel: "none", enabled: {} }));
   }
 
   /** Remote provider whose calls are tallied; API routes should use this one. */
@@ -125,10 +148,25 @@ export class SyncRuntime {
     this.logger?.[level](data ?? {}, message);
   }
 
+  /** Deliver one notification if — and only if — the configured channel and the
+   *  matching category switch both allow it (D). Delivery failures never break
+   *  a sync round; a sink is an convenience, not a dependency. */
+  private async notify(category: NotificationCategory, title: string, body: string, ids: { rootId?: string; entryId?: string } = {}): Promise<void> {
+    const { channel, enabled } = this.notificationSettings();
+    if (!shouldNotify(channel, enabled, category)) return;
+    try {
+      await this.notificationSink.notify({ category, title, body, ...ids, at: new Date().toISOString() });
+    } catch (error) {
+      this.log("warn", "notification delivery failed", { category, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
   async start(): Promise<void> {
+    this.stopped = false;
     // Give credential-based providers (ProviderRegistry) a chance to initialize
     // from stored settings before the first watcher/poller runs.
     await this.prepareRemote?.();
+    await this.cancelInterruptedTasks();
     for (const root of await this.metaStorage.listRoots()) {
       if (root.enabled) {
         // Initialize Git repo and meta storage for this root
@@ -141,12 +179,40 @@ export class SyncRuntime {
     this.log("info", "runtime started");
   }
 
-  stop(): void {
-    for (const watcher of this.watchers.values()) void watcher.close();
+  /** A4: records left `queued`/`running` belong to a process that is gone. Without
+   *  this the task centre's「进行中」shows tasks from before a restart forever,
+   *  because nothing will ever pick them up again. */
+  private async cancelInterruptedTasks(): Promise<void> {
+    const stale = await this.metaStorage.listOperations({ limit: 1000 }).then((operations) =>
+      operations.filter((operation) => operation.status === "queued" || operation.status === "running"));
+    for (const operation of stale) {
+      try {
+        await this.metaStorage.updateOperation(operation.id, { status: "cancelled", error: "服务重启，任务中断", completedAt: new Date().toISOString(), needsAction: false });
+      } catch {
+        // Record vanished between the listing and the update; nothing to clean.
+      }
+    }
+    if (stale.length > 0) this.log("info", "cancelled tasks interrupted by restart", { count: stale.length });
+  }
+
+  /** Stop listening, then let already-queued rounds finish.
+   *
+   *  Awaited on purpose: `app.close()` resolving must mean the process is done
+   *  touching the metadata directories, otherwise an embedder or a test that
+   *  removes the workspace right after closing races a round still writing it.
+   *  The queue holds only each root's tail promise, which chains everything
+   *  queued before it, and the `stopped` gate keeps late watcher callbacks from
+   *  appending more work while we drain. */
+  async stop(): Promise<void> {
+    this.stopped = true;
+    const closing = [...this.watchers.values()].map((watcher) => watcher.close());
     for (const timer of this.timers.values()) clearInterval(timer);
     for (const client of this.clients) client.close();
     this.watchers.clear(); this.timers.clear(); this.clients.clear();
     if (this.maintenanceTimer) { clearInterval(this.maintenanceTimer); this.maintenanceTimer = undefined; }
+    await Promise.all(closing).catch(() => undefined);
+    await Promise.all([...this.queues.values()]).catch(() => undefined);
+    this.queues.clear();
   }
 
   /** Enforce retention policies; defaults configurable via SYNC_RETENTION_* env vars. */
@@ -190,7 +256,7 @@ export class SyncRuntime {
   }
 
   startRoot(root: SyncRoot): void {
-    if (this.watchers.has(root.id)) return;
+    if (this.stopped || this.watchers.has(root.id)) return;
     const watcher = watch(root.localPath, {
       ignoreInitial: true,
       awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
@@ -203,16 +269,16 @@ export class SyncRuntime {
     const onLocalChange = (changedPath: string) => {
       if (this.isRecentLocalWrite(changedPath)) return;
       const relativePath = relative(root.localPath, changedPath).split(sep).join("/");
-      void this.enqueue(root.id, () => this.scanAndSync(root, 'watch', { relativePaths: [relativePath] }));
+      void this.queueRound(root, 'watch', { relativePaths: [relativePath] });
     };
     watcher.on("add", onLocalChange);
     watcher.on("change", onLocalChange);
     watcher.on("unlink", onLocalChange);
     watcher.on("error", (error) => this.broadcast({ type: "error", rootId: root.id, error: String(error) }));
     this.watchers.set(root.id, watcher);
-    const timer = setInterval(() => void this.enqueue(root.id, () => this.scanAndSync(root, 'poll')), root.pollIntervalMs);
+    const timer = setInterval(() => void this.queueRound(root, 'poll'), root.pollIntervalMs);
     this.timers.set(root.id, timer);
-    void this.enqueue(root.id, () => this.scanAndSync(root, 'manual'));
+    void this.queueRound(root, 'manual');
     this.log("info", "started watcher and poll timer", { rootId: root.id, localPath: root.localPath, pollIntervalMs: root.pollIntervalMs });
   }
 
@@ -236,7 +302,7 @@ export class SyncRuntime {
     if (!root) throw notFound(`Root not found: ${id}`);
     // Serialize with any in-flight round for this root: scan mutates bindings
     // and must not interleave with a watcher/poll sync.
-    const result = await this.enqueueResult(root.id, () => this.engine.scan(root));
+    const result = await this.queueRound(root, 'manual', undefined, 'scan');
     this.broadcast({ type: "scan", rootId: id, result });
     return result;
   }
@@ -247,7 +313,69 @@ export class SyncRuntime {
     // Serialize with watcher/poll/event syncs for this root. Concurrent rounds
     // would race on the shared git index and the JSON binding files, so an
     // API-triggered sync joins the same per-root queue.
-    return this.enqueueResult(root.id, () => this.scanAndSync(root, trigger));
+    return this.queueRound(root, trigger);
+  }
+
+  /**
+   * A4: every round of work — poll, watcher, drive event, API button — is one
+   * visible `sync-round` task. Without it a round lives only as its per-entry
+   * records, so「进行中」was empty for the whole scan phase and a round that
+   * found nothing to do never appeared at all.
+   *
+   * `mode: "scan"` re-uses the same visibility for the scan-only endpoint
+   * without secretly syncing the root.
+   */
+  private queueRound(root: SyncRoot, trigger: SyncTrigger, scope?: SyncScope, mode: "sync" | "scan" = "sync"): Promise<unknown> {
+    // Rounds fire from watcher/poll/event callbacks that can outlive `stop()` by
+    // a tick; a stopped runtime must not open a task nobody will ever finish.
+    if (this.stopped) return Promise.resolve(undefined);
+    return this.enqueueResult(root.id, async () => {
+      const queued = await this.metaStorage.addOperation({
+        rootId: root.id, direction: "merge", operation: "sync-round", trigger,
+        startedAt: new Date().toISOString(), maxRetries: 0
+      });
+      this.broadcast({ type: "operation-queued", rootId: root.id, operation: queued });
+      const running = await this.metaStorage.updateOperation(queued.id, { status: "running", startedAt: new Date().toISOString() });
+      this.broadcast({ type: "operation-started", rootId: root.id, operation: running });
+      try {
+        const result = mode === "scan" ? await this.scanOnly(root, trigger, scope) : await this.scanAndSync(root, trigger, scope);
+        const summary = (result as { summary?: RoundSummary }).summary;
+        const succeeded = await this.metaStorage.updateOperation(queued.id, {
+          status: "succeeded", direction: "merge", completedAt: new Date().toISOString(), needsAction: false, ...(summary ? { summary } : {})
+        });
+        this.broadcast({ type: "operation-completed", rootId: root.id, operation: succeeded });
+        return { ...(result as object), roundId: queued.id };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const failed = await this.metaStorage.updateOperation(queued.id, {
+          status: "failed", error: message, errorCategory: categorizeError(error, "pending"), completedAt: new Date().toISOString(), needsAction: true
+        });
+        this.broadcast({ type: "operation-failed", rootId: root.id, operation: failed });
+        throw error;
+      }
+    });
+  }
+
+  /** A scan-only round: same bookkeeping as a sync round, no content is moved. */
+  private async scanOnly(root: SyncRoot, trigger: SyncTrigger, scope?: SyncScope): Promise<unknown> {
+    this.currentTrigger = trigger;
+    let scan: Awaited<ReturnType<SyncEngine["scan"]>>;
+    try {
+      scan = await this.engine.scan(root, trigger, scope);
+    } catch (error) {
+      if (isAuthError(error)) { await this.flagAuthInvalid(); return { rootId: root.id, authInvalid: true }; }
+      throw error;
+    }
+    this.logScanWarnings(root);
+    this.broadcast({ type: "sync", rootId: root.id, trigger });
+    return { ...scan, entries: scan.entries, summary: emptySummary(scan.scanned) };
+  }
+
+  /** Surface the file-name/path findings the engine could not act on itself. */
+  private logScanWarnings(root: SyncRoot): void {
+    for (const warning of this.engine.drainWarnings()) {
+      this.log("warn", warning, { rootId: root.id });
+    }
   }
 
   /** Queue a scan+sync round for the root. Entry point for the event channel:
@@ -262,7 +390,7 @@ export class SyncRuntime {
       return;
     }
     const scope: SyncScope | undefined = fileToken ? { remoteTokens: [fileToken] } : undefined;
-    await this.enqueue(root.id, () => this.scanAndSync(root, 'event', scope));
+    await this.queueRound(root, 'event', scope);
   }
 
   /** Local tree for the browser: fully DB-backed and credential-independent,
@@ -285,7 +413,8 @@ export class SyncRuntime {
     const root = await this.metaStorage.getRoot(rootId);
     if (!root) throw notFound(`Root not found: ${rootId}`);
     const remoteDocument = await this.countedRemote.getDocument(remoteToken);
-    const localPathExists = (await this.local.scan(root)).some((file) => file.relativePath === relativePath);
+    // E1: this only has to answer "does this one path exist locally?".
+    const localPathExists = (await this.local.scan(root, { onlyPaths: [relativePath] })).length > 0;
     if (!localPathExists) await this.local.writeText(root, relativePath, remoteDocument.content);
     const existing = await this.metaStorage.getBinding(rootId, relativePath);
     const binding: EntryBinding = existing ?? {
@@ -318,7 +447,26 @@ export class SyncRuntime {
       return aborted;
     }
     const binding = await this.metaStorage.findBindingById(conflict.entryId);
-    if (!binding?.remoteToken) throw new Error("Conflict entry is no longer bound to a remote document");
+    if (!binding?.remoteToken) {
+      // B4: a title collision leaves the entry unbound on purpose. 「采用该远端
+      // 文档」 is the one resolution that works without a token: it transfers the
+      // colliding document to this entry. 「保留本地」 cannot — the title is taken —
+      // so it is answered with the guidance the workbench shows instead of a
+      // misleading English error.
+      if (input.resolution === "remote" && conflict.collidingToken) {
+        const adopted = await this.engine.adoptCollidingDocument(conflict.entryId, conflict.collidingToken);
+        const adoptRoot = await this.metaStorage.getRoot(adopted.rootId);
+        if (adoptRoot) await this.local.writeText(adoptRoot, adopted.relativePath, conflict.remoteContent);
+        const adoptedResolved = await this.metaStorage.resolveConflict(conflict.id, "remote", conflict.remoteContent);
+        if (adoptRoot) await this.queueRound(adoptRoot, 'manual');
+        this.broadcast({ type: "conflict-resolved", conflict: adoptedResolved });
+        return adoptedResolved;
+      }
+      if (conflict.collidingToken) {
+        throw Object.assign(new Error("远端同名文档属于另一条目：请先重命名本地文件后重新推送，或选择「采用该远端文档」"), { statusCode: 400 });
+      }
+      throw new Error("Conflict entry is no longer bound to a remote document");
+    }
     const root = await this.metaStorage.getRoot(binding.rootId);
     if (!root) throw new Error("Conflict root not found");
     const currentRemote = await this.countedRemote.getDocument(binding.remoteToken);
@@ -446,6 +594,10 @@ export class SyncRuntime {
     await this.enqueue(root.id, () => this.syncSingleEntry(binding, root));
     const result = await this.metaStorage.findBindingById(entryId);
     if (!result) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
+    // A3: the manual/batch 「重试」 button is a human action too — once the entry
+    // is clean again its failure record must leave the 失败待处理 queue. When the
+    // sync is still broken the record stays, because nobody has resolved it.
+    if (result.status === "clean") await this.clearPendingFailures(root.id, entryId);
     return result;
   }
 
@@ -454,8 +606,23 @@ export class SyncRuntime {
   async setEntryIgnored(entryId: string, ignored: boolean): Promise<EntryBinding> {
     const binding = await this.metaStorage.findBindingById(entryId);
     if (!binding) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
-    const next: EntryBinding = { ...binding, ignoredAt: ignored ? new Date().toISOString() : undefined, updatedAt: new Date().toISOString() };
+    const rearmed = !ignored && binding.status === "error";
+    const next: EntryBinding = {
+      ...binding,
+      ignoredAt: ignored ? new Date().toISOString() : undefined,
+      // Restoring an entry frozen while it was failing means "try again": A1
+      // made `error` terminal, and nothing would have noticed that the file
+      // needs another push while it was ignored. Structural statuses
+      // (local-missing/remote-missing/conflict) are preserved — the batch
+      // resync of missing entries filters on them.
+      status: rearmed ? "pending" : binding.status,
+      lastErrorAt: rearmed ? undefined : binding.lastErrorAt,
+      updatedAt: new Date().toISOString(),
+    };
     await this.metaStorage.setBinding(binding.rootId, binding.relativePath, next);
+    // A3: ignoring is one of the two ways out of the「失败待处理」queue, so it
+    // retires the pending failure record immediately even though no sync ran.
+    if (ignored) await this.clearPendingFailures(binding.rootId, entryId);
     this.broadcast({ type: "sync", rootId: binding.rootId });
     return (await this.metaStorage.findBindingById(entryId)) ?? next;
   }
@@ -537,23 +704,32 @@ export class SyncRuntime {
       throw error;
     }
     this.log("info", "sync round started", { rootId: root.id, localPath: root.localPath, trigger, mode });
+    this.logScanWarnings(root);
     // Outer loop re-lists pending entries so cascading re-arms (a synced asset
     // re-arming the documents that reference it, link maps) are processed in the
-    // same round; the per-entry attempt cap bounds pathological cascades. Each
-    // entry owns one operation record whose retryCount climbs on transient
-    // failures via syncEntryWithRetry's exponential backoff.
-    const attempts = new Map<string, number>();
+    // same round. A2: an entry is attempted at most once per round — the earlier
+    // per-entry attempt counter let the same file fail three separate times in
+    // one round, which read as a hang rather than as one clear failure. The
+    // auto-retry budget lives in syncEntryWithRetry's exponential backoff.
+    const attempted = new Set<string>();
+    const counters = { pushed: 0, pulled: 0, merged: 0, failed: 0 };
     while (true) {
       const pending = (await this.metaStorage.listBindings(root.id))
         // Ignored entries are frozen by the user; never evaluate them here.
-        .filter((binding) => binding.status === "pending" && !binding.ignoredAt && (attempts.get(binding.entryId) ?? 0) < 3)
+        .filter((binding) => binding.status === "pending" && !binding.ignoredAt && !attempted.has(binding.entryId))
         .sort((left, right) => Number(left.kind !== "asset") - Number(right.kind !== "asset"));
       if (pending.length === 0) break;
       for (const binding of pending) {
-        attempts.set(binding.entryId, (attempts.get(binding.entryId) ?? 0) + 1);
+        attempted.add(binding.entryId);
         // Credential failures fail every entry; surface once and stop the round.
-        if (await this.syncEntryWithRetry(binding, root, trigger)) {
-          return { ...scan, entries: await this.metaStorage.listBindings(root.id), authInvalid: true };
+        const outcome = await this.syncEntryWithRetry(binding, root, trigger);
+        if (outcome.status === "pushed") counters.pushed += 1;
+        else if (outcome.status === "pulled") counters.pulled += 1;
+        else if (outcome.status === "merged") counters.merged += 1;
+        else if (outcome.status === "failed") counters.failed += 1;
+        if (outcome.authInvalid) {
+          const aborted = await this.metaStorage.listBindings(root.id);
+          return { entries: aborted, conflicts: 0, scanned: scan.scanned, authInvalid: true, summary: summarize(scan.scanned, counters, aborted) };
         }
       }
     }
@@ -565,24 +741,30 @@ export class SyncRuntime {
     // user, so their working-tree drift must never become the baseline either;
     // when restored they are re-evaluated against the last-synced content.
     const finalBindings = await this.metaStorage.listBindings(root.id);
-    const cleanPaths = new Set(finalBindings.filter((binding) => binding.status === "clean" && !binding.ignoredAt).map((binding) => binding.relativePath));
+    const clean = finalBindings.filter((binding) => binding.status === "clean" && !binding.ignoredAt);
+    const cleanPaths = new Set(clean.map((binding) => binding.relativePath));
+    // The exact bytes each clean entry was left at. A file the user saved while
+    // this round was still running no longer matches, and `commitBaseline` drops
+    // it from the commit: absorbing an unsynced edit here would make the next
+    // round read it as `base === local` and pull the remote over the edit.
+    const reconciled = new Map(clean.flatMap((binding) => (binding.localContentHash ? [[binding.relativePath, binding.localContentHash] as const] : [])));
     try {
-      await this.gitStorage.commitBaseline(root.id, `sync: ${trigger}`, trigger, cleanPaths);
+      await this.gitStorage.commitBaseline(root.id, `sync: ${trigger}`, trigger, cleanPaths, reconciled);
     } catch (error) {
       this.log("warn", "git commit failed", { rootId: root.id, error: error instanceof Error ? error.message : String(error) });
     }
     await this.markAuthHealthy();
+    await this.announceConflicts(root);
     this.broadcast({ type: "sync", rootId: root.id, trigger });
     this.log("info", "sync round completed", { rootId: root.id, elapsedMs: Date.now() - startedAt, trigger });
-    return { ...scan, entries: finalBindings };
+    return { ...scan, entries: finalBindings, summary: summarize(scan.scanned, counters, finalBindings) };
   }
 
   /** Sync one entry behind a single operation record with per-round exponential
    *  backoff (1s/2s/4s) for transient failures. Emits operation-queued/started/
    *  completed/failed/retrying so the task center can track progress live.
-   *  Returns true when the round must abort because credentials are invalid
-   *  (auth/permission fail fast and are never auto-retried). */
-  private async syncEntryWithRetry(binding: EntryBinding, root: SyncRoot, trigger: SyncTrigger): Promise<boolean> {
+   *  The returned outcome feeds the round summary. */
+  private async syncEntryWithRetry(binding: EntryBinding, root: SyncRoot, trigger: SyncTrigger): Promise<EntryOutcome> {
     const operation = await this.metaStorage.addOperation({
       entryId: binding.entryId, rootId: root.id, direction: "merge", operation: "sync-entry",
       trigger, startedAt: new Date().toISOString(), maxRetries: 3
@@ -601,19 +783,22 @@ export class SyncRuntime {
         const after = await this.metaStorage.findBindingById(binding.entryId);
         if (direction === "pull") this.registerLocalWrite(root, binding.relativePath);
         if ((direction === "push" || direction === "merge") && after?.remoteToken) this.registerRemotePush(after.remoteToken);
-        const succeeded = await this.metaStorage.updateOperation(operation.id, { status: "succeeded", direction, completedAt: new Date().toISOString() });
+        const succeeded = await this.metaStorage.updateOperation(operation.id, { status: "succeeded", direction, completedAt: new Date().toISOString(), needsAction: false });
         this.broadcast({ type: "operation-completed", rootId: root.id, operation: succeeded });
-        return false;
+        // A success retires any earlier「失败待处理」record for this entry: the
+        // queue must not keep showing a failure that has since been fixed.
+        await this.clearPendingFailures(root.id, binding.entryId, operation.id);
+        return { authInvalid: false, status: direction === "pull" ? "pulled" : direction === "push" ? "pushed" : "merged" };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const category: ErrorCategory = categorizeError(error, binding.status);
         if (isAuthError(error) || category === "auth") {
-          const failedOp = await this.metaStorage.updateOperation(operation.id, { status: "failed", error: message, errorCategory: "auth", retryCount, completedAt: new Date().toISOString(), ...failedDirection(this.engine, binding.entryId) });
+          const failedOp = await this.recordEntryFailure(root.id, operation.id, binding.entryId, { status: "failed", error: message, errorCategory: "auth", retryCount, completedAt: new Date().toISOString(), ...failedDirection(this.engine, binding.entryId) });
           this.broadcast({ type: "operation-failed", rootId: root.id, operation: failedOp });
           this.broadcast({ type: "error", rootId: root.id, entryId: binding.entryId, error: message });
           this.log("warn", "entry sync aborted: credentials invalid", { rootId: root.id, entryId: binding.entryId });
           await this.flagAuthInvalid();
-          return true;
+          return { authInvalid: true, status: "failed" };
         }
         // Transient categories (network/rate_limit/unknown) auto-retry with
         // exponential backoff; conflict/not_found/permission fail fast for the
@@ -632,16 +817,49 @@ export class SyncRuntime {
           await this.sleep(delayMs);
           continue;
         }
-        const failedOp = await this.metaStorage.updateOperation(operation.id, { status: "failed", error: message, errorCategory: category, retryCount, completedAt: new Date().toISOString(), ...failedDirection(this.engine, binding.entryId) });
+        const failedOp = await this.recordEntryFailure(root.id, operation.id, binding.entryId, { status: "failed", error: message, errorCategory: category, retryCount, completedAt: new Date().toISOString(), ...failedDirection(this.engine, binding.entryId) });
         this.broadcast({ type: "operation-failed", rootId: root.id, operation: failedOp });
         this.broadcast({ type: "error", rootId: root.id, entryId: binding.entryId, error: message });
         this.log("warn", "entry sync failed", { rootId: root.id, entryId: binding.entryId, category, retryCount, error: message });
-        // Surface the failure on the entry itself; the next scan resets "error"
-        // entries to "pending" so they are retried.
+        // Surface the failure on the entry itself. A1: `error` is terminal — the
+        // next scan leaves it alone unless the local content actually changed or
+        // a human retries, so one broken file stops burning a round forever.
         const failed = await this.metaStorage.findBindingById(binding.entryId);
-        if (failed) await this.metaStorage.setBinding(root.id, failed.relativePath, { ...failed, status: "error", updatedAt: new Date().toISOString() });
-        return false;
+        if (failed) await this.metaStorage.setBinding(root.id, failed.relativePath, { ...failed, status: "error", lastErrorAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+        await this.notify("failure", `同步失败：${binding.relativePath}`, message, { rootId: root.id, entryId: binding.entryId });
+        return { authInvalid: false, status: "failed" };
       }
+    }
+  }
+
+  /** A3: a failed entry owns exactly one「失败待处理」record. When an entry that
+   *  already waits for a human fails again (e.g. the user retried and it broke
+   *  once more), the existing record absorbs the new details and the record this
+   *  round just opened is marked as superseded instead of piling up. */
+  private async recordEntryFailure(
+    rootId: string,
+    currentId: string,
+    entryId: string,
+    patch: Parameters<MetaStorage["updateOperation"]>[1]
+  ): Promise<OperationRecord> {
+    const previous = (await this.metaStorage.listOperations({ rootId, status: "failed", needsAction: true, limit: 200 }))
+      .find((operation) => operation.entryId === entryId && operation.id !== currentId);
+    if (previous) {
+      await this.metaStorage.updateOperation(previous.id, { ...patch, needsAction: true });
+      return this.metaStorage.updateOperation(currentId, { status: "failed", needsAction: false, error: patch.error });
+    }
+    return this.metaStorage.updateOperation(currentId, { ...patch, needsAction: true });
+  }
+
+  /** A3: drop the「失败待处理」marker from an entry's failed records, so retrying
+   *  or ignoring one takes it out of the queue immediately rather than after the
+   *  next round happens to succeed. `keepId` stays actionable if the fresh
+   *  attempt fails again for its own reason. */
+  private async clearPendingFailures(rootId: string, entryId: string, keepId?: string): Promise<void> {
+    const pending = await this.metaStorage.listOperations({ rootId, status: "failed", needsAction: true, limit: 200 });
+    for (const operation of pending) {
+      if (operation.entryId !== entryId || operation.id === keepId) continue;
+      await this.metaStorage.updateOperation(operation.id, { needsAction: false });
     }
   }
 
@@ -651,8 +869,16 @@ export class SyncRuntime {
    *  deriving nextCursor from the raw page rather than the in-memory filter. */
   async listTasks(options: { status?: TaskStatus; rootId?: string; limit?: number; cursor?: string } = {}): Promise<{ tasks: TaskView[]; nextCursor?: string }> {
     const limit = options.limit ?? 100;
-    const concrete = options.status && options.status !== "active" && options.status !== "all" ? options.status : undefined;
-    const operations = await this.metaStorage.listOperations({ rootId: options.rootId, limit, cursor: options.cursor, status: concrete });
+    // A3:「失败待处理」is the human queue, not the failure history. Only records
+    // still waiting for an action show up there; retried/ignored ones stay in the
+    // history view but leave the group. `needsAction` absent means true, so
+    // records written before this field keep surfacing.
+    const wantsPendingFailures = options.status === "failed";
+    const concrete = options.status && options.status !== "active" && options.status !== "all" && !wantsPendingFailures ? options.status : undefined;
+    const operations = await this.metaStorage.listOperations({
+      rootId: options.rootId, limit, cursor: options.cursor, status: concrete,
+      ...(wantsPendingFailures ? { needsAction: true } : {})
+    });
     const visible = options.status === "active"
       ? operations.filter((operation) => operation.status === "queued" || operation.status === "running")
       : operations;
@@ -667,18 +893,34 @@ export class SyncRuntime {
 
   /** Re-arm the entry behind a failed/cancelled operation and queue a manual
    *  round so the task center's retry button reprocesses it immediately. */
-  async retryTask(operationId: string): Promise<{ ok: boolean; operationId: string }> {
+  async retryTask(operationId: string): Promise<{ ok: boolean; operationId: string; roundId?: string }> {
     const operation = await this.metaStorage.getOperation(operationId);
     if (!operation) throw Object.assign(new Error(`Operation not found: ${operationId}`), { statusCode: 404 });
-    if (!operation.entryId) throw Object.assign(new Error("Operation is not bound to an entry"), { statusCode: 400 });
+    // A4: a round record carries no entry — retrying it means "run the whole
+    // round again", which is also the recovery path for a round killed by an
+    // auth failure mid-way. It must not be rejected as "not bound to an entry".
+    if (!operation.entryId) {
+      if (!operation.rootId) throw Object.assign(new Error(`Root not found for operation: ${operationId}`), { statusCode: 404 });
+      const roundRoot = await this.metaStorage.getRoot(operation.rootId);
+      if (!roundRoot) throw notFound(`Root not found: ${operation.rootId}`);
+      await this.metaStorage.updateOperation(operationId, { needsAction: false });
+      const roundId = await this.queueRound(roundRoot, 'manual');
+      return { ok: true, operationId, roundId: (roundId as { roundId?: string })?.roundId };
+    }
     const binding = await this.metaStorage.findBindingById(operation.entryId);
     if (!binding) throw Object.assign(new Error(`Entry not found: ${operation.entryId}`), { statusCode: 404 });
     const root = await this.metaStorage.getRoot(binding.rootId);
-    if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
-    // Re-arm as pending (and un-ignore) so the next round re-evaluates it.
-    await this.metaStorage.setBinding(binding.rootId, binding.relativePath, { ...binding, status: "pending", ignoredAt: undefined, updatedAt: new Date().toISOString() });
-    await this.enqueue(root.id, () => this.scanAndSync(root, 'manual'));
-    return { ok: true, operationId };
+    if (!root) throw notFound(`Root not found: ${binding.rootId}`);
+    // A3: the record leaves the「失败待处理」queue the moment the user acts on it,
+    // and the binding re-arms as pending (also un-ignored) with the error stamp
+    // cleared so the next round re-evaluates it.
+    await this.metaStorage.updateOperation(operationId, { needsAction: false });
+    await this.clearPendingFailures(root.id, binding.entryId, operationId);
+    await this.metaStorage.setBinding(binding.rootId, binding.relativePath, {
+      ...binding, status: "pending", ignoredAt: undefined, lastErrorAt: undefined, updatedAt: new Date().toISOString()
+    });
+    const result = await this.queueRound(root, 'manual');
+    return { ok: true, operationId, roundId: (result as { roundId?: string })?.roundId };
   }
 
   /** Mark a queued/running operation cancelled. The in-flight engine call is
@@ -780,6 +1022,7 @@ export class SyncRuntime {
       await this.authState?.setAuthFlag("invalid", new Date().toISOString());
       this.broadcast({ type: "auth-invalid" });
       this.log("warn", "Feishu credentials marked invalid");
+      await this.notify("credential", "飞书凭证已失效", "用户令牌无法续期，请在设置页重新授权。");
     }
   }
 
@@ -790,8 +1033,44 @@ export class SyncRuntime {
       await this.authState?.setAuthFlag("ok", new Date().toISOString());
       this.broadcast({ type: "auth-restored" });
       this.log("info", "Feishu credentials restored");
+      await this.notify("credential", "飞书凭证已恢复", "令牌续期成功，同步继续。");
     }
   }
+
+  /** Re-announce conflicts that appeared since the last notification check, at
+   *  most once per conflict id. Called at the end of every round so the channel
+   *  stays useful without spamming the same conflict each round. */
+  private async announceConflicts(root: SyncRoot): Promise<void> {
+    const open = await this.metaStorage.listConflicts("open");
+    for (const conflict of open) {
+      if (this.announcedConflicts.has(conflict.id)) continue;
+      const binding = await this.metaStorage.findBindingById(conflict.entryId);
+      if (!binding || binding.rootId !== root.id) continue;
+      this.announcedConflicts.add(conflict.id);
+      await this.notify("conflict", `同步冲突：${binding.relativePath}`, conflict.reason || "本地与远端都有改动，请在异常工作台选择保留哪一侧", { rootId: root.id, entryId: conflict.entryId });
+    }
+  }
+}
+
+/** B6.1: the round task's badge counts. `conflicts`/`skipped` come from the
+ *  final bindings so they describe the root's state after the round, while
+ *  pushed/pulled/merged/failed count what this round actually did. */
+function summarize(scanned: number, counters: { pushed: number; pulled: number; merged: number; failed: number }, bindings: EntryBinding[]): RoundSummary {
+  const active = bindings.filter((binding) => !binding.ignoredAt);
+  return {
+    scanned,
+    pushed: counters.pushed,
+    pulled: counters.pulled,
+    merged: counters.merged,
+    conflicts: active.filter((binding) => binding.status === "conflict").length,
+    failed: counters.failed,
+    skipped: active.filter((binding) => binding.status === "local-missing" || binding.status === "remote-missing").length
+  };
+}
+
+/** A scan moved nothing, so every action counter is zero by definition. */
+function emptySummary(scanned: number): RoundSummary {
+  return { scanned, pushed: 0, pulled: 0, merged: 0, conflicts: 0, failed: 0, skipped: 0 };
 }
 
 function numberFromEnv(name: string, fallback: number): number {

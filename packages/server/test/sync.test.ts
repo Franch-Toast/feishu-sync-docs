@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { FilesystemProvider, SyncEngine } from "@feishu-sync/core";
+import type { LocalFile, LocalScanOptions, SyncRoot } from "@feishu-sync/core";
 import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
 import { FakeRemote } from "./helpers/fake-remote.js";
 
@@ -72,7 +73,7 @@ test("imports a remote-only document into the local tree", async () => {
   await rm(globalDir, { recursive: true, force: true });
 });
 
-test("blocks duplicate-title pushes instead of creating a second remote copy", async () => {
+test("two files sharing an H1 push two documents titled by their file names", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-dup-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
   await writeFile(join(directory, "one.md"), "# Same Title\n\nfirst", "utf8");
@@ -80,19 +81,67 @@ test("blocks duplicate-title pushes instead of creating a second remote copy", a
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
-  remote.simulateH1Title = true;
   const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
   await gitStorage.initRoot(root);
   await metaStorage.initRootMeta(root.id, root.localPath);
   const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
 
+  // B2: the drive title is now the deterministic file name, not the H1, so the
+  // case that used to abort the round with "already has a document named …" is
+  // simply two independent documents.
   const scan = await engine.scan(root);
-  const first = scan.entries.find((entry) => entry.relativePath === "one.md")!;
+  for (const relativePath of ["one.md", "two.md"]) {
+    const entry = scan.entries.find((item) => item.relativePath === relativePath)!;
+    assert.equal((await engine.syncEntry(entry, root)).status, "clean");
+  }
+  assert.equal(remote.documents.size, 2);
+  assert.deepEqual([...remote.documents.values()].map((doc) => doc.name).sort(), ["one", "two"]);
+  assert.equal((await metaStorage.listConflicts("open")).length, 0);
+  // The remotes keep the titles they were created with, so a later scan of the
+  // persisted binding is still unambiguous.
+  const rescan = await engine.scan(root);
+  assert.deepEqual(rescan.entries.map((entry) => entry.status).sort(), ["clean", "clean"]);
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("a remote title owned by another entry becomes an actionable conflict", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-collide-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  await writeFile(join(directory, "alpha.md"), "# Alpha\n\na", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const first = (await engine.scan(root)).entries[0]!;
   const synced = await engine.syncEntry(first, root);
   assert.equal(synced.status, "clean");
-  const second = scan.entries.find((entry) => entry.relativePath === "two.md")!;
-  await assert.rejects(() => engine.syncEntry(second, root), /already has a document named "Same Title"/);
+  // The user renames the document in the drive, then creates a local file whose
+  // deterministic title is now taken by the still-bound alpha entry.
+  remote.rename(synced.remoteToken!, "beta");
+  await writeFile(join(directory, "beta.md"), "# Beta\n\nb", "utf8");
+
+  const second = (await engine.scan(root)).entries.find((entry) => entry.relativePath === "beta.md")!;
+  const collided = await engine.syncEntry(second, root);
+  assert.equal(collided.status, "conflict");
+  assert.equal(collided.remoteToken, undefined);
   assert.equal(remote.documents.size, 1);
+  const conflict = (await metaStorage.listConflicts("open"))[0]!;
+  assert.match(conflict.reason ?? "", /远端同名文档/);
+  assert.equal(conflict.collidingToken, synced.remoteToken);
+  assert.equal(conflict.collidingOwnerPath, "alpha.md");
+
+  // Action 1 (adopt): the colliding document changes hands, alpha re-pushes
+  // under its own file name, and no second copy is ever created.
+  const adopted = await engine.adoptCollidingDocument(collided.entryId, conflict.collidingToken!);
+  assert.equal(adopted.remoteToken, synced.remoteToken);
+  const alpha = (await metaStorage.listBindings(root.id)).find((entry) => entry.relativePath === "alpha.md");
+  assert.equal(alpha?.remoteToken, undefined);
+  assert.equal(alpha?.status, "pending");
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
@@ -381,3 +430,101 @@ test("exclude globs keep matching paths out of the scan and freeze already-bound
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
+
+/** Records which slice of the tree each round asked the local provider for. */
+class CountingLocal extends FilesystemProvider {
+  readonly scopes: (readonly string[] | undefined)[] = [];
+
+  override async scan(root: SyncRoot, options?: LocalScanOptions): Promise<LocalFile[]> {
+    this.scopes.push(options?.onlyPaths);
+    return super.scan(root, options);
+  }
+}
+
+test("a watch round hashes only the changed path and a poll round still walks everything (E1)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-scopedlocal-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  for (const name of ["a.md", "b.md", "c.md"]) await writeFile(join(directory, name), `# ${name}\n\nbody`, "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const local = new CountingLocal();
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, local, remote);
+
+  const first = await engine.scan(root);
+  for (const entry of first.entries) await engine.syncEntry(entry, root);
+  await gitStorage.commitBaseline(root.id, "sync: manual", "manual");
+
+  local.scopes.length = 0;
+  await engine.scan(root, "watch", { relativePaths: ["a.md"] });
+  assert.deepEqual(local.scopes[0], ["a.md"], "the watcher round must stat one file, not the tree");
+
+  local.scopes.length = 0;
+  await engine.scan(root, "poll");
+  assert.equal(local.scopes[0], undefined, "a poll round has no scope and keeps the full walk");
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("an event round reuses the cached tree and fetches only the announced token (E2)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-event-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  for (const name of ["a.md", "b.md", "c.md"]) await writeFile(join(directory, name), `# ${name}\n\nbody`, "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const first = await engine.scan(root);
+  for (const entry of first.entries) await engine.syncEntry(entry, root);
+  await gitStorage.commitBaseline(root.id, "sync: manual", "manual");
+  const token = (await metaStorage.getBinding(root.id, "b.md"))!.remoteToken!;
+  remote.edit(token, "# b.md\n\nedited in Feishu");
+
+  remote.listTreeCalls = 0;
+  remote.getDocumentCalls = 0;
+  const scoped = await engine.scan(root, "event", { remoteTokens: [token] });
+  assert.equal(remote.listTreeCalls, 0, "a drive event must not re-list the whole folder");
+  assert.equal(remote.getDocumentCalls, 1, "only the token that announced the change is fetched");
+  assert.equal((await metaStorage.getBinding(root.id, "b.md"))?.status, "pending", "the changed entry is armed for the pull");
+  assert.equal((await metaStorage.getBinding(root.id, "a.md"))?.status, "clean", "untouched entries stay clean");
+  assert.equal(scoped.scanned, 1);
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("a token the cache cannot resolve degrades to one full listing and says so (E5)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-degrade-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  await writeFile(join(directory, "a.md"), "# a.md\n\nbody", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const first = await engine.scan(root);
+  for (const entry of first.entries) await engine.syncEntry(entry, root);
+  await gitStorage.commitBaseline(root.id, "sync: manual", "manual");
+
+  engine.drainWarnings();
+  remote.listTreeCalls = 0;
+  await engine.scan(root, "event", { remoteTokens: ["a-token-nobody-has-ever-seen"] });
+  assert.equal(remote.listTreeCalls, 1, "correctness outranks the API budget: exactly one full listing");
+  assert.match(engine.drainWarnings().join("\n"), /回退为全量列举/);
+  assert.equal((await metaStorage.getBinding(root.id, "a.md"))?.status, "clean", "the degraded round invents nothing");
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+

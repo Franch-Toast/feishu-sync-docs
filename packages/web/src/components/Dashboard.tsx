@@ -11,6 +11,8 @@ interface DashboardProps {
   conflictsCount: number;
   syncing: boolean;
   authStatus?: AuthStatus;
+  /** F4: roots with a sync round in flight, for the「本轮同步进度」card (A4). */
+  activeRounds?: number;
   /** Optional tab so metric shortcuts land on the right workbench. */
   onOpenRoot: (rootId: string, tab?: DetailTab) => void;
   onOpenAdd: () => void;
@@ -26,7 +28,7 @@ function rootName(root: Root): string {
   return root.localPath.split(/[\\/]/).at(-1) ?? root.localPath;
 }
 
-export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatus, onOpenRoot, onOpenAdd, onDeleteRoot, onToggleRoot, onSyncNow, onRefresh, quickStart }: DashboardProps): React.JSX.Element {
+export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatus, activeRounds = 0, onOpenRoot, onOpenAdd, onDeleteRoot, onToggleRoot, onSyncNow, onRefresh, quickStart }: DashboardProps): React.JSX.Element {
   // Exception statistic: hard failures plus both missing flavors (and legacy
   // orphans before their reclassification round).
   const errorEntries = Object.values(rootStats).reduce(
@@ -63,6 +65,9 @@ export function Dashboard({ roots, rootStats, conflictsCount, syncing, authStatu
         ? <button className="metric metric-link" title="打开第一个存在异常条目的根目录" onClick={() => onOpenRoot(issueRoot.id, issueRootHasMissing ? "issues-missing" : "issues-conflicts")}><span>异常条目</span><strong>{errorEntries}</strong></button>
         : <div className="metric"><span>异常条目</span><strong>{errorEntries}</strong></div>}
       <div className="metric"><span>凭证状态</span><strong>{authStatus ? AUTH_STATUS_LABELS[authStatus] : "—"}</strong></div>
+      {/* F4/A4: one round per root is always visible, so “nothing running” is a
+          fact worth showing rather than an absent card. */}
+      <div className={`metric${activeRounds > 0 ? " metric-active" : ""}`}><span>本轮同步</span><strong>{activeRounds > 0 ? `${activeRounds} 个根目录进行中` : "空闲"}</strong><small>{activeRounds > 0 ? "可在任务中心查看整轮同步进度" : "等待下一次轮询或文件变动"}</small></div>
     </div>
 
     <section className="panel roots-panel">

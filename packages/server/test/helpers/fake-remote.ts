@@ -19,6 +19,10 @@ export class FakeRemote implements RemoteProvider {
   /** Mirrors Feishu's behaviour of deriving the drive-visible title from the
    *  markdown H1 instead of keeping the file name passed to createDocument. */
   simulateH1Title = false;
+  /** Return a token-only stub from createDocument, the way the real provider
+   *  does when the second step of the two-step create (docs_ai overwrite)
+   *  fails: the document exists, its body has not landed yet (B2). */
+  stubOnCreate = false;
   listTreeCalls = 0;
   createFolderCalls = 0;
   getDocumentCalls = 0;
@@ -65,6 +69,16 @@ export class FakeRemote implements RemoteProvider {
     this.documents.set(token, this.makeDocument(token, current.parentToken, current.name, content));
   }
 
+  /** Simulate the user renaming a document in the drive — the other way a
+   *  remote title stops matching the local file name (B4 collisions). */
+  rename(token: string, name: string): void {
+    const current = this.documents.get(token);
+    if (!current) throw new Error(`missing document: ${token}`);
+    this.documents.set(token, { ...current, name });
+    const node = this.folders.get(token);
+    if (node) this.folders.set(token, { ...node, name });
+  }
+
   async listTree(root: SyncRoot): Promise<RemoteTree> {
     this.listTreeCalls += 1;
     return { root: { token: root.remoteToken, name: "root", type: "folder", parentToken: "" }, nodes: [...this.folders.values(), ...this.documents.values()] };
@@ -86,7 +100,9 @@ export class FakeRemote implements RemoteProvider {
   }
 
   async createDocument(parentToken: string, name: string, content: string): Promise<RemoteDocument> {
-    const document = this.makeDocument(`${parentToken}/${name}`, parentToken, name, content);
+    // The stub variant models the real two-step create: the docx exists with its
+    // title, the markdown body only lands via the following overwrite.
+    const document = this.makeDocument(`${parentToken}/${name}`, parentToken, name, this.stubOnCreate ? "" : content);
     this.documents.set(document.token, document);
     return structuredClone(document);
   }

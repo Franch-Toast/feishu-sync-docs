@@ -261,7 +261,7 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
                 <span className="conflict-icon">!</span>
                 <span className="conflict-info">
                   <strong>{conflict.relativePath ?? conflict.id.slice(0, 12)}</strong>
-                  <small>产生于 {formatDateTime(conflict.createdAt)}</small>
+                  <small>{conflict.collidingToken ? "远端同名文档已被占用" : "本地与飞书同时修改"} · 产生于 {formatDateTime(conflict.createdAt)}</small>
                 </span>
                 <span className="arrow">→</span>
               </button>
@@ -332,6 +332,44 @@ export function IssuesView({ conflicts, entries, rootId, initialGroup, selected,
   };
 
   const resolutionContent = mode === "edit" ? editorValue : mergedContent;
+
+  // B4: a title collision is not a content conflict — the remote document is
+  // owned by another entry, so the merge workbench would be misleading. Offer
+  // the three actions the user can actually take instead of throwing.
+  if (selected.collidingToken) {
+    return <div className="conflict-view">
+      <div className="conflict-toolbar">
+        <button className="back" onClick={() => onSelect(undefined)}>← 返回列表</button>
+        <div>
+          <strong>{selected.relativePath ?? `冲突 ${selected.id.slice(0, 8)}`}</strong>
+          <span className="badge conflict-badge">同名冲突</span>
+        </div>
+        <button className="danger-ghost" onClick={() => void onResolve(selected.id, "abort")}>暂不处理</button>
+      </div>
+      <div className="panel collision-panel">
+        <div className="panel-heading">
+          <div><h3>飞书目标文件夹里已有同名文档</h3><span className="muted">{selected.reason || `远端文档（${selected.collidingToken}）已绑定到另一个条目，同步不猜测归属，也不会自动删除任何一侧。`}</span></div>
+        </div>
+        <ol className="collision-options">
+          <li>
+            <div className="collision-option-head"><strong>重命名本地文件后重新推送</strong><span className="badge ok-badge">推荐</span></div>
+            <span className="muted">远端标题由文件名推导。把本地 <code>{selected.relativePath}</code> 改成别的名字，再点「已重命名，重新检测」，碰撞会自然消失。</span>
+            <div className="collision-option-actions"><button className="secondary" onClick={() => onRefresh()}>已重命名，重新检测</button></div>
+          </li>
+          <li>
+            <div className="collision-option-head"><strong>采用该远端文档</strong></div>
+            <span className="muted">把那份飞书文档改绑到当前条目（本地文件内容会被远端内容覆盖）；原本持有它的条目下一轮会按自己的文件名重新创建文档，不会丢内容。</span>
+            <div className="collision-option-actions"><button className="secondary" onClick={() => void onResolve(selected.id, "remote")}>采用该远端文档</button></div>
+          </li>
+          <li>
+            <div className="collision-option-head"><strong>忽略</strong></div>
+            <span className="muted">不再评估该条目，也会离开「失败待处理」队列；可在「已忽略」分组随时恢复。</span>
+            <div className="collision-option-actions"><button className="danger-ghost" onClick={() => void runEntryAction(selected.entryId, () => onIgnoreEntry(selected.entryId, true))}>忽略该条目</button></div>
+          </li>
+        </ol>
+      </div>
+    </div>;
+  }
 
   return <div className="conflict-view">
     <div className="conflict-toolbar">

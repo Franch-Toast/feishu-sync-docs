@@ -6,7 +6,7 @@ import test from "node:test";
 import type { RemoteTree, SyncRoot } from "@feishu-sync/core";
 import { FeishuApiError } from "@feishu-sync/feishu";
 import type { WebSocket } from "ws";
-import { buildApp } from "../src/app.js";
+import { buildApp, type EventChannelPort } from "../src/app.js";
 import { CredentialStore } from "../src/credentials.js";
 import { AppConfigStore } from "../src/appconfig.js";
 import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
@@ -188,19 +188,23 @@ test("global preferences API reads and persists config.json", async () => {
   const app = buildIsolatedApp({ remote: new FakeRemote() });
   try {
     const initial = (await app.inject({ method: "GET", url: "/api/app-config" })).json();
-    assert.deepEqual(initial.preferences, { defaultPollIntervalMs: 15000, logLevel: "info", notifications: { conflict: true, failure: true, credential: true } });
+    assert.deepEqual(initial.preferences, { defaultPollIntervalMs: 15000, logLevel: "info", notifications: { conflict: false, failure: false, credential: false }, notificationChannel: "none" });
     assert.ok(initial.paths.config.endsWith("config.json"));
 
     const saved = await app.inject({ method: "PUT", url: "/api/app-config", payload: { defaultPollIntervalMs: 30000, logLevel: "debug" } });
     assert.equal(saved.statusCode, 200);
-    assert.deepEqual(saved.json().preferences, { defaultPollIntervalMs: 30000, logLevel: "debug", notifications: { conflict: true, failure: true, credential: true } });
+    assert.deepEqual(saved.json().preferences, { defaultPollIntervalMs: 30000, logLevel: "debug", notifications: { conflict: false, failure: false, credential: false }, notificationChannel: "none" });
 
     // Notification toggles (B6.8) are a server-side preference too: a partial
     // patch flips one category and the others keep their value.
-    const notified = await app.inject({ method: "PUT", url: "/api/app-config", payload: { notifications: { conflict: false } } });
+    const notified = await app.inject({ method: "PUT", url: "/api/app-config", payload: { notifications: { conflict: true } } });
     assert.equal(notified.statusCode, 200);
-    assert.deepEqual(notified.json().preferences.notifications, { conflict: false, failure: true, credential: true });
-    assert.equal((await app.inject({ method: "GET", url: "/api/app-config" })).json().preferences.notifications.conflict, false);
+    assert.deepEqual(notified.json().preferences.notifications, { conflict: true, failure: false, credential: false });
+    assert.equal((await app.inject({ method: "GET", url: "/api/app-config" })).json().preferences.notifications.conflict, true);
+
+    // D: the channel is validated too — an unknown one is a client error.
+    assert.equal((await app.inject({ method: "PUT", url: "/api/app-config", payload: { notificationChannel: "sms" } })).statusCode, 400);
+    assert.equal((await app.inject({ method: "PUT", url: "/api/app-config", payload: { notificationChannel: "feishu-bot" } })).json().preferences.notificationChannel, "feishu-bot");
 
     // Values persist on disk for the next process (config.json next to the app).
     const disk = JSON.parse(readFileSync(app.appConfig.configPath, "utf8")) as { preferences: { defaultPollIntervalMs: number; logLevel: string } };
@@ -913,3 +917,265 @@ test("the /api/events websocket handshake completes and delivers broadcasts", as
     await app.close();
   }
 });
+
+/* ---------------------------- C1/C2/C4: 凭证空值兜底与授权码换取 ---------------------------- */
+
+/** Every env key `CredentialStore.load()` or the OAuth routes fall back to; a
+ *  stray value in the developer's shell would silently change these answers. */
+const CREDENTIAL_ENV_KEYS = [
+  "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_ACCESS_TOKEN", "FEISHU_REFRESH_TOKEN",
+  "FEISHU_PROVIDER", "FEISHU_BASE_URL", "FEISHU_OAUTH_REDIRECT_URI"
+] as const;
+
+interface FetchCall {
+  url: string;
+  authorization?: string;
+  /** The urlencoded body of a token-endpoint POST, decoded. */
+  form?: Record<string, string>;
+}
+
+/** Stands in for the real websocket subscription so `refreshCredentialDependents`
+ *  can be observed without dialling out to Feishu. */
+class RecordingEventChannel implements EventChannelPort {
+  rebuilds = 0;
+  started = 0;
+  stopped = 0;
+  getState(): { status: "disabled" } {
+    return { status: "disabled" };
+  }
+  async start(): Promise<void> {
+    this.started += 1;
+  }
+  async rebuild(): Promise<void> {
+    this.rebuilds += 1;
+  }
+  stop(): void {
+    this.stopped += 1;
+  }
+}
+
+function jsonResponse(value: unknown): Response {
+  return new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+const OAUTH_TOKEN_SUCCESS = {
+  code: 0,
+  access_token: "oauth-access-token-1",
+  refresh_token: "oauth-refresh-token-1",
+  expires_in: 7200,
+  refresh_token_expires_in: 15_552_000,
+  scope: "offline_access docx"
+};
+
+/** An app whose only network dependency is a recorded, scripted fetch. */
+function buildCredentialApp(options: { tokenReplies?: unknown[] } = {}) {
+  const savedEnv = new Map<string, string | undefined>();
+  for (const key of CREDENTIAL_ENV_KEYS) {
+    savedEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+  const calls: FetchCall[] = [];
+  const tokenReplies = [...(options.tokenReplies ?? [OAUTH_TOKEN_SUCCESS])];
+  const appConfig = new AppConfigStore(join(mkdtempSync(join(tmpdir(), "feishu-sync-oauth-")), "config.json"));
+  configDirs.push(dirname(appConfig.configPath));
+  const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = new URL(String(input));
+    const body = init?.body;
+    calls.push({
+      url: url.href,
+      authorization: new Headers(init?.headers ?? {}).get("authorization") ?? undefined,
+      form: body instanceof URLSearchParams ? Object.fromEntries(body.entries()) : undefined
+    });
+    if (url.pathname === "/open-apis/authen/v1/user_info") return jsonResponse({ code: 0, data: { name: "Tester", open_id: "ou_1" } });
+    if (url.pathname === "/oauth/v3/token") {
+      const reply = tokenReplies.length > 1 ? tokenReplies.shift() : tokenReplies[0];
+      return jsonResponse(reply ?? OAUTH_TOKEN_SUCCESS);
+    }
+    throw new Error(`unexpected request ${url.href}`);
+  };
+  const credentials = new CredentialStore(appConfig, fetchImpl);
+  const eventChannel = new RecordingEventChannel();
+  const app = buildApp({ credentials, appConfig, eventChannel });
+  const close = async (): Promise<void> => {
+    await app.close();
+    for (const [key, value] of savedEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  return { app, calls, credentials, eventChannel, close };
+}
+
+test("C1: a blank access token probes with the stored credential instead of erasing it", async () => {
+  const harness = buildCredentialApp();
+  try {
+    const saved = (await harness.app.inject({ method: "PUT", url: "/api/settings", payload: { mode: "user", accessToken: "stored-token-abcdef123456" } })).json();
+    assert.equal(saved.hasAccessToken, true);
+    assert.ok(!String(saved.accessToken).includes("123456"), "responses stay redacted");
+
+    // The settings form renders saved secrets masked, so submitting it untouched
+    // posts empty fields. That must probe with the token on disk…
+    const probe = (await harness.app.inject({ method: "POST", url: "/api/settings/test-connection", payload: { mode: "user", accessToken: "", refreshToken: "   " } })).json();
+    assert.equal(probe.ok, true, probe.error);
+    const userInfo = harness.calls.filter((call) => call.url.includes("user_info")).at(-1)!;
+    assert.equal(userInfo.authorization, "Bearer stored-token-abcdef123456");
+
+    // …and must never be a reason to blank what is stored.
+    const after = (await harness.app.inject({ method: "GET", url: "/api/settings" })).json();
+    assert.equal(after.hasAccessToken, true);
+    assert.equal(after.authStatus, "ok");
+
+    // An explicit clear still works: the form sends `undefined`, a caller that
+    // really wants to wipe the token has to say so with PUT (documented).
+    await harness.app.inject({ method: "PUT", url: "/api/settings", payload: { accessToken: "" } });
+    assert.equal((await harness.app.inject({ method: "GET", url: "/api/settings" })).json().hasAccessToken, false);
+    const cleared = await harness.app.inject({ method: "POST", url: "/api/settings/test-connection", payload: { mode: "user" } });
+    assert.equal(cleared.json().ok, false);
+    assert.match(cleared.json().error, /缺少 user access token/);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("C2: /api/oauth/start requires app credentials and returns a Feishu authorize URL", async () => {
+  const harness = buildCredentialApp();
+  try {
+    const blocked = await harness.app.inject({ method: "GET", url: "/api/oauth/start" });
+    assert.equal(blocked.statusCode, 400);
+    assert.equal(blocked.json().error, "前往飞书授权前需要先填写 App ID 与 App Secret");
+
+    await harness.app.inject({ method: "PUT", url: "/api/settings", payload: { mode: "user", appId: "cli_a1b2c3d4", appSecret: "app-secret-value" } });
+
+    const started = (await harness.app.inject({ method: "GET", url: "/api/oauth/start", headers: { host: "127.0.0.1:8790" } })).json();
+    const authorize = new URL(started.url);
+    assert.equal(authorize.origin, "https://accounts.feishu.cn");
+    assert.equal(authorize.pathname, "/open-apis/authen/v1/authorize");
+    assert.equal(authorize.searchParams.get("client_id"), "cli_a1b2c3d4");
+    assert.equal(authorize.searchParams.get("scope"), "offline_access");
+    assert.equal(authorize.searchParams.get("state"), started.state);
+    assert.match(started.state, /^[0-9a-f]{32}$/);
+    // The loopback redirect follows the request host so any port works.
+    assert.equal(started.redirectUri, "http://127.0.0.1:8790/oauth/callback");
+    assert.equal(authorize.searchParams.get("redirect_uri"), started.redirectUri);
+    assert.equal(started.url.includes("app-secret-value"), false, "the secret never leaks into the URL");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("C2: the callback exchanges the code once, persists both tokens and burns the state", async () => {
+  const harness = buildCredentialApp();
+  try {
+    await harness.app.inject({ method: "PUT", url: "/api/settings", payload: { mode: "user", appId: "cli_a1b2c3d4", appSecret: "app-secret-value" } });
+    assert.equal((await harness.app.inject({ method: "GET", url: "/api/settings" })).json().authStatus, "invalid");
+
+    const started = (await harness.app.inject({ method: "GET", url: "/api/oauth/start", headers: { host: "127.0.0.1:8790" } })).json();
+    const page = await harness.app.inject({ method: "GET", url: `/oauth/callback?code=auth-code-xyz&state=${started.state}` });
+    assert.equal(page.statusCode, 200);
+    assert.match(page.headers["content-type"] as string, /text\/html/);
+    assert.ok(page.body.includes("授权完成"), page.body.slice(0, 200));
+
+    const tokenCall = harness.calls.find((call) => call.url.includes("/oauth/v3/token"))!;
+    assert.equal(tokenCall.url, "https://accounts.feishu.cn/oauth/v3/token");
+    assert.deepEqual(tokenCall.form, {
+      grant_type: "authorization_code",
+      client_id: "cli_a1b2c3d4",
+      client_secret: "app-secret-value",
+      code: "auth-code-xyz",
+      redirect_uri: "http://127.0.0.1:8790/oauth/callback"
+    });
+
+    const settings = (await harness.app.inject({ method: "GET", url: "/api/settings" })).json();
+    assert.equal(settings.hasAccessToken, true);
+    assert.equal(settings.hasRefreshToken, true);
+    assert.equal(settings.authStatus, "ok");
+    assert.equal(settings.refreshSupported, true);
+    assert.ok(settings.refreshTokenExpiresAt, "refresh expiry is recorded for the maintenance tick");
+
+    // A fresh token pair has to reach the live provider, and the probe must now
+    // authenticate with the exchanged token rather than the old manual one.
+    assert.ok(harness.eventChannel.rebuilds >= 1, "the live provider and event channel follow the new token");
+    await harness.app.inject({ method: "POST", url: "/api/settings/test-connection", payload: {} });
+    assert.equal(harness.calls.filter((call) => call.url.includes("user_info")).at(-1)?.authorization, "Bearer oauth-access-token-1");
+
+    // `state` is a single-use CSRF guard: replaying the callback is refused.
+    const replay = await harness.app.inject({ method: "GET", url: `/oauth/callback?code=auth-code-xyz&state=${started.state}` });
+    assert.ok(replay.body.includes("授权失败"), replay.body.slice(0, 200));
+    assert.ok(replay.body.includes("授权会话已过期或不匹配"), replay.body.slice(0, 400));
+    assert.equal(harness.calls.filter((call) => call.url.includes("/oauth/v3/token")).length, 1, "the replay never hit Feishu");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("C2: /api/oauth/code pastes the code by hand and reports rejections in Chinese", async () => {
+  const harness = buildCredentialApp({
+    tokenReplies: [
+      { code: 20004, error: "invalid_code", error_description: "the code is expired" },
+      OAUTH_TOKEN_SUCCESS
+    ]
+  });
+  try {
+    // No flow was ever started, so there is nothing to complete against.
+    const noSession = await harness.app.inject({ method: "POST", url: "/api/oauth/code", payload: { code: "any-code" } });
+    assert.equal(noSession.statusCode, 400);
+    assert.equal(noSession.json().error, "没有进行中的授权会话，请先点击「前往飞书授权」");
+
+    await harness.app.inject({ method: "PUT", url: "/api/settings", payload: { mode: "user", appId: "cli_a1b2c3d4", appSecret: "app-secret-value" } });
+    const empty = await harness.app.inject({ method: "POST", url: "/api/oauth/code", payload: { code: "   " } });
+    assert.equal(empty.statusCode, 400);
+    assert.equal(empty.json().error, "code is required");
+
+    const badState = await harness.app.inject({ method: "POST", url: "/api/oauth/code", payload: { code: "any-code", state: "deadbeef" } });
+    assert.equal(badState.statusCode, 400);
+    assert.equal(badState.json().error, "授权会话已过期或不匹配，请重新发起授权");
+
+    const started = (await harness.app.inject({ method: "GET", url: "/api/oauth/start", headers: { host: "127.0.0.1:8790" } })).json();
+    // An expired code is Feishu's answer to *our* request, so the Chinese label
+    // has to survive all the way to the API client in the browser.
+    const expired = await harness.app.inject({ method: "POST", url: "/api/oauth/code", payload: { code: "expired-code", state: started.state } });
+    assert.equal(expired.statusCode, 400);
+    assert.match(expired.json().error, /授权码已过期/);
+    assert.match(expired.json().error, /the code is expired/);
+    assert.equal(expired.json().settings, undefined, "a failed exchange returns no settings");
+    assert.equal((await harness.app.inject({ method: "GET", url: "/api/settings" })).json().hasAccessToken, false);
+
+    // The state was consumed by the attempt; the next paste starts from scratch
+    // and falls back to the redirect URI of the last beginOAuth.
+    harness.eventChannel.rebuilds = 0;
+    const retried = await harness.app.inject({ method: "POST", url: "/api/oauth/code", payload: { code: "fresh-code" } });
+    assert.equal(retried.statusCode, 200);
+    assert.equal(retried.json().ok, true);
+    assert.equal(retried.json().refreshTokenReceived, true);
+    assert.equal(retried.json().settings.hasRefreshToken, true);
+    assert.equal(retried.json().settings.authStatus, "ok");
+    assert.equal(retried.json().settings.refreshToken, "oauth-…en-1", "the response stays redacted");
+    assert.equal(harness.calls.filter((call) => call.url.includes("/oauth/v3/token")).at(-1)?.form?.redirect_uri, "http://127.0.0.1:8790/oauth/callback");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("C2: a cancelled or failing authorization still answers with a readable page", async () => {
+  const harness = buildCredentialApp();
+  try {
+    const denied = await harness.app.inject({ method: "GET", url: "/oauth/callback?error=access_denied&state=whatever" });
+    assert.equal(denied.statusCode, 200);
+    assert.ok(denied.body.includes("授权未完成"), denied.body.slice(0, 200));
+    assert.ok(denied.body.includes("你取消了授权"), denied.body.slice(0, 400));
+    assert.ok(denied.body.includes("返回工作台"), "a failed page offers a way back");
+
+    const unknownError = await harness.app.inject({ method: "GET", url: "/oauth/callback?error=interaction_required" });
+    assert.ok(unknownError.body.includes("interaction_required"), "unmapped reasons are shown verbatim, never hidden");
+
+    const codeless = await harness.app.inject({ method: "GET", url: "/oauth/callback" });
+    assert.ok(codeless.body.includes("回调缺少 code 参数"), codeless.body.slice(0, 300));
+
+    // Nothing was persisted on any of these paths.
+    assert.equal((await harness.app.inject({ method: "GET", url: "/api/settings" })).json().hasAccessToken, false);
+    assert.equal(harness.calls.some((call) => call.url.includes("/oauth/v3/token")), false);
+  } finally {
+    await harness.close();
+  }
+});
+
