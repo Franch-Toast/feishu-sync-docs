@@ -749,3 +749,89 @@ test("a baseline commit does not retrigger the watcher into an endless loop (B1)
     cleanup(scenario);
   }
 });
+
+test("an error entry whose content reverts stays failed until a manual retry", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entryId = result.entries[0]!.entryId;
+    const token = result.entries[0]!.remoteToken!;
+
+    // A persistent write failure leaves the entry in the error state.
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    scenario.remote.failWrites = true;
+    const failed = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(failed.entries[0]?.status, "error");
+
+    // The user reverts the edit: with both sides unchanged the entry must NOT
+    // resurrect into the retry queue on later rounds (no cross-round churn).
+    writeFileSync(join(scenario.directory, "notes.md"), "shared line\n", "utf8");
+    scenario.remote.failWrites = false;
+    const stuck = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(stuck.entries[0]?.status, "error");
+    assert.equal(scenario.remote.documents.get(token)?.content, "shared line\n");
+
+    // The task center retry re-arms the entry and the round succeeds.
+    const failedOperation = (await scenario.metaStorage.listOperations()).find((operation) => operation.status === "failed");
+    assert.ok(failedOperation, "expected a failed operation record");
+    await scenario.runtime.retryTask(failedOperation.id);
+    const binding = (await scenario.metaStorage.listBindings(root.id))[0]!;
+    assert.equal(binding.status, "clean");
+    assert.equal(binding.entryId, entryId);
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("the failed task queue keeps only the latest failure and drops dealt-with entries", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    const first = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entryId = first.entries[0]!.entryId;
+
+    // First failure: it shows up in the failed queue joined with its path.
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    scenario.remote.failWrites = true;
+    await scenario.runtime.syncRoot(root.id);
+    const queue1 = await scenario.runtime.listTasks({ status: "failed" });
+    assert.equal(queue1.tasks.length, 1);
+    assert.equal(queue1.tasks[0]?.entryId, entryId);
+    assert.equal(queue1.tasks[0]?.relativePath, "notes.md");
+
+    // Retrying while writes are still broken records a second failure for the
+    // same entry, but only the latest one stays visible in the queue.
+    const retried = await scenario.runtime.retryTask(queue1.tasks[0]!.id);
+    assert.ok(retried.ok);
+    const queue2 = await scenario.runtime.listTasks({ status: "failed" });
+    assert.equal(queue2.tasks.length, 1);
+    assert.notEqual(queue2.tasks[0]!.id, queue1.tasks[0]!.id);
+
+    // A successful manual retry re-syncs the entry and empties the queue.
+    scenario.remote.failWrites = false;
+    await scenario.runtime.retryTask(queue2.tasks[0]!.id);
+    const queue3 = await scenario.runtime.listTasks({ status: "failed" });
+    assert.equal(queue3.tasks.length, 0);
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("ignoring a failed entry drops it out of the failed queue", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    await scenario.runtime.syncRoot(root.id);
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    scenario.remote.failWrites = true;
+    await scenario.runtime.syncRoot(root.id);
+    assert.equal((await scenario.runtime.listTasks({ status: "failed" })).tasks.length, 1);
+
+    const binding = (await scenario.metaStorage.listBindings(root.id))[0]!;
+    await scenario.runtime.setEntryIgnored(binding.entryId, true);
+    assert.equal((await scenario.runtime.listTasks({ status: "failed" })).tasks.length, 0);
+  } finally {
+    cleanup(scenario);
+  }
+});

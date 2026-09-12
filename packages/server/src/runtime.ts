@@ -7,6 +7,7 @@ import { SyncEngine } from "@feishu-sync/core";
 import { sha256, matchesAnyGlob } from "@feishu-sync/core";
 import { categorizeError, FeishuApiError, RETRIABLE_ERROR_CATEGORIES } from "@feishu-sync/feishu";
 import type { AuthStateStore } from "./appconfig.js";
+import { NoopNotifier, type Notifier, type NotificationEvent } from "./notify.js";
 import { ApiCallStats, instrumentRemote, type ApiStatsSnapshot } from "./apistats.js";
 import type { Commit, ConflictRecord, EntryBinding, ErrorCategory, FolderBinding, GitStorage, LocalProvider, MetaStorage, OperationRecord, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger } from "@feishu-sync/core";
 
@@ -87,6 +88,9 @@ export class SyncRuntime {
   /** Tally of remote API calls, surfaced as the settings-page 调用统计 (B6.2). */
   private readonly apiStats = new ApiCallStats();
   private readonly countedRemote: RemoteProvider;
+  private readonly notifier: Notifier;
+  /** Conflict ids already announced through the notifier (per process). */
+  private readonly notifiedConflicts = new Set<string>();
 
   constructor(
     private readonly gitStorage: GitStorage,
@@ -100,7 +104,9 @@ export class SyncRuntime {
     /** Auth lifecycle flags live in config.json; absent in bare-runtime tests. */
     private readonly authState?: AuthStateStore,
     /** Injectable auto-retry backoff schedule/sleep so tests never wait for real. */
-    retryOptions?: { backoffMs?: number[]; sleep?: (ms: number) => Promise<void> }
+    retryOptions?: { backoffMs?: number[]; sleep?: (ms: number) => Promise<void> },
+    /** Conflict/failure/credential announcements; defaults to a silent no-op. */
+    notifier?: Notifier
   ) {
     // Every remote call goes through the instrumented provider so the engine
     // and the runtime's own probes share one tally.
@@ -108,6 +114,7 @@ export class SyncRuntime {
     this.engine = new SyncEngine(gitStorage, metaStorage, local, this.countedRemote);
     this.backoffMs = retryOptions?.backoffMs ?? [1_000, 2_000, 4_000];
     this.sleepImpl = retryOptions?.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.notifier = notifier ?? new NoopNotifier();
   }
 
   /** Remote provider whose calls are tallied; API routes should use this one. */
@@ -123,6 +130,13 @@ export class SyncRuntime {
   /** Structured logging helper; no-ops when no logger is injected (tests). */
   private log(level: "debug" | "info" | "warn" | "error", message: string, data?: Record<string, unknown>): void {
     this.logger?.[level](data ?? {}, message);
+  }
+
+  /** Fire-and-forget notification (conflicts/failures/credential loss): a
+   *  failing notifier must never break the sync round, so its errors are
+   *  swallowed and logged. The default notifier is a silent no-op. */
+  private notify(event: NotificationEvent): void {
+    void this.notifier.send(event).catch((error) => this.log("warn", "notifier delivery failed", { error: error instanceof Error ? error.message : String(error) }));
   }
 
   async start(): Promise<void> {
@@ -254,14 +268,19 @@ export class SyncRuntime {
    *  serializes with watcher/poll tasks through the per-root queue, skips
    *  disabled roots, ignores drive events that merely echo our own recent push,
    *  and narrows the round to the changed token via an incremental scope. */
-  async requestSync(rootId: string, fileToken?: string): Promise<void> {
+  async requestSync(rootId: string, fileToken?: string, folderToken?: string): Promise<void> {
     const root = await this.metaStorage.getRoot(rootId);
     if (!root || !root.enabled) return;
     if (fileToken && this.isRecentRemotePush(fileToken)) {
       this.log("debug", "drive event ignored: echo of a recent push", { rootId, fileToken });
       return;
     }
-    const scope: SyncScope | undefined = fileToken ? { remoteTokens: [fileToken] } : undefined;
+    // folderToken (drive.file.created_in_folder) feeds the incremental fast
+    // path: an unbound new token is located with a single-level listing of the
+    // announced folder instead of a full drive walk.
+    const scope: SyncScope | undefined = fileToken || folderToken
+      ? { remoteTokens: fileToken ? [fileToken] : undefined, remoteParentTokens: folderToken ? [folderToken] : undefined }
+      : undefined;
     await this.enqueue(root.id, () => this.scanAndSync(root, 'event', scope));
   }
 
@@ -572,6 +591,14 @@ export class SyncRuntime {
       this.log("warn", "git commit failed", { rootId: root.id, error: error instanceof Error ? error.message : String(error) });
     }
     await this.markAuthHealthy();
+    // Announce conflicts this round produced (Notifier hook). Each conflict is
+    // announced once per process; resolving and re-conflicting makes a new id.
+    for (const conflict of await this.metaStorage.listConflicts("open")) {
+      if (this.notifiedConflicts.has(conflict.id)) continue;
+      this.notifiedConflicts.add(conflict.id);
+      const binding = await this.metaStorage.findBindingById(conflict.entryId);
+      this.notify({ category: "conflict", title: "Sync conflict needs a decision", body: `${binding?.relativePath ?? conflict.entryId}: local and remote diverged on both sides`, rootId: root.id, entryId: conflict.entryId, at: new Date().toISOString() });
+    }
     this.broadcast({ type: "sync", rootId: root.id, trigger });
     this.log("info", "sync round completed", { rootId: root.id, elapsedMs: Date.now() - startedAt, trigger });
     return { ...scan, entries: finalBindings };
@@ -612,6 +639,7 @@ export class SyncRuntime {
           this.broadcast({ type: "operation-failed", rootId: root.id, operation: failedOp });
           this.broadcast({ type: "error", rootId: root.id, entryId: binding.entryId, error: message });
           this.log("warn", "entry sync aborted: credentials invalid", { rootId: root.id, entryId: binding.entryId });
+          this.notify({ category: "credential", title: "Feishu credentials are no longer valid", body: `${binding.relativePath}: ${message}`, rootId: root.id, entryId: binding.entryId, at: new Date().toISOString() });
           await this.flagAuthInvalid();
           return true;
         }
@@ -636,8 +664,9 @@ export class SyncRuntime {
         this.broadcast({ type: "operation-failed", rootId: root.id, operation: failedOp });
         this.broadcast({ type: "error", rootId: root.id, entryId: binding.entryId, error: message });
         this.log("warn", "entry sync failed", { rootId: root.id, entryId: binding.entryId, category, retryCount, error: message });
-        // Surface the failure on the entry itself; the next scan resets "error"
-        // entries to "pending" so they are retried.
+        this.notify({ category: "failure", title: "Entry sync failed and awaits a retry", body: `${binding.relativePath}: ${message}`, rootId: root.id, entryId: binding.entryId, at: new Date().toISOString() });
+        // Surface the failure on the entry itself. The status stays "error"
+        // across rounds — no automatic resurrection; retryTask re-arms it.
         const failed = await this.metaStorage.findBindingById(binding.entryId);
         if (failed) await this.metaStorage.setBinding(root.id, failed.relativePath, { ...failed, status: "error", updatedAt: new Date().toISOString() });
         return false;
@@ -657,8 +686,19 @@ export class SyncRuntime {
       ? operations.filter((operation) => operation.status === "queued" || operation.status === "running")
       : operations;
     const tasks: TaskView[] = [];
+    // The "failed & awaiting" queue only holds failures nobody has dealt with:
+    // once the entry is ignored or has re-synced (clean/pending) the record
+    // drops out, and only the latest failure per entry stays visible (the
+    // storage listing is newest-first, so first sight wins the dedupe).
+    const seenEntries = new Set<string>();
     for (const operation of visible) {
+      if (operation.entryId) {
+        const isLatest = !seenEntries.has(operation.entryId);
+        seenEntries.add(operation.entryId);
+        if (options.status === "failed" && !isLatest) continue;
+      }
       const binding = operation.entryId ? await this.metaStorage.findBindingById(operation.entryId) : undefined;
+      if (options.status === "failed" && binding && (binding.ignoredAt || binding.status === "clean" || binding.status === "pending")) continue;
       tasks.push({ ...operation, relativePath: binding?.relativePath, kind: binding?.kind });
     }
     const nextCursor = operations.length === limit ? operations[operations.length - 1]!.id : undefined;

@@ -3,6 +3,7 @@ import { posix } from "node:path";
 import { buildBlockPatch, decideSync } from "./merge.js";
 import { parseMarkdown, restoreAssetReferences, restoreInternalLinks, rewriteAssetReferences, rewriteInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
+import { normalizeForMatch, sanitizeLocalSegment } from "./names.js";
 import { matchesAnyGlob } from "./glob.js";
 import type {
   EntryBinding, GitStorage, LocalFile, LocalProvider, MetaStorage, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger
@@ -40,15 +41,27 @@ export class SyncEngine {
   async scan(root: SyncRoot, trigger: SyncTrigger = 'manual', scope?: SyncScope): Promise<{ entries: EntryBinding[]; conflicts: number }> {
     const mode: SyncMode = root.mode ?? "bidirectional";
     // Incremental scope is honored only for event/watch triggers: the costly
-    // per-entry loops below are restricted to the changed paths/tokens, while
-    // local.scan()/refreshRemoteTree() still run once to produce a consistent
-    // snapshot for those loops to filter over. poll/manual always scan fully.
+    // per-entry loops below are restricted to the changed paths/tokens, and
+    // both sides try a scoped fast path (partial stat + single-document reads)
+    // before falling back to the full scans. poll/manual always scan fully.
     const scopedPaths = scope?.relativePaths?.length ? new Set(scope.relativePaths) : undefined;
     const scopedTokens = scope?.remoteTokens?.length ? new Set(scope.remoteTokens) : undefined;
+    const scopedParentTokens = scope?.remoteParentTokens ?? [];
     const incremental = (trigger === 'event' || trigger === 'watch') && Boolean(scopedPaths || scopedTokens);
     const inScope = (relativePath: string, remoteToken?: string): boolean =>
       !incremental || (scopedPaths?.has(relativePath) ?? false) || (remoteToken !== undefined && (scopedTokens?.has(remoteToken) ?? false));
-    let files = await this.local.scan(root);
+    // Local fast path: hash only the announced paths when the provider can;
+    // anything unexpected falls back to the full scan below.
+    let files: LocalFile[];
+    if (incremental && scopedPaths && this.local.scanEntries) {
+      try {
+        files = await this.local.scanEntries(root, [...scopedPaths]);
+      } catch {
+        files = await this.local.scan(root);
+      }
+    } else {
+      files = await this.local.scan(root);
+    }
     const initialBindings = await this.metaStorage.listBindings(root.id);
     const existingByPath = new Map(initialBindings.map((binding) => [binding.relativePath, binding]));
     let localByPath = new Map(files.map((file) => [file.relativePath, file]));
@@ -72,9 +85,13 @@ export class SyncEngine {
       // status are re-evaluated until the user restores them.
       if (existing?.ignoredAt) continue;
       const changed = existing?.remoteContentHash !== file.contentHash;
+      // An "error" entry stays in error until its content changes or the user
+      // retries: resurrecting it unconditionally turned every round into an
+      // unbounded retry loop for permanently failing entries (the failed task
+      // also stays visible in the task center for manual retry/ignore).
       const status = existing?.status === "conflict"
         ? "conflict"
-        : changed || existing?.status === "error"
+        : changed
           ? "pending"
           : existing?.status ?? "pending";
       const binding: EntryBinding = {
@@ -95,11 +112,44 @@ export class SyncEngine {
       if (file.kind === "asset" && changed && existing?.remoteToken) changedAssets.push(file.relativePath);
     }
 
-    const remoteTree = await this.refreshRemoteTree(root);
+    // Remote fast path: read only the announced tokens (plus the tokens of the
+    // scoped local bindings) as a minimal tree; an unbound token must be
+    // locatable in one of the announced parent folders, otherwise fall back to
+    // the full drive walk so no remote change is missed.
+    let remoteTree: RemoteTree | undefined;
+    // Documents already fetched for the minimal tree; the binding loop below
+    // reuses them so a scoped round reads each document exactly once.
+    const documentCache = new Map<string, RemoteDocument>();
+    if (incremental) {
+      const fastTokens = new Set(scopedTokens ?? []);
+      if (scopedPaths) {
+        for (const binding of initialBindings) {
+          if (binding.remoteToken && scopedPaths.has(binding.relativePath)) fastTokens.add(binding.remoteToken);
+        }
+      }
+      if (fastTokens.size > 0) remoteTree = await this.buildScopedRemoteTree(root, fastTokens, scopedParentTokens, documentCache);
+    }
+    if (!remoteTree) remoteTree = await this.refreshRemoteTree(root);
+    // Same-name duplicate governance: only on full rounds, where the tree is
+    // complete and the pairing loops below can rely on a deduplicated listing.
+    if (!incremental) await this.governRemoteDuplicates(root, remoteTree, mode);
     const remotePathMaps = this.buildRemotePathMaps(root.remoteToken, remoteTree);
     const remoteDocumentPaths = remotePathMaps.documents;
     const remoteAssetPaths = remotePathMaps.assets;
     const remoteAssetParents = remotePathMaps.assetParents;
+    // Local documents still pairable with an unbound remote token, keyed by
+    // NFC-normalized base name for the title-based pairing below.
+    const unboundTitlePaths = new Map<string, string[]>();
+    for (const file of files) {
+      if (file.kind !== "document") continue;
+      const binding = existingByPath.get(file.relativePath);
+      if (binding?.remoteToken || binding?.ignoredAt) continue;
+      const baseName = normalizeForMatch(posix.basename(file.relativePath).replace(/\.md$/i, ""));
+      if (!baseName) continue;
+      const bucket = unboundTitlePaths.get(baseName);
+      if (bucket) bucket.push(file.relativePath); else unboundTitlePaths.set(baseName, [file.relativePath]);
+    }
+    const importedPaths = new Set<string>();
     for (const node of remoteTree.nodes.filter((item) => item.type === "document")) {
       const relativePath = remoteDocumentPaths.get(node.token);
       if (!relativePath) continue;
@@ -110,16 +160,49 @@ export class SyncEngine {
       const existing = await this.metaStorage.getBinding(root.id, relativePath);
       if (existing?.remoteToken && existing.remoteToken !== node.token) continue;
       if (existing && existing.kind === "document" && localByPath.has(relativePath)) {
-        if (!existing.remoteToken) await this.recordRemoteCollision(root, existing, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents);
+        if (!existing.remoteToken) await this.recordRemoteCollision(root, existing, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents, localByPath);
         else await this.metaStorage.setBinding(root.id, relativePath, { ...existing, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, status: "pending", updatedAt: new Date().toISOString() });
         continue;
       }
+      // Title pairing: a document whose drive title equals the local base name
+      // (NFC-normalized) re-binds even when the drive path differs from the
+      // local path. This recovers bindings lost to metadata resets without
+      // re-importing the document under its title-derived path — which used
+      // to duplicate the document and block the next push of the original.
+      if (!localByPath.has(relativePath)) {
+        const candidates = unboundTitlePaths.get(normalizeForMatch(node.name));
+        if (candidates && candidates.length === 1) {
+          const targetPath = candidates[0]!;
+          const target = await this.metaStorage.getBinding(root.id, targetPath);
+          if (!target?.remoteToken) {
+            await this.metaStorage.setBinding(root.id, targetPath, {
+              entryId: target?.entryId ?? randomUUID(),
+              rootId: root.id,
+              relativePath: targetPath,
+              kind: "document",
+              remoteToken: node.token,
+              remoteParentToken: node.parentToken || root.remoteToken,
+              status: "pending",
+              remoteContentHash: localByPath.get(targetPath)?.contentHash,
+              lastSyncCommit: target?.lastSyncCommit,
+              updatedAt: new Date().toISOString()
+            });
+            continue;
+          }
+        }
+      }
       if (!localByPath.has(relativePath) && mode !== "push-only") {
-        await this.importRemoteDocument(root, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents);
+        importedPaths.add(relativePath);
+        await this.importRemoteDocument(root, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents, localByPath);
       }
     }
     if (remoteTree.nodes.some((node) => node.type === "document" && remoteDocumentPaths.has(node.token) && !localByPath.has(remoteDocumentPaths.get(node.token)!))) {
-      files = await this.local.scan(root);
+      // Rescan after imports; stay scoped during incremental rounds so a
+      // single new remote document does not force a full local walk.
+      const rescanPaths = [...(scopedPaths ?? []), ...importedPaths];
+      files = this.local.scanEntries && rescanPaths.length > 0
+        ? await this.local.scanEntries(root, rescanPaths)
+        : await this.local.scan(root);
       localByPath = new Map(files.map((file) => [file.relativePath, file]));
     }
 
@@ -147,6 +230,9 @@ export class SyncEngine {
     const bindingByPath = new Map(bindingsAfterFiles.map((binding) => [binding.relativePath, binding]));
     const referencesByAsset = new Map<string, string[]>();
     for (const file of files.filter((item) => item.kind === "document")) {
+      // Incremental rounds only rebuild references for the scoped documents;
+      // unscoped assets keep their stored references untouched below.
+      if (incremental && !(scopedPaths?.has(file.relativePath) ?? false)) continue;
       const content = await this.local.readText(root, file.relativePath);
       const documentBinding = bindingByPath.get(file.relativePath);
       if (!documentBinding) continue;
@@ -157,6 +243,10 @@ export class SyncEngine {
       }
     }
     for (const asset of bindingsAfterFiles.filter((binding) => binding.kind === "asset")) {
+      // Guard the incremental fast path: assets outside the scope were not
+      // scanned, so their reference lists must not be overwritten with an
+      // (empty) default.
+      if (incremental && !(scopedPaths?.has(asset.relativePath) ?? false)) continue;
       await this.metaStorage.saveAssetReferences(root.id, asset.relativePath, referencesByAsset.get(asset.relativePath) ?? []);
     }
 
@@ -177,14 +267,16 @@ export class SyncEngine {
       if (binding.ignoredAt) continue;
       if (!inScope(binding.relativePath, binding.remoteToken)) continue;
       if (binding.kind !== "document" || !binding.remoteToken || !localByPath.has(binding.relativePath)) continue;
-      let remote;
-      try {
-        remote = await this.remote.getDocument(binding.remoteToken);
-      } catch (error) {
-        if (!isRemoteNotFound(error)) throw error;
-        // The remote document is gone: the local copy is the only survivor.
-        await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "remote-missing", updatedAt: new Date().toISOString() });
-        continue;
+      let remote = documentCache.get(binding.remoteToken);
+      if (!remote) {
+        try {
+          remote = await this.remote.getDocument(binding.remoteToken);
+        } catch (error) {
+          if (!isRemoteNotFound(error)) throw error;
+          // The remote document is gone: the local copy is the only survivor.
+          await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "remote-missing", updatedAt: new Date().toISOString() });
+          continue;
+        }
       }
       const assetReverseMap = new Map<string, string>();
       for (const assetBinding of await this.metaStorage.getAssetBindings(binding.entryId)) {
@@ -253,7 +345,8 @@ export class SyncEngine {
       // are already bound elsewhere.
       const tree = await this.loadRemoteTree(root);
       const expectedTitle = parseMarkdown(localContent).title ?? documentTitle(binding.relativePath);
-      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && (node.name === expectedTitle || node.name === documentTitle(binding.relativePath)));
+      const expectedNames = new Set([normalizeForMatch(expectedTitle), normalizeForMatch(documentTitle(binding.relativePath))]);
+      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && expectedNames.has(normalizeForMatch(node.name)));
       if (duplicate) {
         const bound = await this.metaStorage.findBindingByToken(root.id, duplicate.token);
         if (bound && bound.entryId !== binding.entryId) {
@@ -458,6 +551,113 @@ export class SyncEngine {
     return this.syncEntry(rearmed, root);
   }
 
+  /** Same-name duplicate governance: within one remote parent folder, two or
+   *  more documents sharing a normalized title are collapsed — the bound copy
+   *  (else the earliest-updated one) wins, and every other copy whose content
+   *  hash matches the winner is soft-deleted so the pairing loops below see a
+   *  one-to-one listing. Divergent duplicates surface as a conflict on the
+   *  winner's entry once it is bound; an unbound winner gets imported first
+   *  and the conflict is raised on the next full round. */
+  private async governRemoteDuplicates(root: SyncRoot, tree: RemoteTree, mode: SyncMode): Promise<void> {
+    const groups = new Map<string, RemoteNode[]>();
+    for (const node of tree.nodes) {
+      if (node.type !== "document") continue;
+      const key = `${node.parentToken || root.remoteToken}|${normalizeForMatch(node.name)}`;
+      const bucket = groups.get(key);
+      if (bucket) bucket.push(node); else groups.set(key, [node]);
+    }
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      const bound = new Map<string, EntryBinding>();
+      for (const node of group) {
+        const binding = await this.metaStorage.findBindingByToken(root.id, node.token);
+        if (binding && !binding.ignoredAt) bound.set(node.token, binding);
+      }
+      const winner = group.find((node) => bound.has(node.token))
+        ?? [...group].sort((left, right) => (left.updatedAt ?? "").localeCompare(right.updatedAt ?? ""))[0]!;
+      const documents = new Map<string, RemoteDocument>();
+      for (const node of group) {
+        try {
+          documents.set(node.token, await this.remote.getDocument(node.token));
+        } catch {
+          // An unreadable copy is left alone rather than deleted blindly.
+        }
+      }
+      const winnerDocument = documents.get(winner.token);
+      if (!winnerDocument) continue;
+      for (const loser of group) {
+        if (loser.token === winner.token) continue;
+        const loserDocument = documents.get(loser.token);
+        if (!loserDocument) continue;
+        if (loserDocument.contentHash === winnerDocument.contentHash) {
+          await this.remote.softDelete(loser.token, "docx");
+          const index = tree.nodes.indexOf(loser);
+          if (index >= 0) tree.nodes.splice(index, 1);
+          continue;
+        }
+        // Divergent duplicate: only surface a conflict once the winner is
+        // bound — the conflict record needs an entry to attach to.
+        const binding = bound.get(winner.token);
+        if (!binding || mode === "push-only") continue;
+        const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
+        if (open) continue;
+        let localContent = "";
+        try {
+          localContent = await this.local.readText(root, binding.relativePath);
+        } catch { /* local-missing entries contribute an empty side */ }
+        const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath) ?? "";
+        await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "conflict", updatedAt: new Date().toISOString() });
+        await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent: baselineContent, localContent, remoteContent: loserDocument.content, remoteRevision: winnerDocument.revisionId, remoteContentHash: winnerDocument.contentHash });
+      }
+    }
+  }
+
+  /** Minimal remote tree for the incremental fast path: every announced token
+   *  is read as a single document; unbound tokens must be locatable in one of
+   *  the announced parent folders via listFolderChildren. Returns undefined
+   *  whenever the preconditions fail so the caller falls back to the full
+   *  drive walk (correctness first, speed second). */
+  private async buildScopedRemoteTree(root: SyncRoot, tokens: ReadonlySet<string>, parentTokens: readonly string[], documents?: Map<string, RemoteDocument>): Promise<RemoteTree | undefined> {
+    const rootNode: RemoteNode = { token: root.remoteToken, name: root.remoteToken, type: "folder", parentToken: "" };
+    const nodes: RemoteNode[] = [];
+    for (const token of tokens) {
+      const binding = await this.metaStorage.findBindingByToken(root.id, token);
+      if (binding) {
+        try {
+          const document = await this.remote.getDocument(token);
+          documents?.set(token, document);
+          nodes.push({ ...document, parentToken: binding.remoteParentToken || root.remoteToken, name: document.name || binding.relativePath });
+        } catch (error) {
+          // A deleted document is simply absent from the minimal tree; the
+          // full round reclassifies its binding. Network failures fall back.
+          if (isRemoteNotFound(error)) continue;
+          return undefined;
+        }
+        continue;
+      }
+      // Unbound token: a drive event announced it; look only inside the
+      // folders the event named instead of walking the whole drive.
+      let found: RemoteNode | undefined;
+      for (const parentToken of parentTokens.length > 0 ? parentTokens : [root.remoteToken]) {
+        if (!this.remote.listFolderChildren) return undefined;
+        let children: RemoteNode[];
+        try {
+          children = await this.remote.listFolderChildren(parentToken);
+        } catch {
+          return undefined;
+        }
+        const hit = children.find((node) => node.token === token);
+        if (hit) {
+          found = hit;
+          break;
+        }
+      }
+      if (!found) return undefined;
+      nodes.push(found);
+    }
+    return { root: rootNode, nodes };
+  }
+
   /** Token→relative-path maps for one remote tree snapshot, shared by scan
    *  and the single-entry pull path. */
   private buildRemotePathMaps(rootToken: string, tree: RemoteTree): { documents: Map<string, string>; assets: Map<string, string>; assetParents: Map<string, string> } {
@@ -477,7 +677,7 @@ export class SyncEngine {
     return { documents, assets, assetParents };
   }
 
-  private async importRemoteDocument(root: SyncRoot, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>): Promise<void> {
+  private async importRemoteDocument(root: SyncRoot, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>, knownFiles?: Map<string, LocalFile>): Promise<void> {
     let remote: RemoteDocument;
     try {
       remote = await this.remote.getDocument(node.token);
@@ -487,7 +687,7 @@ export class SyncEngine {
     }
     const existingBinding = await this.metaStorage.getBinding(root.id, relativePath);
     const entryId = existingBinding?.entryId ?? randomUUID();
-    const assetImport = await this.importRemoteAssets(root, entryId, remote.content, remoteAssetPaths, remoteAssetParents);
+    const assetImport = await this.importRemoteAssets(root, entryId, remote.content, remoteAssetPaths, remoteAssetParents, knownFiles);
     const canonicalContent = restoreAssetReferences(restoreInternalLinks(remote.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
     await this.local.writeText(root, relativePath, canonicalContent);
     const hash = sha256(canonicalContent);
@@ -508,10 +708,10 @@ export class SyncEngine {
     await this.saveBlockMapping(entryId, canonicalContent, remote);
   }
 
-  private async recordRemoteCollision(root: SyncRoot, binding: EntryBinding, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>): Promise<void> {
+  private async recordRemoteCollision(root: SyncRoot, binding: EntryBinding, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>, knownFiles?: Map<string, LocalFile>): Promise<void> {
     const localContent = await this.local.readText(root, relativePath);
     const remote = await this.remote.getDocument(node.token);
-    const assetImport = await this.importRemoteAssets(root, binding.entryId, remote.content, remoteAssetPaths, remoteAssetParents);
+    const assetImport = await this.importRemoteAssets(root, binding.entryId, remote.content, remoteAssetPaths, remoteAssetParents, knownFiles);
     const remoteContent = restoreAssetReferences(restoreInternalLinks(remote.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
     const baselineContent = await this.gitStorage.getBaseline(root.id, relativePath);
     const baseContent = baselineContent ?? "";
@@ -522,12 +722,13 @@ export class SyncEngine {
     await this.metaStorage.saveAssetBindings(binding.entryId, assetImport.bindings);
   }
 
-  private async importRemoteAssets(root: SyncRoot, documentEntryId: string, content: string, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>): Promise<{ reverseMap: Map<string, string>; bindings: Array<{ documentEntryId: string; assetEntryId: string; token: string; contentHash: string }> }> {
+  private async importRemoteAssets(root: SyncRoot, documentEntryId: string, content: string, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>, knownFiles?: Map<string, LocalFile>): Promise<{ reverseMap: Map<string, string>; bindings: Array<{ documentEntryId: string; assetEntryId: string; token: string; contentHash: string }> }> {
     const reverseMap = new Map<string, string>();
     const bindings: Array<{ documentEntryId: string; assetEntryId: string; token: string; contentHash: string }> = [];
     const tokens = [...content.matchAll(/<img\s+[^>]*?(?:src|token)="([^"]+)"/g)].map((match) => match[1]).filter((token): token is string => Boolean(token));
-    // Scan the local directory once; per-token scans would walk the whole tree for every image.
-    const localFiles = new Map((await this.local.scan(root)).map((file) => [file.relativePath, file]));
+    // Reuse the caller's scan when available; per-token scans would walk the
+    // whole tree for every image.
+    const localFiles = knownFiles ?? new Map((await this.local.scan(root)).map((file) => [file.relativePath, file]));
     for (const token of tokens) {
       const relativePath = remoteAssetPaths.get(token);
       if (!relativePath || reverseMap.has(token)) continue;
@@ -808,7 +1009,11 @@ function mimeType(relativePath: string): string {
 }
 
 function remoteRelativePath(rootToken: string, node: RemoteNode, nodes: Map<string, RemoteNode>): string | undefined {
-  const segments = [node.name];
+  // Each segment is sanitized so drive titles that carry filesystem-illegal
+  // characters ("a:b", trailing dots…) map onto writable local names; the
+  // sanitized path is the single shared key between the binding table and
+  // the drive listing.
+  const segments = [sanitizeLocalSegment(node.name)];
   const visited = new Set<string>();
   let parentToken = node.parentToken;
   while (parentToken && parentToken !== rootToken) {
@@ -816,7 +1021,7 @@ function remoteRelativePath(rootToken: string, node: RemoteNode, nodes: Map<stri
     visited.add(parentToken);
     const parent = nodes.get(parentToken);
     if (!parent || parent.type !== "folder") return undefined;
-    segments.unshift(parent.name);
+    segments.unshift(sanitizeLocalSegment(parent.name));
     parentToken = parent.parentToken;
   }
   const path = posix.normalize(posix.join(...segments));

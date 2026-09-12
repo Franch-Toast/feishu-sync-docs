@@ -94,3 +94,64 @@ test("writeText writes atomically through nested directories without leftovers",
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("scanEntries hashes only the requested paths and mirrors the full scan", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-scanentries-"));
+  try {
+    writeFileSync(join(directory, "note.md"), "# Note\n", "utf8");
+    writeFileSync(join(directory, "other.md"), "# Other\n", "utf8");
+    writeFileSync(join(directory, "pic.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    mkdirSync(join(directory, "sub"));
+    writeFileSync(join(directory, "sub", "guide.md"), "# Guide\n", "utf8");
+    const provider = new FilesystemProvider();
+    const root = makeRoot(directory);
+    const full = new Map((await provider.scan(root)).map((file) => [file.relativePath, file]));
+
+    // A file path returns that file; a directory path walks it recursively.
+    const scoped = await provider.scanEntries(root, ["note.md", "sub"]);
+    assert.deepEqual(scoped.map((file) => file.relativePath).sort(), ["note.md", "sub/guide.md"]);
+    for (const file of scoped) {
+      assert.equal(file.contentHash, full.get(file.relativePath)?.contentHash, "hashes must match the full scan");
+      assert.equal(file.kind, full.get(file.relativePath)?.kind);
+    }
+
+    // The same file scanned again must hash identically (event-safe re-hash).
+    const again = await provider.scanEntries(root, ["note.md"]);
+    assert.equal(again[0]?.contentHash, full.get("note.md")?.contentHash);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("scanEntries applies the same filters as scan and tolerates missing paths", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-scanentries-filter-"));
+  try {
+    mkdirSync(join(directory, "sub"));
+    mkdirSync(join(directory, "sub", "node_modules"));
+    writeFileSync(join(directory, "sub", "guide.md"), "# Guide\n", "utf8");
+    writeFileSync(join(directory, "sub", ".hidden.md"), "invisible", "utf8");
+    writeFileSync(join(directory, "sub", "node_modules", "dep.md"), "dependency", "utf8");
+    writeFileSync(join(directory, "sub", "data.txt"), "not synced", "utf8");
+    const provider = new FilesystemProvider();
+    const root = makeRoot(directory);
+
+    const scoped = await provider.scanEntries(root, ["sub"]);
+    assert.deepEqual(scoped.map((file) => file.relativePath), ["sub/guide.md"], "directory walks must honor the scan filters");
+
+    const missing = await provider.scanEntries(root, ["gone.md", "sub/also-gone.md", "sub/guide.md"]);
+    assert.deepEqual(missing.map((file) => file.relativePath), ["sub/guide.md"], "vanished paths are skipped, not fatal");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("scanEntries still rejects paths that escape the sync root", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-scanentries-escape-"));
+  try {
+    const provider = new FilesystemProvider();
+    const root = makeRoot(directory);
+    await assert.rejects(provider.scanEntries(root, ["../outside.md"]), /Path escapes sync root/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

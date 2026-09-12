@@ -115,9 +115,21 @@ export function App(): React.JSX.Element {
   const [runningMeta, setRunningMeta] = useState<Record<string, { trigger: SyncTrigger; mode?: SyncMode }>>({});
   /** Live activity feed shown in the issue workbench and history tab. */
   const [activity, setActivity] = useState<ActivityItem[]>([]);
+  /** OAuth 回调重定向 (?auth=ok|error) 的顶部提示,展示一次后清除。 */
+  const [authNotice, setAuthNotice] = useState<string>();
 
   const pushActivity = useCallback((item: Omit<ActivityItem, "at">) => {
     setActivity((current) => [{ ...item, at: new Date().toISOString() }, ...current].slice(0, 50));
+  }, []);
+
+  // OAuth 授权回调回到应用时展示一次性提示,并清掉地址栏参数避免刷新重复提示。
+  useEffect(() => {
+    const auth = new URLSearchParams(window.location.search).get("auth");
+    if (!auth) return;
+    window.history.replaceState({}, "", window.location.pathname);
+    setAuthNotice(auth === "ok"
+      ? "飞书授权成功:refresh token 已保存,凭证自动续期已启用。"
+      : "飞书授权未完成:请回设置页重试;若反复失败请确认回调地址已在飞书后台「安全设置 → 重定向 URL」登记。");
   }, []);
 
   const setRootRunning = useCallback((rootId: string, running: boolean) => {
@@ -142,10 +154,11 @@ export function App(): React.JSX.Element {
   useEffect(() => { notificationsRef.current = notifications; }, [notifications]);
   const conflictCountRef = useRef(0);
 
-  const notify = useCallback((category: keyof NotificationPreferences, title: string, body: string) => {
-    if (!notificationsRef.current[category]) return;
-    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-    try { new Notification(title, { body }); } catch { /* some browsers require SW */ }
+  /** 通知功能暂未开放:系统通知已停用,接口已预留 —— 所有 notify 调用点保持
+   *  原样,未来接入飞书机器人/系统通知时只需还原函数体。浏览器通知权限的
+   *  状态采集保留,页面内的徽章、任务中心与 activity 不受影响。 */
+  const notify = useCallback((_category: keyof NotificationPreferences, _title: string, _body: string) => {
+    /* no-op */
   }, []);
 
   const refresh = useCallback(async () => {
@@ -402,17 +415,7 @@ export function App(): React.JSX.Element {
     return result;
   };
 
-  /** Persist one notification category server-side; it now follows the
-   *  installation instead of a single browser's localStorage (B6.8). */
-  const toggleNotification = async (category: keyof NotificationPreferences, enabled: boolean) => {
-    const saved = await api.saveAppConfig({ notifications: { [category]: enabled } });
-    setAppConfig(saved);
-  };
-
-  const requestNotifyPermission = () => {
-    if (typeof Notification === "undefined") return;
-    void Notification.requestPermission().then((permission) => setNotifyPermission(permission));
-  };
+  // 通知开关与权限请求已随「通知暂未开放」下线;偏好读取保留,恢复开放时还原这两个函数。
 
   /** 「不再显示」— persisted per browser; only hides the modal wizard (B6.1). */
   const dismissOnboarding = () => {
@@ -507,6 +510,7 @@ export function App(): React.JSX.Element {
       </header>
 
       <main className="content">
+        {authNotice && <div className="form-notice oauth-banner">{authNotice}</div>}
         {view === "dashboard" && <Dashboard
           roots={roots}
           rootStats={rootStats}
@@ -569,10 +573,6 @@ export function App(): React.JSX.Element {
           onPatchRoot={patchRoot}
           onPrune={pruneHistory}
           onOpenGuide={() => setGuideOpen(true)}
-          notifications={notifications}
-          onToggleNotification={toggleNotification}
-          notifyPermission={notifyPermission}
-          onRequestNotifyPermission={requestNotifyPermission}
         />}
       </main>
     </div>

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FilesystemProvider, SyncEngine } from "@feishu-sync/core";
+import { FilesystemProvider, SyncEngine, parseMarkdown } from "@feishu-sync/core";
 import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
 import { FakeRemote } from "./helpers/fake-remote.js";
 
@@ -377,6 +377,114 @@ test("exclude globs keep matching paths out of the scan and freeze already-bound
   await metaStorage.setBinding(root.id, "archive/old.md", { ...frozen!, ignoredAt: undefined, updatedAt: new Date().toISOString() });
   scan = await engine.scan(thawed);
   assert.ok(scan.entries.some((entry) => entry.relativePath === "archive/old.md"));
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("rebinds by title when the remote document lives in a subfolder (H1 title ≠ path)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-title-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  await writeFile(join(directory, "Weekly Meeting.md"), "# Weekly Meeting\n\nagenda body", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  // The drive copy lives in a subfolder, so the remote relative path
+  // ("sub/Weekly Meeting.md") can never equal the local path; the title does.
+  const sub = await remote.createFolder("root", "sub");
+  const created = await remote.createDocument(sub.token, "Weekly Meeting", "# Weekly Meeting\n\nagenda body");
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const scan = await engine.scan(root);
+  // The title match re-binds instead of importing a duplicate copy.
+  assert.equal(remote.documents.size, 1, "no duplicate document is imported");
+  const binding = await metaStorage.getBinding(root.id, "Weekly Meeting.md");
+  assert.equal(binding?.remoteToken, created.token);
+  const entry = await engine.syncEntry(binding!, root);
+  assert.equal(entry.status, "clean");
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("identical same-name remote duplicates collapse onto the bound copy", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-dedupe-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  await writeFile(join(directory, "notes.md"), "# Notes\n\nshared body", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const scan = await engine.scan(root);
+  const entry = await engine.syncEntry(scan.entries[0]!, root);
+  assert.equal(entry.status, "clean");
+  const bound = remote.documents.get(entry.remoteToken!)!;
+
+  // A second document with the same parent, same title and the same content:
+  // governance collapses it onto the bound copy instead of deadlocking.
+  const parsed = parseMarkdown("# Notes\n\nshared body");
+  remote.documents.set("root/notes-shadow", {
+    token: "root/notes-shadow",
+    name: bound.name,
+    type: "document",
+    parentToken: bound.parentToken,
+    content: "# Notes\n\nshared body",
+    contentHash: parsed.contentHash,
+    revisionId: 4242,
+    blocks: []
+  });
+  await engine.scan(root);
+  assert.ok(!remote.documents.has("root/notes-shadow"), "the identical duplicate is soft-deleted");
+  assert.ok(remote.documents.has(entry.remoteToken!), "the bound copy survives");
+  assert.equal((await metaStorage.listConflicts("open")).length, 0);
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("divergent same-name remote duplicates surface a conflict instead of auto-deletion", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-diverge-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  await writeFile(join(directory, "notes.md"), "# Notes\n\nshared body", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const scan = await engine.scan(root);
+  const entry = await engine.syncEntry(scan.entries[0]!, root);
+  const bound = remote.documents.get(entry.remoteToken!)!;
+
+  // Content differs: the shadow copy must survive for a human decision and
+  // the divergence lands in the conflict workbench on the bound entry.
+  const divergent = "# Notes\n\ndifferent body";
+  remote.documents.set("root/notes-shadow", {
+    token: "root/notes-shadow",
+    name: bound.name,
+    type: "document",
+    parentToken: bound.parentToken,
+    content: divergent,
+    contentHash: parseMarkdown(divergent).contentHash,
+    revisionId: 4243,
+    blocks: []
+  });
+  await engine.scan(root);
+  assert.ok(remote.documents.has("root/notes-shadow"), "the divergent copy is kept for triage");
+  const conflicts = await metaStorage.listConflicts("open");
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0]?.remoteContent, divergent);
+  const rebound = await metaStorage.getBinding(root.id, "notes.md");
+  assert.equal(rebound?.status, "conflict");
 
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });

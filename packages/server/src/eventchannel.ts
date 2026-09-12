@@ -33,6 +33,8 @@ export class EventChannelService {
   /** Token scope for each pending (debouncing) round; undefined means a burst
    *  of differing tokens widened the round to a full event sync. */
   private readonly pendingTokens = new Map<string, string | undefined>();
+  /** Parent-folder scope (created_in_folder events) paired with pendingTokens. */
+  private readonly pendingFolderTokens = new Map<string, string | undefined>();
 
   constructor(
     private readonly credentials: CredentialStore,
@@ -106,6 +108,7 @@ export class EventChannelService {
     for (const timer of this.pending.values()) clearTimeout(timer);
     this.pending.clear();
     this.pendingTokens.clear();
+    this.pendingFolderTokens.clear();
     this.state = { status: "disabled" };
   }
 
@@ -128,7 +131,7 @@ export class EventChannelService {
         this.log("debug", "drive event ignored: no matching root", { kind, fileToken, folderToken });
         return;
       }
-      for (const root of roots) this.scheduleSync(root, kind, fileToken);
+      for (const root of roots) this.scheduleSync(root, kind, fileToken, folderToken);
     } catch (error) {
       this.log("warn", "drive event handling failed", { kind, error: error instanceof Error ? error.message : String(error) });
     }
@@ -155,23 +158,30 @@ export class EventChannelService {
     return [...hits.values()];
   }
 
-  private scheduleSync(root: SyncRoot, kind: string, fileToken?: string): void {
+  private scheduleSync(root: SyncRoot, kind: string, fileToken?: string, folderToken?: string): void {
     if (!root.enabled) return;
     if (this.pending.has(root.id)) {
-      // Coalesce a burst: a differing token widens the pending round to a full
+      // Coalesce a burst: differing tokens widen the pending round to a full
       // event sync (undefined scope) so no changed file is missed while debouncing.
-      if (this.pendingTokens.get(root.id) !== fileToken) this.pendingTokens.set(root.id, undefined);
+      if (this.pendingTokens.get(root.id) !== fileToken || this.pendingFolderTokens.get(root.id) !== folderToken) {
+        this.pendingTokens.set(root.id, undefined);
+        this.pendingFolderTokens.set(root.id, undefined);
+      }
       return;
     }
     this.pendingTokens.set(root.id, fileToken);
-    this.log("info", "drive event scheduled sync", { rootId: root.id, kind, fileToken, debounceMs: EVENT_SYNC_DEBOUNCE_MS });
+    this.pendingFolderTokens.set(root.id, folderToken);
+    this.log("info", "drive event scheduled sync", { rootId: root.id, kind, fileToken, folderToken, debounceMs: EVENT_SYNC_DEBOUNCE_MS });
     const timer = setTimeout(() => {
       this.pending.delete(root.id);
       const token = this.pendingTokens.get(root.id);
+      const parentToken = this.pendingFolderTokens.get(root.id);
       this.pendingTokens.delete(root.id);
+      this.pendingFolderTokens.delete(root.id);
       // Passing the token narrows the round to that entry and lets the runtime
-      // skip it entirely when it merely echoes a push we just made.
-      void this.runtime.requestSync(root.id, token);
+      // skip it entirely when it merely echoes a push we just made; the parent
+      // folder token lets the incremental fast path locate unbound new files.
+      void this.runtime.requestSync(root.id, token, parentToken);
     }, EVENT_SYNC_DEBOUNCE_MS);
     timer.unref();
     this.pending.set(root.id, timer);

@@ -16,6 +16,10 @@ export type SyncMode = "bidirectional" | "pull-only" | "push-only";
 export interface SyncScope {
   relativePaths?: string[];
   remoteTokens?: string[];
+  /** Folders the event announced (e.g. drive.file.created_in_folder); lets the
+   *  incremental fast path locate unbound new tokens with a single-level
+   *  listing instead of walking the whole drive tree. */
+  remoteParentTokens?: string[];
 }
 
 export interface SyncRoot {
@@ -134,6 +138,11 @@ export interface MutationResult {
 
 export interface LocalProvider {
   scan(root: SyncRoot): Promise<LocalFile[]>;
+  /** Stat+hash only the given paths (a directory entry is walked recursively);
+   *  entries that no longer exist are skipped so deletions surface through the
+   *  binding loops instead of an error. Backs the incremental fast path;
+   *  optional so lightweight fakes can fall back to a full scan. */
+  scanEntries?(root: SyncRoot, relativePaths: readonly string[]): Promise<LocalFile[]>;
   readText(root: SyncRoot, relativePath: string): Promise<string>;
   writeText(root: SyncRoot, relativePath: string, content: string): Promise<void>;
   readBinary(root: SyncRoot, relativePath: string): Promise<Uint8Array>;
@@ -155,6 +164,10 @@ export interface RemoteProvider {
   /** Move a remote file to the drive trash. The Feishu endpoint requires the
    *  file type as a query parameter (docx/folder/file). */
   softDelete(token: string, type?: "docx" | "folder" | "file"): Promise<void>;
+  /** Single-level listing of one drive folder. Backs the incremental fast
+   *  path that locates newly created documents without a full tree walk;
+   *  optional so providers without drive listings can opt out. */
+  listFolderChildren?(parentToken: string): Promise<RemoteNode[]>;
 }
 
 export interface ProviderCapabilities {

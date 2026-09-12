@@ -2,7 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
-import { accessSync, constants, createReadStream, existsSync, statSync } from "node:fs";
+import { accessSync, constants, createReadStream, existsSync, renameSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FilesystemProvider } from "@feishu-sync/core";
 import type { ErrorCategory, GitStorage, MetaStorage, OperationRecord, RemoteProvider, SyncMode, SyncRoot, SyncTrigger } from "@feishu-sync/core";
@@ -12,6 +12,7 @@ import { ProviderRegistry } from "./provider.js";
 import { CredentialStore, type CredentialInput } from "./credentials.js";
 import { AppConfigStore, type LogLevel, type NotificationPreferences } from "./appconfig.js";
 import { SyncRuntime, type TaskStatus } from "./runtime.js";
+import type { Notifier } from "./notify.js";
 import { EventChannelService } from "./eventchannel.js";
 
 /** Allowed sync modes / triggers for request validation (B1). */
@@ -32,9 +33,11 @@ export interface AppOptions {
   publicDir?: string;
   /** Injected by tests/embedding; defaults to ~/.feishu-sync-docs/config.json. */
   appConfig?: AppConfigStore;
+  /** Conflict/failure/credential notifier; defaults to a silent no-op. */
+  notifier?: Notifier;
 }
 
-export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime: SyncRuntime; gitStorage: GitStorage; metaStorage: MetaStorage; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore } {
+export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime: SyncRuntime; gitStorage: GitStorage; metaStorage: MetaStorage; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore; notifier?: Notifier } {
   const appConfig = options.appConfig ?? new AppConfigStore();
   const app = Fastify({ logger: process.env.NODE_ENV === "test" ? false : { level: process.env.SYNC_LOG_LEVEL ?? appConfig.preferences.logLevel } });
   // Tolerate body-less requests that still carry the JSON content-type (e.g.
@@ -66,11 +69,13 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     // Maintenance tick: proactively rotate user tokens, then swap the live
     // delegate so the registry's in-memory token stays in sync with the DB.
     () => credentials.maintainUserToken().then(() => registry?.rebuild()).then(() => undefined),
-    appConfig
+    appConfig,
+    undefined,
+    options.notifier
   );
   // Long-lived drive event subscription; polling stays enabled as the fallback.
   const eventChannel = new EventChannelService(credentials, metaStorage, runtime, app.log);
-  Object.assign(app, { runtime, gitStorage, metaStorage, credentials, registry, eventChannel, appConfig });
+  Object.assign(app, { runtime, gitStorage, metaStorage, credentials, registry, eventChannel, appConfig, notifier: options.notifier });
 
   void app.register(fastifyWebsocket);
   const defaultPublicDir = join(dirname(fileURLToPath(import.meta.url)), "../public");
@@ -102,6 +107,37 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
   });
   app.post<{ Body: CredentialInput | undefined }>("/api/settings/test-connection", async (request) => credentials.testConnection(request.body ?? undefined));
 
+  // ---- OAuth authorization-code flow (recommended way to obtain a user
+  // refresh token: automatic renewal, no manual copy-paste of tokens) ------
+  app.get("/api/auth/feishu/authorize", async (request, reply) => {
+    try {
+      const redirectUri = await credentials.getOAuthRedirectUri(request.headers.host);
+      return reply.send({ url: await credentials.buildAuthorizeUrl(redirectUri), redirectUri });
+    } catch (error) {
+      return reply.code((error as { statusCode?: number }).statusCode ?? 500).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+  app.get<{ Querystring: { code?: string; state?: string } }>("/api/auth/feishu/callback", async (request, reply) => {
+    // Derive the same redirect URI the authorize step used and consume the
+    // one-time state; a mismatch or expiry bounces back with auth=error.
+    const redirectUri = await credentials.getOAuthRedirectUri(request.headers.host).catch(() => undefined);
+    const expected = credentials.consumeOAuthState(request.query.state);
+    if (!redirectUri || !expected || expected !== redirectUri || !request.query.code) {
+      return reply.redirect("/?auth=error&reason=state");
+    }
+    try {
+      await credentials.exchangeCode(request.query.code, redirectUri);
+      if (registry) await registry.rebuild();
+      // Restart the drive-event subscription and refresh the UI badge.
+      await eventChannel.rebuild();
+      runtime.broadcastEvent({ type: "settings-updated" });
+      return reply.redirect("/?auth=ok");
+    } catch (error) {
+      app.log.warn({ error: error instanceof Error ? error.message : String(error) }, "OAuth callback failed");
+      return reply.redirect(`/?auth=error&reason=${encodeURIComponent(error instanceof Error ? error.message : String(error))}`);
+    }
+  });
+
   // ---- Global preferences (config.json; never exposes credential fields) --
   app.get("/api/app-config", async () => ({
     preferences: appConfig.preferences,
@@ -132,6 +168,22 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (body.mode !== undefined && !SYNC_MODES.includes(body.mode)) return reply.code(400).send({ error: "mode must be one of bidirectional, pull-only, push-only" });
     if (body.exclude !== undefined && (!Array.isArray(body.exclude) || body.exclude.some((pattern) => typeof pattern !== "string"))) {
       return reply.code(400).send({ error: "exclude must be an array of glob strings" });
+    }
+    // One directory, one binding: two roots writing the same tree would corrupt
+    // bindings.json and double-push every entry (resolve() normalizes trailing
+    // slashes and relative spellings so the comparison is exact).
+    const normalizedPath = resolve(body.localPath);
+    const duplicate = (await metaStorage.listRoots()).find((root) => resolve(root.localPath) === normalizedPath);
+    if (duplicate) return reply.code(409).send({ error: `该目录已被同步根绑定(${duplicate.localPath}),请先删除旧根或选择其他目录` });
+    // Orphaned metadata guard: a leftover .feishu-sync directory (e.g. after a
+    // service restart lost the in-memory metaDirs map) would silently rebind
+    // the new root to stale tokens. Archive it instead of reusing it; .git is
+    // deliberately kept so history and baselines carry over.
+    const metaDir = join(body.localPath, ".feishu-sync");
+    if (existsSync(metaDir)) {
+      const archive = `${metaDir}.bak-${Date.now()}`;
+      renameSync(metaDir, archive);
+      app.log.warn({ from: metaDir, to: archive }, "archived orphaned .feishu-sync metadata before binding");
     }
     const root = await metaStorage.createRoot({ localPath: body.localPath, remoteToken: body.remoteToken, remoteType: body.remoteType ?? "folder", enabled: true, pollIntervalMs, mode: body.mode, exclude: body.exclude });
     // Initialize Git repo and meta storage for the new root
@@ -443,5 +495,5 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     runtime.stop();
     eventChannel.stop();
   });
-  return app as unknown as FastifyInstance & { runtime: SyncRuntime; gitStorage: GitStorage; metaStorage: MetaStorage; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore };
+  return app as unknown as FastifyInstance & { runtime: SyncRuntime; gitStorage: GitStorage; metaStorage: MetaStorage; credentials: CredentialStore; registry?: ProviderRegistry; eventChannel: EventChannelService; appConfig: AppConfigStore; notifier?: Notifier };
 }

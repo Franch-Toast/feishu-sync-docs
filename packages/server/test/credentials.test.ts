@@ -50,7 +50,7 @@ test("redacted() masks short tokens fully and long tokens first6…last4", async
   assert.ok(!String(view.accessToken).includes("1234567890"), "long token must only reveal first 6 / last 4");
 });
 
-test("save() semantics: undefined keeps values, empty strings clear, refresh token resets expiry", async () => {
+test("save() semantics: empty strings are treated as not-provided and keep stored values", async () => {
   const config = newConfig();
   const credentials = new CredentialStore(config);
   await credentials.save({ mode: "tenant", appId: "cli_a", appSecret: "secret-1" });
@@ -61,9 +61,10 @@ test("save() semantics: undefined keeps values, empty strings clear, refresh tok
   assert.equal(await config.getCredential("feishu.appId"), "cli_a");
   assert.equal(await config.getCredential("feishu.appSecret"), "secret-1");
 
-  // An empty string clears the stored value.
+  // An empty string means "not provided": the browser form submits blanks for
+  // fields the user left untouched, so a blank must never clear a saved value.
   await credentials.save({ appSecret: "" });
-  assert.equal(await config.getCredential("feishu.appSecret"), "");
+  assert.equal(await config.getCredential("feishu.appSecret"), "secret-1");
 
   // Manually supplying a refresh token clears any previous expiry record.
   await credentials.save({ refreshToken: "rt-1" });
@@ -172,4 +173,66 @@ test("user connection test reports a missing token without leaking secrets", asy
   } finally {
     guard.restore();
   }
+});
+
+test("OAuth authorize URL carries the app id, offline_access scope and a single-use state", async () => {
+  const config = newConfig();
+  const credentials = new CredentialStore(config);
+  await credentials.save({ mode: "user", appId: "cli_a", appSecret: "secret-1" });
+
+  const redirectUri = "http://127.0.0.1:8787/api/auth/feishu/callback";
+  const url = await credentials.buildAuthorizeUrl(redirectUri);
+  const parsed = new URL(url);
+  assert.equal(parsed.origin, "https://accounts.feishu.cn");
+  assert.equal(parsed.pathname, "/open-apis/authen/v1/authorize");
+  assert.equal(parsed.searchParams.get("app_id"), "cli_a");
+  assert.equal(parsed.searchParams.get("redirect_uri"), redirectUri);
+  assert.equal(parsed.searchParams.get("scope"), "offline_access");
+
+  // The state is single-use: the callback consumes it exactly once.
+  const state = parsed.searchParams.get("state")!;
+  assert.ok(state.length > 10);
+  assert.equal(credentials.consumeOAuthState(state), redirectUri);
+  assert.equal(credentials.consumeOAuthState(state), undefined);
+  assert.equal(credentials.consumeOAuthState(undefined), undefined);
+});
+
+test("exchangeCode persists the token pair, pins user mode and marks auth ok", async () => {
+  const config = newConfig();
+  const calls: Array<{ url: string; body: string }> = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    calls.push({ url: String(input), body: String(init?.body ?? "") });
+    return jsonResponse({ code: 0, access_token: "u-token", refresh_token: "r-token", refresh_token_expires_in: 604800 });
+  };
+  const credentials = new CredentialStore(config, fetchImpl);
+  await credentials.save({ mode: "tenant", appId: "cli_a", appSecret: "secret-1" });
+
+  const redirectUri = "http://127.0.0.1:8787/api/auth/feishu/callback";
+  await credentials.exchangeCode("one-time-code", redirectUri);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.url, "https://accounts.feishu.cn/oauth/v3/token");
+  const payload = JSON.parse(calls[0]!.body) as Record<string, string>;
+  assert.equal(payload.grant_type, "authorization_code");
+  assert.equal(payload.client_id, "cli_a");
+  assert.equal(payload.client_secret, "secret-1");
+  assert.equal(payload.code, "one-time-code");
+  assert.equal(payload.redirect_uri, redirectUri);
+
+  assert.equal(await config.getCredential("feishu.accessToken"), "u-token");
+  assert.equal(await config.getCredential("feishu.refreshToken"), "r-token");
+  assert.equal(await config.getCredential("feishu.mode"), "user");
+  assert.equal(await config.getCredential("feishu.authStatus"), "ok");
+  const expiry = Number(await config.getCredential("feishu.refreshTokenExpiresAt"));
+  assert.ok(Number.isFinite(expiry) && expiry > Date.now(), "the refresh expiry is recorded from refresh_token_expires_in");
+});
+
+test("exchangeCode fails with a hint when the refresh token is missing (offline_access off)", async () => {
+  const config = newConfig();
+  const fetchImpl: typeof fetch = async () => jsonResponse({ code: 0, access_token: "u-token" });
+  const credentials = new CredentialStore(config, fetchImpl);
+  await credentials.save({ appId: "cli_a", appSecret: "secret-1" });
+
+  await assert.rejects(() => credentials.exchangeCode("code", "http://127.0.0.1:8787/api/auth/feishu/callback"), /offline_access/);
+  assert.equal(await config.getCredential("feishu.accessToken"), undefined, "a failed exchange must not persist partial tokens");
 });

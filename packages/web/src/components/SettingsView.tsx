@@ -1,13 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { api, AUTH_STATUS_LABELS, EVENT_CHANNEL_LABELS, formatDateTime, formatDurationMs, NOTIFICATION_LABELS, type ApiStats, type AppConfigPatch, type AppConfigView, type CredentialMode, type CredentialPatch, type LogLevel, type NotificationPreferences, type PruneResult, type RedactedSettings, type Root, type RootPatch, type TestConnectionResult } from "../api";
-
-/** Browser permission state labels for the notification section (B6.8). */
-const PERMISSION_LABELS: Record<string, string> = {
-  granted: "已授权",
-  denied: "已拒绝（需在浏览器地址栏重新允许）",
-  default: "未请求",
-  unsupported: "当前浏览器不支持系统通知"
-};
+import { api, AUTH_STATUS_LABELS, EVENT_CHANNEL_LABELS, formatDateTime, formatDurationMs, type ApiStats, type AppConfigPatch, type AppConfigView, type CredentialMode, type CredentialPatch, type LogLevel, type PruneResult, type RedactedSettings, type Root, type RootPatch, type TestConnectionResult } from "../api";
 
 interface SettingsViewProps {
   settings?: RedactedSettings;
@@ -19,12 +11,6 @@ interface SettingsViewProps {
   onPatchRoot: (id: string, patch: RootPatch) => Promise<void>;
   onPrune: () => Promise<PruneResult>;
   onOpenGuide: () => void;
-  /** Server-side per-category notification toggles (B6.8). */
-  notifications: NotificationPreferences;
-  onToggleNotification: (category: keyof NotificationPreferences, enabled: boolean) => Promise<void>;
-  /** Browser Notification permission, or "unsupported" where the API is absent. */
-  notifyPermission: string;
-  onRequestNotifyPermission: () => void;
 }
 
 const MODE_LABELS: Record<CredentialMode, string> = {
@@ -49,7 +35,7 @@ interface RootDraft {
   intervalSec: string;
 }
 
-export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSaveSettings, onTestConnection, onPatchRoot, onPrune, onOpenGuide, notifications, onToggleNotification, notifyPermission, onRequestNotifyPermission }: SettingsViewProps): React.JSX.Element {
+export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSaveSettings, onTestConnection, onPatchRoot, onPrune, onOpenGuide }: SettingsViewProps): React.JSX.Element {
   const [mode, setMode] = useState<CredentialMode>("user");
   const [baseUrl, setBaseUrl] = useState("");
   const [accessToken, setAccessToken] = useState("");
@@ -70,9 +56,8 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
   const [prefSeededFor, setPrefSeededFor] = useState<string>();
   const [prefBusy, setPrefBusy] = useState(false);
   const [prefNotice, setPrefNotice] = useState<string>();
-  /** Category currently being persisted, so its switch shows a pending state. */
-  const [notifyBusy, setNotifyBusy] = useState<keyof NotificationPreferences>();
-  const [notifyNotice, setNotifyNotice] = useState<string>();
+  /** OAuth 授权跳转进行中。 */
+  const [oauthBusy, setOauthBusy] = useState(false);
   /** Lightweight remote API call tally, refreshed on demand (B6.2). */
   const [apiStats, setApiStats] = useState<ApiStats>();
   const [statsBusy, setStatsBusy] = useState(false);
@@ -125,28 +110,30 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
     }
   };
 
+  // 仅提交非空字段:输入框始终渲染,但空串意味着「保持已保存值」——服务端
+  // save() 与此共同保证空串不会清掉用户看不到的存量凭证。
   const buildPatch = (): CredentialPatch => ({
     mode,
-    baseUrl: baseUrl.trim(),
-    accessToken,
-    refreshToken: refreshToken || undefined,
-    appId: appId.trim(),
-    appSecret: appSecret || undefined,
-    larkCliBin: larkCliBin.trim()
+    ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
+    ...(accessToken.trim() ? { accessToken: accessToken.trim() } : {}),
+    ...(refreshToken.trim() ? { refreshToken: refreshToken.trim() } : {}),
+    ...(appId.trim() ? { appId: appId.trim() } : {}),
+    ...(appSecret.trim() ? { appSecret: appSecret.trim() } : {}),
+    ...(larkCliBin.trim() ? { larkCliBin: larkCliBin.trim() } : {})
   });
 
-  /** Persist one notification category server-side (B6.8): the preference now
-   *  follows the installation instead of a single browser's localStorage. */
-  const toggleNotification = async (category: keyof NotificationPreferences, enabled: boolean) => {
-    setNotifyBusy(category);
-    setNotifyNotice(undefined);
+  /** OAuth 授权登录(推荐):跳转飞书授权页,回调地址由服务端完成 code 换取
+   *  并持久化 refresh token;重定向回应用后由 App.tsx 的 authNotice 提示结果。 */
+  const startOAuth = async () => {
+    setOauthBusy(true);
+    setNotice(undefined);
     try {
-      await onToggleNotification(category, enabled);
-      setNotifyNotice(`「${NOTIFICATION_LABELS[category].label}」已${enabled ? "开启" : "关闭"}，已保存到服务端。`);
+      const { url, redirectUri } = await api.authorizeFeishuOAuth();
+      setNotice(`正在打开飞书授权页…请确保回调地址 ${redirectUri} 已在飞书开发者后台「安全设置 → 重定向 URL」登记。`);
+      window.location.href = url;
     } catch (error) {
-      setNotifyNotice(error instanceof Error ? error.message : String(error));
-    } finally {
-      setNotifyBusy(undefined);
+      setNotice(error instanceof Error ? error.message : String(error));
+      setOauthBusy(false);
     }
   };
 
@@ -243,14 +230,21 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
           <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://open.feishu.cn" />
         </label>}
         {mode === "user" && <>
+          <div className="oauth-entry">
+            <button className="primary" disabled={oauthBusy} onClick={() => void startOAuth()}>{oauthBusy ? "正在打开授权页…" : "飞书授权登录（推荐，自动获取并续期 Refresh Token）"}</button>
+            <span className="muted">需先在下方填写 App ID / App Secret 并保存,且回调地址已在飞书后台「安全设置 → 重定向 URL」登记:<code>http://127.0.0.1:8787/api/auth/feishu/callback</code>(以实际访问地址为准)。</span>
+          </div>
           <label className="form-row">
             <span>User Access Token</span>
-            <input type="password" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} placeholder={settings?.hasAccessToken ? `已保存（${settings.accessToken}）` : "粘贴从飞书开放平台获取的 user token"} />
+            <input type="password" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} placeholder={settings?.hasAccessToken ? `已保存（${settings.accessToken}）·留空保持已保存值` : "粘贴从飞书开放平台获取的 user token"} />
           </label>
-          <label className="form-row">
-            <span>Refresh Token（可选，启用自动刷新）</span>
-            <input type="password" value={refreshToken} onChange={(event) => setRefreshToken(event.target.value)} placeholder={settings?.hasRefreshToken ? `已保存（${settings.refreshToken}）` : "粘贴 OAuth 获取的 refresh_token，user token 过期前将自动续期"} />
-          </label>
+          <details className="advanced-credentials">
+            <summary>高级选项：手工粘贴 Refresh Token（通常无需填写，推荐使用上方授权登录）</summary>
+            <label className="form-row">
+              <span>Refresh Token</span>
+              <input type="password" value={refreshToken} onChange={(event) => setRefreshToken(event.target.value)} placeholder={settings?.hasRefreshToken ? `已保存（${settings.refreshToken}）·留空保持已保存值` : "粘贴 OAuth 获取的 refresh_token，user token 过期前将自动续期"} />
+            </label>
+          </details>
           <label className="form-row">
             <span>App ID（自动刷新用）</span>
             <input value={appId} onChange={(event) => setAppId(event.target.value)} placeholder="cli_xxxx（配套 refresh token 使用）" />
@@ -379,28 +373,9 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
     </div>
 
     <div className="panel settings-panel">
-      <div className="panel-heading"><div><h3>通知偏好</h3><span className="muted">按类别开关，保存在服务端 config.json，换浏览器也跟随生效</span></div></div>
+      <div className="panel-heading"><div><h3>通知偏好</h3><span className="muted">通知功能暂未开放（接口已预留）</span></div></div>
       <div className="settings-form">
-        {(Object.keys(NOTIFICATION_LABELS) as Array<keyof NotificationPreferences>).map((category) => (
-          <label className="form-row checkbox-row" key={category}>
-            <input
-              type="checkbox"
-              checked={notifications[category]}
-              disabled={notifyBusy === category}
-              onChange={(event) => void toggleNotification(category, event.target.checked)}
-            />
-            <span>{NOTIFICATION_LABELS[category].label}<small className="muted">{NOTIFICATION_LABELS[category].hint}</small></span>
-          </label>
-        ))}
-        <div className="form-row">
-          <span className="form-label">浏览器系统通知权限</span>
-          <div className="rebind-row">
-            <span className={`notify-permission ${notifyPermission}`}>{PERMISSION_LABELS[notifyPermission] ?? notifyPermission}</span>
-            {notifyPermission !== "granted" && notifyPermission !== "unsupported" && <button className="secondary" onClick={onRequestNotifyPermission}>请求通知权限</button>}
-          </div>
-          <span className="muted">关闭某一类后，该类事件不再弹出系统通知；页面内的徽章、任务中心与异常工作台仍会展示。本版本不提供通知声音。</span>
-        </div>
-        {notifyNotice && <div className="form-notice">{notifyNotice}</div>}
+        <p className="muted form-hint">通知功能暂未开放：冲突、失败与凭证异常目前通过页面顶栏徽章、任务中心与冲突工作台提示。服务端已预留 Notifier 接口，未来可接入飞书机器人推送；此前保存的通知偏好仍保留在 config.json 中，开放后将自动生效。</p>
       </div>
     </div>
 

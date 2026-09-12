@@ -603,8 +603,15 @@ test("task center groups operations and supports retry/cancel/batch-retry", asyn
     assert.equal((await app.inject({ method: "GET", url: "/api/tasks?status=active" })).json().tasks.length, 0);
 
     // Inject a failed operation bound to the entry to exercise retry + batch.
+    // The failed queue only holds failures nobody has dealt with: while the
+    // entry's binding is still clean the record stays hidden; the error state
+    // (as a real failed sync would leave it) makes it visible again.
     const failed = await app.metaStorage.addOperation({ rootId, entryId, direction: "pull", operation: "sync-entry", trigger: "poll" });
     await app.metaStorage.updateOperation(failed.id, { status: "failed", errorCategory: "network", error: "simulated" });
+    const hiddenWhileClean = (await app.inject({ method: "GET", url: "/api/tasks?status=failed" })).json().tasks as Array<{ id: string }>;
+    assert.ok(!hiddenWhileClean.some((task) => task.id === failed.id), "a dealt-with (clean) failure stays out of the queue");
+    const binding = await app.metaStorage.findBindingById(entryId);
+    if (binding) await app.metaStorage.setBinding(rootId, binding.relativePath, { ...binding, status: "error", updatedAt: new Date().toISOString() });
     const failedTasks = (await app.inject({ method: "GET", url: "/api/tasks?status=failed" })).json().tasks as Array<{ id: string }>;
     assert.ok(failedTasks.some((task) => task.id === failed.id));
 

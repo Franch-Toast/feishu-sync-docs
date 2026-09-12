@@ -183,6 +183,13 @@ export interface CredentialPatch {
   larkCliBin?: string;
 }
 
+/** GET /api/auth/feishu/authorize: consent-page URL plus the callback address
+ *  that must be registered in the Feishu app's redirect-URL settings. */
+export interface FeishuAuthorizeResult {
+  url: string;
+  redirectUri: string;
+}
+
 export interface RootPatch {
   localPath?: string;
   remoteToken?: string;
@@ -373,6 +380,9 @@ export const api = {
   saveSettings: (patch: CredentialPatch) =>
     json<SettingsSaveResult>("/api/settings", { method: "PUT", body: JSON.stringify(patch) }),
   testConnection: (patch?: CredentialPatch) => post<TestConnectionResult>("/api/settings/test-connection", patch ?? {}),
+  /** OAuth authorization-login: returns the Feishu consent page URL (the
+   *  callback route exchanges the code and persists the refresh token). */
+  authorizeFeishuOAuth: () => json<FeishuAuthorizeResult>("/api/auth/feishu/authorize"),
   // global preferences (config.json)
   getAppConfig: () => json<AppConfigView>("/api/app-config"),
   saveAppConfig: (patch: AppConfigPatch) =>

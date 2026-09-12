@@ -13,6 +13,58 @@ export class FilesystemProvider implements LocalProvider {
     return files;
   }
 
+  /** Incremental counterpart of scan(): stat+hash only the requested paths.
+   *  A directory path is walked with the same filters as scan(); paths that
+   *  vanished between the event and this call are skipped so the binding loops
+   *  reclassify them as local-missing, while anything that escapes the root
+   *  still throws so the sync engine can fall back to a full scan. */
+  async scanEntries(root: SyncRoot, relativePaths: readonly string[]): Promise<LocalFile[]> {
+    const files: LocalFile[] = [];
+    for (const rawPath of new Set(relativePaths)) {
+      await this.visitEntry(root, rawPath.replaceAll("\\", "/"), files);
+    }
+    return files;
+  }
+
+  /** Recursive helper for scanEntries(): filters mirror walk() exactly (hidden
+   *  segments, node_modules, exclude globs, markdown/image extensions) and a
+   *  missing path is tolerated instead of failing the batch. */
+  private async visitEntry(root: SyncRoot, relativePath: string, files: LocalFile[]): Promise<void> {
+    // Hidden segments and node_modules are skipped exactly like walk(); `..`
+    // deliberately falls through to safePath() so an escaping path throws
+    // instead of being silently ignored.
+    if (relativePath.split("/").some((segment) => (segment.startsWith(".") && segment !== "..") || segment === "node_modules")) return;
+    const absolutePath = this.safePath(root, relativePath);
+    let metadata: Awaited<ReturnType<typeof stat>>;
+    try {
+      metadata = await stat(absolutePath);
+    } catch {
+      return; // vanished after the event fired; deletion flows through the binding loop
+    }
+    if (metadata.isDirectory()) {
+      if (matchesAnyGlob(relativePath, root.exclude ?? [])) return;
+      const entries = await readdir(absolutePath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+        await this.visitEntry(root, `${relativePath}/${entry.name}`, files);
+      }
+      return;
+    }
+    if (!metadata.isFile()) return;
+    if (matchesAnyGlob(relativePath, root.exclude ?? [])) return;
+    const extension = extname(relativePath).toLowerCase();
+    if (extension !== ".md" && !imageExtensions.has(extension)) return;
+    const data = await readFile(absolutePath);
+    files.push({
+      relativePath,
+      absolutePath,
+      kind: extension === ".md" ? "document" : "asset",
+      size: metadata.size,
+      mtimeMs: metadata.mtimeMs,
+      contentHash: sha256(data)
+    });
+  }
+
   async readText(root: SyncRoot, relativePath: string): Promise<string> {
     return readFile(this.safePath(root, relativePath), "utf8");
   }

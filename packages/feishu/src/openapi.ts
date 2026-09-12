@@ -214,7 +214,11 @@ export class FeishuOpenApiProvider implements RemoteProvider {
     await this.request("DELETE", `/open-apis/drive/v1/files/${encodeURIComponent(token)}?type=${encodeURIComponent(type)}`);
   }
 
-  private async walkDrive(folderToken: string, output: RemoteNode[]): Promise<void> {
+  /** Single-level listing of one drive folder (paginated). Backs both the
+   *  full tree walk and the incremental fast path that locates newly created
+   *  documents without walking the whole drive. */
+  async listFolderChildren(folderToken: string): Promise<RemoteNode[]> {
+    const children: RemoteNode[] = [];
     let pageToken = "";
     do {
       const query = new URLSearchParams({ folder_token: folderToken, page_size: "200" });
@@ -223,12 +227,18 @@ export class FeishuOpenApiProvider implements RemoteProvider {
       for (const file of data.files ?? []) {
         if (!file.token) continue;
         const type = file.type === "folder" ? "folder" : ["doc", "docx", "wiki"].includes(file.type ?? "") ? "document" : "asset";
-        const node: RemoteNode = { token: file.token, name: file.name ?? file.token, type, parentToken: file.parent_token ?? folderToken, updatedAt: file.modified_time };
-        output.push(node);
-        if (type === "folder") await this.walkDrive(file.token, output);
+        children.push({ token: file.token, name: file.name ?? file.token, type, parentToken: file.parent_token ?? folderToken, updatedAt: file.modified_time });
       }
       pageToken = data.next_page_token ?? "";
     } while (pageToken);
+    return children;
+  }
+
+  private async walkDrive(folderToken: string, output: RemoteNode[]): Promise<void> {
+    for (const node of await this.listFolderChildren(folderToken)) {
+      output.push(node);
+      if (node.type === "folder") await this.walkDrive(node.token, output);
+    }
   }
 
   private async listNativeBlocks(documentToken: string, parsedBlocks: ReturnType<typeof parseMarkdown>["blocks"]): Promise<{ blocks: RemoteDocument["blocks"]; rootBlockId?: string }> {
