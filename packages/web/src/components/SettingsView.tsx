@@ -129,7 +129,15 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
     setNotice(undefined);
     try {
       const { url, redirectUri } = await api.authorizeFeishuOAuth();
-      setNotice(`正在打开飞书授权页…请确保回调地址 ${redirectUri} 已在飞书开发者后台「安全设置 → 重定向 URL」登记。`);
+      // 飞书对 redirect_uri 做逐字符精确匹配:登记 127.0.0.1 却从 localhost
+      // 发起授权是最常见的「重定向 URL 有误」来源,提前显式提示。
+      let mismatch = "";
+      try {
+        if (new URL(redirectUri).origin !== window.location.origin) {
+          mismatch = "注意:本次回调地址与当前页面不同源,请确认飞书后台登记的正是这个地址,或用 FEISHU_OAUTH_REDIRECT_URI 指定。";
+        }
+      } catch { /* 非法 URL 由服务端兜底校验 */ }
+      setNotice(`正在打开飞书授权页…本次回调地址 ${redirectUri} 必须与飞书后台「安全设置 → 重定向 URL」登记的地址逐字符一致(127.0.0.1 与 localhost 视为不同地址)。${mismatch}`);
       window.location.href = url;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
@@ -232,7 +240,7 @@ export function SettingsView({ settings, appConfig, onSaveAppConfig, roots, onSa
         {mode === "user" && <>
           <div className="oauth-entry">
             <button className="primary" disabled={oauthBusy} onClick={() => void startOAuth()}>{oauthBusy ? "正在打开授权页…" : "飞书授权登录（推荐，自动获取并续期 Refresh Token）"}</button>
-            <span className="muted">需先在下方填写 App ID / App Secret 并保存,且回调地址已在飞书后台「安全设置 → 重定向 URL」登记:<code>http://127.0.0.1:8787/api/auth/feishu/callback</code>(以实际访问地址为准)。</span>
+            <span className="muted">需先在下方填写 App ID / App Secret 并保存,且回调地址已在飞书后台「安全设置 → 重定向 URL」登记:<code>{`http://${window.location.host}/api/auth/feishu/callback`}</code>(以当前浏览器地址栏为准;登记地址必须与本页地址逐字符一致,127.0.0.1 与 localhost 是不同地址,不一致会报「重定向 URL 有误」)。</span>
           </div>
           <label className="form-row">
             <span>User Access Token</span>

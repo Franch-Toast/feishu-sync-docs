@@ -47,6 +47,8 @@ curl -X POST http://127.0.0.1:8787/api/roots \
 3. 在「权限管理」中开通文档读写权限,并确保应用支持 `offline_access`(否则拿不到 refresh_token);
 4. 回到设置页点击「飞书授权登录」,在飞书完成授权后自动跳回,refresh token 即保存完成。
 
+> 排障:若点击授权后飞书提示**「重定向 URL 有误」**,几乎都是登记地址与实际发起授权的地址不一致——飞书对 `redirect_uri` 做**逐字符精确匹配**,登记了 `127.0.0.1` 却通过 `localhost` 访问服务(或端口不同)都会报错。用与登记地址完全相同的 host 访问服务、修改登记地址、或用 `FEISHU_OAUTH_REDIRECT_URI` 显式指定即可。
+
 之后 user_access_token 由服务端**自动续期**:每次刷新自动顺延约 7 天有效期;若服务停摆超过 7 天导致 refresh token 过期,重新点一次授权即可。手工粘贴 Token 的输入框降级为「高级选项」,通常无需填写。
 
 ### 方式二:手工 User Access Token

@@ -138,17 +138,23 @@ export class SyncEngine {
     const remoteAssetPaths = remotePathMaps.assets;
     const remoteAssetParents = remotePathMaps.assetParents;
     // Local documents still pairable with an unbound remote token, keyed by
-    // NFC-normalized base name for the title-based pairing below.
+    // NFC-normalized base name for the title-based pairing below; the flat
+    // list feeds the content-hash pairing after it.
     const unboundTitlePaths = new Map<string, string[]>();
+    const unboundLocalFiles: Array<{ relativePath: string; contentHash: string }> = [];
     for (const file of files) {
       if (file.kind !== "document") continue;
       const binding = existingByPath.get(file.relativePath);
       if (binding?.remoteToken || binding?.ignoredAt) continue;
+      unboundLocalFiles.push({ relativePath: file.relativePath, contentHash: file.contentHash });
       const baseName = normalizeForMatch(posix.basename(file.relativePath).replace(/\.md$/i, ""));
       if (!baseName) continue;
       const bucket = unboundTitlePaths.get(baseName);
       if (bucket) bucket.push(file.relativePath); else unboundTitlePaths.set(baseName, [file.relativePath]);
     }
+    // Lazily built for the content-hash pairing; empty link maps make the
+    // canonicalization identical to the raw comparison, so it is skipped.
+    let scanReverseMap: Map<string, string> | undefined;
     const importedPaths = new Set<string>();
     for (const node of remoteTree.nodes.filter((item) => item.type === "document")) {
       const relativePath = remoteDocumentPaths.get(node.token);
@@ -185,6 +191,56 @@ export class SyncEngine {
               status: "pending",
               remoteContentHash: localByPath.get(targetPath)?.contentHash,
               lastSyncCommit: target?.lastSyncCommit,
+              updatedAt: new Date().toISOString()
+            });
+            continue;
+          }
+        }
+      }
+      // Content-hash pairing (4th tier): after a successful push the stored
+      // remoteContentHash equals the canonicalized remote content, so an
+      // unbound remote document whose content matches exactly one unbound
+      // local file is that file's own earlier copy — the recovery path when
+      // bindings are lost and the drive title is the markdown H1, which pairs
+      // with neither the path nor the base name. Adopting it here keeps the
+      // later push from tripping the same-name duplicate guard on itself.
+      if (!localByPath.has(relativePath) && unboundLocalFiles.length > 0) {
+        let targets = node.contentHash ? unboundLocalFiles.filter((file) => file.contentHash === node.contentHash) : [];
+        if (targets.length !== 1) {
+          if (scanReverseMap === undefined) scanReverseMap = (await this.buildLinkMaps(root.id)).reverseMap;
+          if (scanReverseMap.size > 0 && unboundLocalFiles.length <= 200) {
+            let document: RemoteDocument | undefined;
+            try {
+              document = await this.remote.getDocument(node.token);
+            } catch (error) {
+              if (!isRemoteNotFound(error)) throw error;
+            }
+            if (document) {
+              const matched: Array<{ relativePath: string; contentHash: string }> = [];
+              for (const file of unboundLocalFiles) {
+                // Asset references have no reverse map at pairing time and
+                // keep their token form, which only ever weakens the match.
+                const canonical = restoreAssetReferences(restoreInternalLinks(document.content, scanReverseMap, file.relativePath), new Map(), file.relativePath);
+                if (sha256(canonical) === file.contentHash) matched.push(file);
+              }
+              targets = matched;
+            }
+          }
+        }
+        if (targets.length === 1) {
+          const target = targets[0]!;
+          const targetBinding = await this.metaStorage.getBinding(root.id, target.relativePath);
+          if (!targetBinding?.remoteToken) {
+            await this.metaStorage.setBinding(root.id, target.relativePath, {
+              entryId: targetBinding?.entryId ?? randomUUID(),
+              rootId: root.id,
+              relativePath: target.relativePath,
+              kind: "document",
+              remoteToken: node.token,
+              remoteParentToken: node.parentToken || root.remoteToken,
+              status: "pending",
+              remoteContentHash: target.contentHash,
+              lastSyncCommit: targetBinding?.lastSyncCommit,
               updatedAt: new Date().toISOString()
             });
             continue;
@@ -349,7 +405,11 @@ export class SyncEngine {
       const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && expectedNames.has(normalizeForMatch(node.name)));
       if (duplicate) {
         const bound = await this.metaStorage.findBindingByToken(root.id, duplicate.token);
-        if (bound && bound.entryId !== binding.entryId) {
+        // A binding on the very same relative path is this entry's own earlier
+        // record (entryId changes when metadata is rebuilt); treating it as a
+        // foreign duplicate made the first rebind after a metadata reset
+        // impossible. Fall through to the adopt/conflict logic below instead.
+        if (bound && bound.entryId !== binding.entryId && bound.relativePath !== binding.relativePath) {
           throw new Error(`Remote folder already has a document named "${duplicate.name}" bound to ${bound.relativePath}; rename one side, then retry sync`);
         }
         remote = await this.remote.getDocument(duplicate.token);

@@ -489,3 +489,80 @@ test("divergent same-name remote duplicates surface a conflict instead of auto-d
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
+
+test("rebinds by content hash after a metadata reset (H1 title ≠ file name)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-hashpair-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-hashpair-global-"));
+  await mkdir(join(directory, "sub"), { recursive: true });
+  await writeFile(join(directory, "sub", "data_flow.md"), "# sensor_radar 数据流详解\n\nrange doppler cfar", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  // First push succeeds; Feishu derives the drive-visible title from the
+  // markdown H1, so once the local binding is lost the document pairs with
+  // neither the path nor the base name.
+  const scan = await engine.scan(root);
+  const entry = await engine.syncEntry(scan.entries[0]!, root);
+  assert.equal(entry.status, "clean");
+  const token = entry.remoteToken!;
+  await gitStorage.commitBaseline(root.id, "sync: manual", "manual");
+  const created = remote.documents.get(token)!;
+  remote.documents.set(token, { ...created, name: "sensor_radar 数据流详解" });
+
+  // Metadata reset: bindings are wiped, the git baseline stays.
+  await metaStorage.deleteBinding(root.id, "sub/data_flow.md");
+  const rescan = await engine.scan(root);
+  const rebound = rescan.entries.find((item) => item.relativePath === "sub/data_flow.md");
+  assert.ok(rebound, "the local file is re-scanned");
+  assert.equal(rebound?.remoteToken, token, "the document is re-paired by content hash");
+  await assert.rejects(readFile(join(directory, "sub", "sensor_radar 数据流详解.md")), "no title-derived duplicate is imported");
+  const final = await engine.syncEntry(rebound!, root);
+  assert.equal(final.status, "clean");
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("treats a same-name remote document bound to the same local path as its own copy", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-selfadopt-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-selfadopt-global-"));
+  await writeFile(join(directory, "notes.md"), "# Notes\n\nshared body", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  // The remote copy already exists and is bound to this very path under a
+  // different (rebuilt) entryId: the duplicate guard must treat it as the
+  // entry's own earlier record instead of demanding a manual rename.
+  const token = "root/notes";
+  const stored = {
+    entryId: "bound-1",
+    rootId: root.id,
+    relativePath: "notes.md",
+    kind: "document" as const,
+    remoteToken: token,
+    remoteParentToken: "root",
+    status: "clean" as const,
+    updatedAt: new Date().toISOString()
+  };
+  await metaStorage.setBinding(root.id, "notes.md", stored);
+  await remote.createDocument("root", "notes", "# Notes\n\nshared body");
+  const stale = { ...stored, entryId: "stale-entry", remoteToken: undefined, status: "pending" as const };
+
+  const result = await engine.syncEntry(stale, root);
+  assert.equal(result.status, "clean");
+  assert.equal(result.remoteToken, token, "the same-path copy is adopted, not duplicated");
+  assert.equal([...remote.documents.keys()].filter((key) => key.endsWith("/notes")).length, 1);
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});

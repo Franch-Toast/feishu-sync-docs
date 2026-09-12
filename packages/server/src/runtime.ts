@@ -568,10 +568,29 @@ export class SyncRuntime {
         .filter((binding) => binding.status === "pending" && !binding.ignoredAt && (attempts.get(binding.entryId) ?? 0) < 3)
         .sort((left, right) => Number(left.kind !== "asset") - Number(right.kind !== "asset"));
       if (pending.length === 0) break;
+      // Queue the whole round up-front: every entry about to sync gets its
+      // queued operation record before the first one starts, so the task
+      // center shows the full in-progress queue instead of a single running
+      // task (cascading re-arms queue the same way on their pass).
+      const queued: Array<{ binding: EntryBinding; operation: OperationRecord }> = [];
       for (const binding of pending) {
         attempts.set(binding.entryId, (attempts.get(binding.entryId) ?? 0) + 1);
-        // Credential failures fail every entry; surface once and stop the round.
-        if (await this.syncEntryWithRetry(binding, root, trigger)) {
+        const operation = await this.metaStorage.addOperation({
+          entryId: binding.entryId, rootId: root.id, direction: "merge", operation: "sync-entry",
+          trigger, startedAt: new Date().toISOString(), maxRetries: 3
+        });
+        this.broadcast({ type: "operation-queued", rootId: root.id, operation });
+        queued.push({ binding, operation });
+      }
+      for (let index = 0; index < queued.length; index += 1) {
+        const item = queued[index]!;
+        // Credential failures fail every entry; surface once, cancel the
+        // still-queued records so no orphan stays "in progress", stop the round.
+        if (await this.syncEntryWithRetry(item.binding, root, trigger, item.operation)) {
+          for (const rest of queued.slice(index + 1)) {
+            const cancelled = await this.metaStorage.updateOperation(rest.operation.id, { status: "cancelled", completedAt: new Date().toISOString() });
+            this.broadcast({ type: "operation-cancelled", rootId: root.id, operation: cancelled });
+          }
           return { ...scan, entries: await this.metaStorage.listBindings(root.id), authInvalid: true };
         }
       }
@@ -604,17 +623,14 @@ export class SyncRuntime {
     return { ...scan, entries: finalBindings };
   }
 
-  /** Sync one entry behind a single operation record with per-round exponential
-   *  backoff (1s/2s/4s) for transient failures. Emits operation-queued/started/
-   *  completed/failed/retrying so the task center can track progress live.
-   *  Returns true when the round must abort because credentials are invalid
-   *  (auth/permission fail fast and are never auto-retried). */
-  private async syncEntryWithRetry(binding: EntryBinding, root: SyncRoot, trigger: SyncTrigger): Promise<boolean> {
-    const operation = await this.metaStorage.addOperation({
-      entryId: binding.entryId, rootId: root.id, direction: "merge", operation: "sync-entry",
-      trigger, startedAt: new Date().toISOString(), maxRetries: 3
-    });
-    this.broadcast({ type: "operation-queued", rootId: root.id, operation });
+  /** Sync one entry behind a pre-queued operation record (created by
+   *  scanAndSync so the whole round is visible in the task center up front)
+   *  with per-round exponential backoff (1s/2s/4s) for transient failures.
+   *  Emits operation-started/completed/failed/retrying; the caller broadcasts
+   *  operation-queued at queue time. Returns true when the round must abort
+   *  because credentials are invalid (auth/permission fail fast and are never
+   *  auto-retried). */
+  private async syncEntryWithRetry(binding: EntryBinding, root: SyncRoot, trigger: SyncTrigger, operation: OperationRecord): Promise<boolean> {
     const maxRetries = operation.maxRetries ?? 3;
     let retryCount = 0;
     for (;;) {

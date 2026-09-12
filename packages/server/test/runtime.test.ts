@@ -835,3 +835,67 @@ test("ignoring a failed entry drops it out of the failed queue", async () => {
     cleanup(scenario);
   }
 });
+
+test("a sync round queues every pending entry before executing any", async () => {
+  const scenario = createScenario();
+  try {
+    writeFileSync(join(scenario.directory, "a.md"), "alpha\n", "utf8");
+    writeFileSync(join(scenario.directory, "b.md"), "beta\n", "utf8");
+    writeFileSync(join(scenario.directory, "c.md"), "gamma\n", "utf8");
+    const root = await createRoot(scenario);
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+
+    await scenario.runtime.syncRoot(root.id);
+
+    const types = broadcastTypes(messages);
+    const firstStarted = types.indexOf("operation-started");
+    assert.ok(firstStarted > 0, "expected an operation-started broadcast");
+    const queuedIndexes = types.reduce<number[]>((acc, type, index) => {
+      if (type === "operation-queued") acc.push(index);
+      return acc;
+    }, []);
+    assert.equal(queuedIndexes.length, 3, "all three pending entries are queued");
+    assert.ok(queuedIndexes.every((index) => index < firstStarted), "the whole round is queued before the first entry starts");
+
+    const operations = await scenario.metaStorage.listOperations({ rootId: root.id, limit: 20 });
+    const round = operations.filter((operation) => operation.operation === "sync-entry");
+    assert.equal(round.length, 3);
+    assert.ok(round.every((operation) => operation.status === "succeeded"), "every queued entry ran to success");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("auth abort cancels the still-queued operations", async () => {
+  const scenario = createScenario();
+  try {
+    writeFileSync(join(scenario.directory, "a.md"), "alpha\n", "utf8");
+    writeFileSync(join(scenario.directory, "b.md"), "beta\n", "utf8");
+    const root = await createRoot(scenario);
+    // First round succeeds so both entries exist; the second round edits both.
+    await scenario.runtime.syncRoot(root.id);
+    writeFileSync(join(scenario.directory, "a.md"), "alpha v2\n", "utf8");
+    writeFileSync(join(scenario.directory, "b.md"), "beta v2\n", "utf8");
+    // Persistent auth error on writes: a fails fast (auth is never retried),
+    // b was already queued but must never be left stuck "in progress".
+    scenario.remote.failWritesAuth = true;
+    const outcome = (await scenario.runtime.syncRoot(root.id)) as { authInvalid?: boolean };
+    assert.equal(outcome.authInvalid, true);
+
+    const operations = await scenario.metaStorage.listOperations({ rootId: root.id, limit: 20 });
+    const round = operations.filter((operation) => operation.operation === "sync-entry");
+    assert.equal(round.length, 4, "two records from the first round plus the re-queued pair");
+    const bindings = await scenario.metaStorage.listBindings(root.id);
+    const statusOf = (relativePath: string) => {
+      const entryId = bindings.find((item) => item.relativePath === relativePath)?.entryId;
+      // listOperations is newest-first, so the first match is the latest round.
+      return round.find((operation) => operation.entryId === entryId)?.status;
+    };
+    assert.equal(statusOf("a.md"), "failed", "the auth-failing entry failed");
+    assert.equal(statusOf("b.md"), "cancelled", "the never-executed entry was cancelled");
+    assert.ok(!round.some((operation) => operation.status === "queued"), "no orphan queued record remains");
+  } finally {
+    cleanup(scenario);
+  }
+});
