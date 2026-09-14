@@ -168,6 +168,11 @@ export interface RemoteProvider {
    *  path that locates newly created documents without a full tree walk;
    *  optional so providers without drive listings can opt out. */
   listFolderChildren?(parentToken: string): Promise<RemoteNode[]>;
+  /** Overwrite the page-block title so the drive-visible name stays a
+   *  deterministic function of the local file name even when the markdown
+   *  import pipeline re-derives the title from the first H1. Optional:
+   *  providers without block-level updates can opt out. */
+  renameDocument?(token: string, title: string): Promise<void>;
 }
 
 export interface ProviderCapabilities {

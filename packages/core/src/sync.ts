@@ -248,6 +248,14 @@ export class SyncEngine {
         }
       }
       if (!localByPath.has(relativePath) && mode !== "push-only") {
+        // Duplicate-import guard: a remote document whose body already equals
+        // a local document file is almost certainly a stale copy created
+        // before drive titles were aligned with local file names (same
+        // content, different name). Importing it would materialise a second
+        // local file for the same document, so leave it untouched — the
+        // user removes the remote copy by hand.
+        if (scanReverseMap === undefined) scanReverseMap = (await this.buildLinkMaps(root.id)).reverseMap;
+        if (await this.findDuplicateLocalDocument(node, localByPath, scanReverseMap)) continue;
         importedPaths.add(relativePath);
         await this.importRemoteDocument(root, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents, localByPath);
       }
@@ -434,13 +442,16 @@ export class SyncEngine {
       }
       let remoteContent = this.renderRemoteContent(localContent, binding.relativePath, forwardMap, assetMaps.forwardMap);
       let created = await this.remote.createDocument(parent, documentTitle(binding.relativePath), remoteContent);
-      this.cacheRemoteNode(root, created);
       if (assetMaps.hasLocalAssets && this.remote.uploadInlineAsset) {
         const inlineAssets = await this.prepareAssets(root, binding, localContent, created.token, true);
         assetMaps = inlineAssets;
         remoteContent = this.renderRemoteContent(localContent, binding.relativePath, forwardMap, inlineAssets.forwardMap);
         if (remoteContent !== created.content) created = (await this.remote.applyPatch(created.token, { operations: [{ type: "overwrite", content: remoteContent }], expectedRevisionId: created.revisionId })).document;
       }
+      // The markdown import can re-derive the title from the first H1; pin
+      // it back to the local file name so the drive name stays reversible.
+      created = await this.ensureRemoteTitle(created, documentTitle(binding.relativePath));
+      this.cacheRemoteNode(root, created);
       const canonicalRemote = restoreAssetReferences(restoreInternalLinks(created.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
       const hash = sha256(localContent);
       const next: EntryBinding = {
@@ -508,6 +519,9 @@ export class SyncEngine {
         ? buildBlockPatch(base, remoteContent, remote.blocks, remote.rootBlockId).operations
         : [{ type: "overwrite" as const, content: remoteContent }];
       remoteAfter = (await this.remote.applyPatch(remote.token, { operations: patch, expectedRevisionId: remote.revisionId, expectedContentHash: remote.contentHash })).document;
+      // Same title pin: an overwrite carrying the first H1 must not rename
+      // the document away from the local file name.
+      remoteAfter = await this.ensureRemoteTitle(remoteAfter, documentTitle(binding.relativePath));
     }
 
     const hash = sha256(content);
@@ -922,6 +936,54 @@ export class SyncEngine {
       reverseMap.set(binding.remoteToken, path);
     }
     return { forwardMap, reverseMap };
+  }
+
+  /** Drop the cached remote tree so the next guard lookup observes documents
+   *  created after the snapshot was taken: the same-round auto-retry after
+   *  "the API failed but the document was actually created" must find and
+   *  adopt the half-finished document instead of creating it again. */
+  invalidateRemoteTree(rootId: string): void {
+    this.remoteTreeCache.delete(rootId);
+  }
+
+  /** Keep the drive-visible title equal to the local file name: the docs_ai
+   *  markdown pipeline can re-derive the title from the document's first H1,
+   *  so after any content write the title is compared and patched back when
+   *  it drifted. A no-op for providers without block-level renames. */
+  private async ensureRemoteTitle(doc: RemoteDocument, expected: string): Promise<RemoteDocument> {
+    if (doc.name === expected || !this.remote.renameDocument) return doc;
+    await this.remote.renameDocument(doc.token, expected);
+    return { ...doc, name: expected };
+  }
+
+  /** Return the local document path whose content equals the remote document,
+   *  comparing raw and canonicalized content hashes across every local file
+   *  (bound or not — the original behind a stale duplicate is usually
+   *  already bound). Undefined when nothing matches. */
+  private async findDuplicateLocalDocument(node: RemoteNode, localByPath: Map<string, LocalFile>, scanReverseMap: Map<string, string>): Promise<string | undefined> {
+    const documents = [...localByPath.values()].filter((file) => file.kind === "document");
+    if (documents.length === 0) return undefined;
+    if (node.contentHash) {
+      const fast = documents.find((file) => file.contentHash === node.contentHash);
+      if (fast) return fast.relativePath;
+    }
+    let remote: RemoteDocument | undefined;
+    try {
+      remote = await this.remote.getDocument(node.token);
+    } catch (error) {
+      if (!isRemoteNotFound(error)) throw error;
+      return undefined;
+    }
+    if (!remote) return undefined;
+    const raw = sha256(remote.content);
+    for (const file of documents) {
+      if (file.contentHash === raw) return file.relativePath;
+      // Asset references have no reverse map at pairing time and keep their
+      // token form, which only ever weakens the match (same as above).
+      const canonical = restoreAssetReferences(restoreInternalLinks(remote.content, scanReverseMap, file.relativePath), new Map(), file.relativePath);
+      if (sha256(canonical) === file.contentHash) return file.relativePath;
+    }
+    return undefined;
   }
 
   /** Force-refresh the cached remote tree for a root; used at scan start so

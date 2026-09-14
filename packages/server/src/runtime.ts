@@ -682,6 +682,10 @@ export class SyncRuntime {
           this.broadcast({ type: "operation-retrying", rootId: root.id, operation: queued, delayMs, retryCount });
           this.log("warn", "entry sync failed; auto-retrying with backoff", { rootId: root.id, entryId: binding.entryId, retryCount, delayMs, category, error: message });
           await this.sleep(delayMs);
+          // The next attempt must observe documents created during the failed
+          // one: a stale cached tree would let the creation guard re-create
+          // an already-created document (the API failed but the write landed).
+          this.engine.invalidateRemoteTree(root.id);
           continue;
         }
         const failedOp = await this.metaStorage.updateOperation(operation.id, { status: "failed", error: message, errorCategory: category, retryCount, completedAt: new Date().toISOString(), ...failedDirection(this.engine, binding.entryId) });
@@ -705,10 +709,15 @@ export class SyncRuntime {
   async listTasks(options: { status?: TaskStatus; rootId?: string; limit?: number; cursor?: string } = {}): Promise<{ tasks: TaskView[]; nextCursor?: string }> {
     const limit = options.limit ?? 100;
     const concrete = options.status && options.status !== "active" && options.status !== "all" ? options.status : undefined;
-    const operations = await this.metaStorage.listOperations({ rootId: options.rootId, limit, cursor: options.cursor, status: concrete });
+    // The active group is the in-flight queue as a whole: a paged window can
+    // cut the running record (the oldest of a big round) before the
+    // running-first sort below ever sees it, leaving the group full of
+    // "queued" rows only. The ring buffer caps stored operations, so one
+    // generous listing reads everything queued/running in one go.
     const visible = options.status === "active"
-      ? operations.filter((operation) => operation.status === "queued" || operation.status === "running")
-      : operations;
+      ? (await this.metaStorage.listOperations({ rootId: options.rootId, limit: 10_000 }))
+        .filter((operation) => operation.status === "queued" || operation.status === "running")
+      : await this.metaStorage.listOperations({ rootId: options.rootId, limit, cursor: options.cursor, status: concrete });
     const tasks: TaskView[] = [];
     // The "failed & awaiting" queue only holds failures nobody has dealt with:
     // once the entry is ignored or has re-synced (clean/pending) the record
@@ -725,7 +734,9 @@ export class SyncRuntime {
       if (options.status === "failed" && binding && (binding.ignoredAt || binding.status === "clean" || binding.status === "pending")) continue;
       tasks.push({ ...operation, relativePath: binding?.relativePath, kind: binding?.kind });
     }
-    const nextCursor = operations.length === limit ? operations[operations.length - 1]!.id : undefined;
+    const nextCursor = options.status === "active" || visible.length !== limit
+      ? undefined
+      : visible[visible.length - 1]!.id;
     // The active group reads like a queue: the running task first, then the
     // queued ones in the order they were enqueued (oldest createdAt first).
     if (options.status === "active") {

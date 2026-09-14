@@ -991,3 +991,41 @@ test("listTasks orders the active group running-first, then by queue time", asyn
     cleanup(scenario);
   }
 });
+
+test("a same-round retry adopts the document the failed attempt already created", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "# Notes\n\nbody");
+    // Step one of the creation commits server-side but the caller never sees
+    // the ack; without a fresh tree the retry would create a second copy.
+    scenario.remote.failCreatesTimes(1);
+    const result = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    assert.equal(result.entries[0]?.status, "clean", "the retry succeeds by adopting the half-created document");
+    assert.equal(scenario.remote.documents.size, 1, "exactly one document exists — no duplicate");
+    const [document] = [...scenario.remote.documents.values()];
+    assert.equal(document!.content, "# Notes\n\nbody", "the adopted document is fully filled");
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("listTasks returns the whole active group regardless of the page limit", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario);
+    // 31 in-flight tasks; the running one is also the oldest — exactly the
+    // record a newest-first page window used to cut off before the
+    // running-first sort could ever see it.
+    const running = await scenario.metaStorage.addOperation({ rootId: root.id, direction: "push", operation: "sync-entry", trigger: "manual", maxRetries: 3 });
+    await scenario.metaStorage.updateOperation(running.id, { status: "running" });
+    for (let index = 0; index < 30; index += 1) {
+      await scenario.metaStorage.addOperation({ rootId: root.id, direction: "push", operation: "sync-entry", trigger: "manual", maxRetries: 3 });
+    }
+    const page = await scenario.runtime.listTasks({ status: "active", limit: 25 });
+    assert.equal(page.tasks.length, 31, "the active group is never truncated by the page size");
+    assert.equal(page.tasks[0]!.id, running.id, "the running task leads the group");
+    assert.equal(page.nextCursor, undefined);
+  } finally {
+    cleanup(scenario);
+  }
+});

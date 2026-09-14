@@ -195,6 +195,17 @@ export class FeishuOpenApiProvider implements RemoteProvider {
     return { document: current, applied: patch.operations };
   }
 
+  /** Overwrite the page-block title, the official way to rename a docx
+   *  document: the docs_ai markdown pipeline derives the title from the
+   *  first H1, so a content write can silently rename the document away
+   *  from the local file name; the engine calls this whenever the
+   *  drive-visible title drifted. */
+  async renameDocument(token: string, title: string): Promise<void> {
+    await this.request("PATCH", `/open-apis/docx/v1/documents/${encodeURIComponent(token)}/blocks/${encodeURIComponent(token)}`, {
+      update_text_elements: { elements: [{ text_run: { content: title } }] }
+    });
+  }
+
   async uploadAsset(parentToken: string, name: string, content: Uint8Array, mimeType: string): Promise<RemoteAsset> {
     const form = new FormData();
     form.append("file_name", name);

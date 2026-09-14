@@ -72,16 +72,16 @@ test("imports a remote-only document into the local tree", async () => {
   await rm(globalDir, { recursive: true, force: true });
 });
 
-test("the same-name guard matches on file names, so a shared H1 no longer blocks pushes", async () => {
+test("the same-name guard matches on file names, and a drifted title is pinned back", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-dup-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
   await writeFile(join(directory, "one.md"), "# Same Title\n\nfirst", "utf8");
   await writeFile(join(directory, "two.md"), "# Same Title\n\nsecond", "utf8");
-  await writeFile(join(directory, "Same Title.md"), "# Different Heading\n\nthird", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
-  // Old-provider behaviour: the drive-visible title is derived from the H1.
+  // Old-provider behaviour: every content write re-derives the drive title
+  // from the markdown H1, which used to collide two files sharing a heading.
   remote.simulateH1Title = true;
   const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
   await gitStorage.initRoot(root);
@@ -91,15 +91,26 @@ test("the same-name guard matches on file names, so a shared H1 no longer blocks
   const scan = await engine.scan(root);
   const first = scan.entries.find((entry) => entry.relativePath === "one.md")!;
   assert.equal((await engine.syncEntry(first, root)).status, "clean");
-  // The H1 collides with one.md but the file name does not: creation used to
-  // deadlock on the H1-derived title, the file-name guard lets it through.
+  // The shared H1 no longer blocks: the drive-visible title is pinned back to
+  // the local file name after the write, so both pushes succeed.
   const second = scan.entries.find((entry) => entry.relativePath === "two.md")!;
   assert.equal((await engine.syncEntry(second, root)).status, "clean");
   assert.equal(remote.documents.size, 2);
-  // A file whose *name* matches an existing remote document still blocks.
-  const third = scan.entries.find((entry) => entry.relativePath === "Same Title.md")!;
+  const names = [...remote.documents.values()].map((document) => document.name).sort();
+  assert.deepEqual(names, ["one", "two"], "each drive title is the file name again after the pin");
+
+  // A document already bound to another path under the same name still
+  // blocks: the guard protects bindings, not titles.
+  const shadow = await remote.createDocument("root", "Same Title", "# Same Title\n\nshadow");
+  await metaStorage.setBinding(root.id, "other.md", {
+    entryId: "other-entry", rootId: root.id, relativePath: "other.md", kind: "document",
+    remoteToken: shadow.token, remoteParentToken: "root", status: "pending", updatedAt: new Date().toISOString()
+  });
+  await writeFile(join(directory, "Same Title.md"), "# Different Heading\n\nthird", "utf8");
+  const rescanned = await engine.scan(root);
+  const third = rescanned.entries.find((entry) => entry.relativePath === "Same Title.md")!;
   await assert.rejects(() => engine.syncEntry(third, root), /already has a document named "Same Title"/);
-  assert.equal(remote.documents.size, 2);
+  assert.equal(remote.documents.size, 3);
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
@@ -149,6 +160,37 @@ test("adopts an empty same-name stub left by a failed creation and fills it on p
   assert.equal(synced.status, "clean", "the push fills the adopted stub");
   assert.equal(remote.documents.get(stub.token)!.content, "# Notes\n\nbody");
   assert.equal(remote.documents.size, 1);
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("skips importing a remote duplicate whose content matches a bound local file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-dupimport-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-dupimport-global-"));
+  await writeFile(join(directory, "sensor_ins_online.md"), "# Thread List\n\nfull thread inventory", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const scan = await engine.scan(root);
+  assert.equal((await engine.syncEntry(scan.entries[0]!, root)).status, "clean");
+
+  // A stale copy created under an old-style title: same body, different
+  // name. Its tree hash is stale on purpose so the guard must fetch the
+  // document and compare canonical content — exactly what happens with the
+  // real provider, whose drive listings carry no content hash at all.
+  const stale = await remote.createDocument("root", "thread_list", "# Thread List\n\nfull thread inventory");
+  const stored = remote.documents.get(stale.token)!;
+  remote.documents.set(stale.token, { ...stored, contentHash: "f".repeat(64) });
+
+  await engine.scan(root);
+  await assert.rejects(readFile(join(directory, "thread_list.md"), "utf8"), "a same-content duplicate never materialises as a local file");
+  assert.equal(remote.documents.size, 2, "the remote copy is kept for the user to clean up by hand");
+
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });

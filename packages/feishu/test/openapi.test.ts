@@ -233,6 +233,22 @@ test("returns a stub document when the post-create read fails", async () => {
   assert.equal(calls.filter((call) => call.path === "/open-apis/docs_ai/v1/documents/doc-new" && call.method === "PUT").length, 1);
 });
 
+test("renameDocument overwrites the page-block title so the drive name stays the file name", async () => {
+  const calls: Array<{ method: string; path: string; body?: string }> = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    calls.push({ method: init?.method ?? "GET", path: url.pathname, body: init?.body === undefined ? undefined : String(init.body) });
+    return json({ code: 0, data: { block: { block_id: "doc-1" } } });
+  };
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
+  await provider.renameDocument("doc-1", "notes");
+  assert.deepEqual(calls, [{
+    method: "PATCH",
+    path: "/open-apis/docx/v1/documents/doc-1/blocks/doc-1",
+    body: JSON.stringify({ update_text_elements: { elements: [{ text_run: { content: "notes" } }] } })
+  }]);
+});
+
 test("classifies Feishu failures into semantic kinds", async () => {
   const cases: Array<{ status?: number; body?: unknown; kind: FeishuApiError["kind"] }> = [
     { body: { code: 99991663, msg: "invalid user access token" }, kind: "auth" },

@@ -36,6 +36,14 @@ export class FakeRemote implements RemoteProvider {
    *  a Retry-After hint (B6.2); the runtime must honour it as a backoff floor. */
   rateLimitRemaining = 0;
   rateLimitRetryAfterMs = 0;
+  /** When > 0, that many createDocument calls commit the empty titled
+   *  document server-side and then throw — the drive keeps the document even
+   *  though the caller never saw the ack (timeout after the server replied),
+   *  which is the duplicate-creation trap the same-round retry must survive. */
+  failCreatesTimes(count: number): void {
+    this.createFailuresRemaining = count;
+  }
+  private createFailuresRemaining = 0;
   private writeFailuresRemaining = 0;
   private revision = 0;
   private pendingWriteError?: Error;
@@ -86,6 +94,14 @@ export class FakeRemote implements RemoteProvider {
   }
 
   async createDocument(parentToken: string, name: string, content: string): Promise<RemoteDocument> {
+    if (this.createFailuresRemaining > 0) {
+      this.createFailuresRemaining -= 1;
+      // Step one of the two-step creation committed: an empty document with
+      // the intended title exists, but the caller only saw the failure.
+      const ghost = this.makeDocument(`${parentToken}/${name}`, parentToken, name, "");
+      this.documents.set(ghost.token, ghost);
+      throw new Error("simulated create ack lost");
+    }
     const document = this.makeDocument(`${parentToken}/${name}`, parentToken, name, content);
     this.documents.set(document.token, document);
     return structuredClone(document);
@@ -119,6 +135,13 @@ export class FakeRemote implements RemoteProvider {
     const next = this.makeDocument(document.token, document.parentToken, document.name, content);
     this.documents.set(token, next);
     return { document: structuredClone(next), applied: patch.operations };
+  }
+
+  async renameDocument(token: string, title: string): Promise<void> {
+    const current = this.documents.get(token);
+    if (!current) throw new Error(`missing document: ${token}`);
+    // A page-block title write bumps the revision like any content edit.
+    this.documents.set(token, { ...current, name: title, revisionId: ++this.revision });
   }
 
   async uploadAsset(parentToken: string, name: string, content: Uint8Array, mimeType: string): Promise<RemoteAsset> {
