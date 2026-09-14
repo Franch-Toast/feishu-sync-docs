@@ -575,9 +575,12 @@ export class SyncRuntime {
       const queued: Array<{ binding: EntryBinding; operation: OperationRecord }> = [];
       for (const binding of pending) {
         attempts.set(binding.entryId, (attempts.get(binding.entryId) ?? 0) + 1);
+        // startedAt is deliberately absent: it marks the first execution
+        // start, set when the record flips to running below, not the queue
+        // time — otherwise every task's duration would include its queue wait.
         const operation = await this.metaStorage.addOperation({
           entryId: binding.entryId, rootId: root.id, direction: "merge", operation: "sync-entry",
-          trigger, startedAt: new Date().toISOString(), maxRetries: 3
+          trigger, maxRetries: 3
         });
         this.broadcast({ type: "operation-queued", rootId: root.id, operation });
         queued.push({ binding, operation });
@@ -633,8 +636,13 @@ export class SyncRuntime {
   private async syncEntryWithRetry(binding: EntryBinding, root: SyncRoot, trigger: SyncTrigger, operation: OperationRecord): Promise<boolean> {
     const maxRetries = operation.maxRetries ?? 3;
     let retryCount = 0;
+    // startedAt marks this task's first execution start and survives retries,
+    // so the task-center duration covers the task alone — its own attempts
+    // and backoff included — instead of resetting on every attempt.
+    let firstStartedAt: string | undefined;
     for (;;) {
-      const running = await this.metaStorage.updateOperation(operation.id, { status: "running", startedAt: new Date().toISOString() });
+      if (firstStartedAt === undefined) firstStartedAt = new Date().toISOString();
+      const running = await this.metaStorage.updateOperation(operation.id, { status: "running", startedAt: firstStartedAt });
       this.broadcast({ type: "operation-started", rootId: root.id, operation: running });
       try {
         await this.engine.syncEntry(binding, root);
@@ -718,6 +726,13 @@ export class SyncRuntime {
       tasks.push({ ...operation, relativePath: binding?.relativePath, kind: binding?.kind });
     }
     const nextCursor = operations.length === limit ? operations[operations.length - 1]!.id : undefined;
+    // The active group reads like a queue: the running task first, then the
+    // queued ones in the order they were enqueued (oldest createdAt first).
+    if (options.status === "active") {
+      tasks.sort((left, right) =>
+        (left.status === "running" ? 0 : 1) - (right.status === "running" ? 0 : 1)
+        || new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
+    }
     return { tasks, nextCursor };
   }
 
@@ -758,6 +773,36 @@ export class SyncRuntime {
       catch (error) { this.log("warn", "batch retry skipped an operation", { operationId, error: error instanceof Error ? error.message : String(error) }); }
     }
     return { accepted, total: operationIds.length };
+  }
+
+  /** Task-center「忽略」: drop the selected failed records (and every older
+   *  failure of the same entries — the failed group only shows the latest
+   *  failure per entry, so removing just the newest would let an older one
+   *  resurface). This only clears the list: the entry keeps its "error"
+   *  status and keeps participating in future sync evaluations. */
+  async dismissTasks(operationIds: string[]): Promise<{ dismissed: number; total: number }> {
+    const targets = new Set<string>();
+    const entryIds = new Set<string>();
+    for (const operationId of operationIds) {
+      const operation = await this.metaStorage.getOperation(operationId);
+      if (!operation || operation.status !== "failed") {
+        this.log("warn", "dismiss skipped an operation", { operationId, status: operation?.status });
+        continue;
+      }
+      targets.add(operation.id);
+      if (operation.entryId) entryIds.add(operation.entryId);
+    }
+    for (const entryId of entryIds) {
+      // The ring buffer caps records at 1000, so one page is enough to see
+      // every failed record of an entry.
+      for (const operation of await this.metaStorage.listOperations({ status: "failed", limit: 1000 })) {
+        if (operation.entryId === entryId) targets.add(operation.id);
+      }
+    }
+    const dismissed = await this.metaStorage.deleteOperations([...targets]);
+    if (dismissed > 0) this.broadcast({ type: "maintenance-pruned", operations: dismissed, conflicts: 0, snapshots: 0 });
+    this.log("info", "dismissed failed operations", { dismissed, total: operationIds.length });
+    return { dismissed, total: operationIds.length };
   }
 
   /** Injectable sleep so auto-retry backoff never blocks tests on real timers. */

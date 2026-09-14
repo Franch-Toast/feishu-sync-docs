@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   DIRECTION_LABELS,
   ERROR_CATEGORY_LABELS,
   formatDateTime,
+  formatDurationMs,
   formatElapsed,
   OPERATION_STATUS_LABELS,
   TRIGGER_LABELS,
@@ -70,8 +71,11 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
   const [notice, setNotice] = useState<string>();
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
-  /** Selected failed-task ids for the bulk retry / ignore toolbar (B6.3). */
+  /** Selected failed-task ids for the bulk retry / dismiss toolbar (B6.3). */
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  /** Monotonic sequence so a slow earlier fetch cannot clobber a newer one
+   *  (operation-* events fire in bursts; responses may resolve out of order). */
+  const loadSequence = useRef(0);
 
   const rootName = useCallback((id?: string) => {
     const item = roots.find((root) => root.id === id);
@@ -88,6 +92,7 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
 
   // First page of every group. Re-runs on revision bumps (operation-* events).
   const load = useCallback(async () => {
+    const sequence = ++loadSequence.current;
     setLoading(true);
     try {
       const [activePage, failedPage, donePage] = await Promise.all([
@@ -95,21 +100,25 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
         api.listTasks({ status: "failed", limit: PAGE }),
         api.listTasks({ status: "succeeded", limit: PAGE })
       ]);
+      if (sequence !== loadSequence.current) return; // superseded by a newer fetch
       setActive(activePage.tasks);
       setFailed(failedPage.tasks);
       setFailedCursor(failedPage.nextCursor);
       setDone(donePage.tasks);
       setDoneCursor(donePage.nextCursor);
     } catch (error) {
+      if (sequence !== loadSequence.current) return;
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => { void load(); }, [load, revision]);
-  // Light polling so the center stays fresh even without socket events.
-  useEffect(() => { const timer = window.setInterval(() => void load(), 5000); return () => window.clearInterval(timer); }, [load]);
+  // Adaptive polling: tick fast while tasks are in flight so the「同步中」
+  // badge shows up even without socket events; relax once the queue drains.
+  const pollMs = active.length > 0 ? 1000 : 5000;
+  useEffect(() => { const timer = window.setInterval(() => void load(), pollMs); return () => window.clearInterval(timer); }, [load, pollMs]);
 
   const loadMoreFailed = async () => {
     if (!failedCursor) return;
@@ -201,17 +210,18 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
     }
   };
 
-  /** Bulk ignore the entries behind the selected failed tasks (B6.3): the
-   *  workbench stops evaluating them until the user restores them. */
-  const batchIgnore = async () => {
-    const entryIds = failed.filter((task) => selected.has(task.id) && task.entryId).map((task) => task.entryId!);
-    if (entryIds.length === 0) { setNotice("选中的任务没有对应条目，无法忽略。"); return; }
-    if (!window.confirm(`忽略选中的 ${entryIds} 个条目？忽略后不再参与同步评估，可在异常工作台恢复。`)) return;
-    setBusy(new Set(entryIds));
+  /** Dismiss failed tasks: the failure records leave the list, the entries
+   *  keep participating in future sync evaluations (B6.3, semantics reworked:
+   *  this is no longer the entry-level ignore that freezes a document). */
+  const dismissTasks = async (tasks: TaskView[], skipConfirm = false) => {
+    const ids = tasks.map((task) => task.id);
+    if (ids.length === 0) return;
+    if (!skipConfirm && !window.confirm(`忽略选中的 ${ids.length} 条失败任务？仅移除失败记录，文档仍会正常参与后续同步评估。`)) return;
+    setBusy(new Set(ids));
     setNotice(undefined);
     try {
-      const result = await api.batchEntries(entryIds, "ignore");
-      setNotice(`已忽略 ${result.accepted}/${result.total} 个条目${result.failed > 0 ? `，${result.failed} 个失败` : ""}。`);
+      const result = await api.dismissTasks(ids);
+      setNotice(`已忽略 ${result.dismissed}/${result.total} 条失败任务。`);
       setSelected(new Set());
       await load();
     } catch (error) {
@@ -221,10 +231,19 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
     }
   };
 
+  const dismissOne = (task: TaskView) => dismissTasks([task]);
+
   const selectedFailed = failed.filter((task) => selected.has(task.id));
 
-  /** B6.6: wall-clock duration from queueing to completion, backoff included. */
-  const elapsed = (task: TaskView) => formatElapsed(task.createdAt, task.completedAt);
+  /** Duration of the task's own execution: first attempt start → completion.
+   *  Queue wait is excluded (the whole round is queued up-front, so createdAt
+   *  reflects enqueue time, not work time); running tasks show a live clock. */
+  const elapsed = (task: TaskView) => {
+    if (!task.completedAt) {
+      return task.startedAt ? formatDurationMs(Date.now() - new Date(task.startedAt).getTime()) : "—";
+    }
+    return formatElapsed(task.startedAt ?? task.createdAt, task.completedAt);
+  };
   const retryLabel = (task: TaskView) => {
     const max = task.maxRetries ?? 3;
     return task.retryCount > 0 ? `${task.retryCount}/${max}` : "—";
@@ -256,6 +275,7 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
         <td data-label="操作" className="task-actions">
           {group === "active" && <button className="link-button" disabled={syncing || busy.has(task.id)} onClick={() => void cancel(task)}>{busy.has(task.id) ? "…" : "取消"}</button>}
           {group === "failed" && guidance?.action && <button className="link-button" disabled={syncing || busy.has(task.id)} onClick={guidance.onAction}>{busy.has(task.id) ? "…" : guidance.action}</button>}
+          {group === "failed" && <button className="link-button" disabled={busy.has(task.id)} onClick={() => void dismissOne(task)}>{busy.has(task.id) ? "…" : "忽略"}</button>}
           {guidance?.expandable && task.error && <button className="link-button" onClick={() => toggleExpand(task.id)}>{isOpen ? "收起详情" : "错误详情"}</button>}
         </td>
       </tr>
@@ -304,7 +324,7 @@ export function TaskCenter({ roots, revision, syncing, onOpenSettings, onOpenIss
         {failed.length > 0 && <div className="batch-bar">
           <span className="muted">已选 {selectedFailed.length} 项</span>
           <button className="secondary" disabled={selectedFailed.length === 0} onClick={() => void batchRetry()}>批量重试</button>
-          <button className="danger-ghost" disabled={selectedFailed.length === 0} onClick={() => void batchIgnore()}>批量忽略</button>
+          <button className="secondary" disabled={selectedFailed.length === 0} onClick={() => void dismissTasks(selectedFailed)}>批量忽略</button>
           {selectedFailed.length > 0 && <button className="link-button" onClick={() => setSelected(new Set())}>取消选择</button>}
         </div>}
       </div>

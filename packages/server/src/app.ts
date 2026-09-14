@@ -409,6 +409,14 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) return reply.code(400).send({ error: "operationIds must be an array of strings" });
     return runtime.batchRetryTasks(ids);
   });
+  // Task center「忽略」: remove failed records from the list; the entries keep
+  // participating in future sync evaluations (unlike the entry-level ignore
+  // in the issue workbench, which freezes them until restored).
+  app.post<{ Body: { operationIds?: string[] } }>("/api/tasks/batch-dismiss", async (request, reply) => {
+    const ids = request.body?.operationIds;
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) return reply.code(400).send({ error: "operationIds must be an array of strings" });
+    return runtime.dismissTasks(ids);
+  });
   // Task center「清空已完成」(B2). Unlike the retention prune this deletes the
   // finished records immediately, so the button's count matches what disappears.
   app.post<{ Body?: { statuses?: string[] } }>("/api/tasks/clear-completed", async (request, reply) => {

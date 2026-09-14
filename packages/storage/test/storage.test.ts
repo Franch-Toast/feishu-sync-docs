@@ -231,6 +231,36 @@ test("JsonMetaStorage clears completed operations without touching open work (B2
   }
 });
 
+test("JsonMetaStorage deletes operations by id and reports the count", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "feishu-meta-"));
+  const globalDir = mkdtempSync(join(tmpdir(), "feishu-global-"));
+  try {
+    const meta = new JsonMetaStorage(globalDir);
+    const rootId = "test-root";
+    await meta.initRootMeta(rootId, dir);
+    const ids: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      ids.push((await meta.addOperation({ rootId, direction: "push", operation: "sync-entry" })).id);
+    }
+    await meta.updateOperation(ids[0]!, { status: "failed" });
+    await meta.updateOperation(ids[1]!, { status: "failed" });
+
+    // An empty request is a no-op, not a rewrite of every file.
+    assert.equal(await meta.deleteOperations([]), 0);
+    // Unknown ids are skipped and the count stays honest.
+    assert.equal(await meta.deleteOperations(["missing-id", ids[2]!]), 1);
+    assert.equal((await meta.listOperations({ rootId })).length, 3);
+    // Already-deleted ids are not double-counted.
+    assert.equal(await meta.deleteOperations([ids[0]!, ids[1]!, ids[2]!]), 2);
+    const remaining = await meta.listOperations({ rootId });
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0]!.id, ids[3]!);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(globalDir, { recursive: true, force: true });
+  }
+});
+
 test("GitStorageImpl reads blobs and lists commits per path (B4 version history)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "feishu-git-"));
   try {

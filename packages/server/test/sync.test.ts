@@ -72,14 +72,16 @@ test("imports a remote-only document into the local tree", async () => {
   await rm(globalDir, { recursive: true, force: true });
 });
 
-test("blocks duplicate-title pushes instead of creating a second remote copy", async () => {
+test("the same-name guard matches on file names, so a shared H1 no longer blocks pushes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-dup-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
   await writeFile(join(directory, "one.md"), "# Same Title\n\nfirst", "utf8");
   await writeFile(join(directory, "two.md"), "# Same Title\n\nsecond", "utf8");
+  await writeFile(join(directory, "Same Title.md"), "# Different Heading\n\nthird", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
+  // Old-provider behaviour: the drive-visible title is derived from the H1.
   remote.simulateH1Title = true;
   const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
   await gitStorage.initRoot(root);
@@ -88,10 +90,64 @@ test("blocks duplicate-title pushes instead of creating a second remote copy", a
 
   const scan = await engine.scan(root);
   const first = scan.entries.find((entry) => entry.relativePath === "one.md")!;
-  const synced = await engine.syncEntry(first, root);
-  assert.equal(synced.status, "clean");
+  assert.equal((await engine.syncEntry(first, root)).status, "clean");
+  // The H1 collides with one.md but the file name does not: creation used to
+  // deadlock on the H1-derived title, the file-name guard lets it through.
   const second = scan.entries.find((entry) => entry.relativePath === "two.md")!;
-  await assert.rejects(() => engine.syncEntry(second, root), /already has a document named "Same Title"/);
+  assert.equal((await engine.syncEntry(second, root)).status, "clean");
+  assert.equal(remote.documents.size, 2);
+  // A file whose *name* matches an existing remote document still blocks.
+  const third = scan.entries.find((entry) => entry.relativePath === "Same Title.md")!;
+  await assert.rejects(() => engine.syncEntry(third, root), /already has a document named "Same Title"/);
+  assert.equal(remote.documents.size, 2);
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("creates the remote document with the local file name as its title", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-title-create-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-title-create-global-"));
+  // H1 deliberately differs from the file name: the drive-visible title must
+  // be the file name passed to createDocument, never the markdown H1.
+  await writeFile(join(directory, "notes.md"), "# Completely Different Heading\n\nbody", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const scan = await engine.scan(root);
+  const entry = await engine.syncEntry(scan.entries[0]!, root);
+  assert.equal(entry.status, "clean");
+  const created = remote.documents.get(entry.remoteToken!)!;
+  assert.equal(created.name, "notes", "the remote title is the local file name, not the H1");
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("adopts an empty same-name stub left by a failed creation and fills it on push", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-stub-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-stub-global-"));
+  await writeFile(join(directory, "notes.md"), "# Notes\n\nbody", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  // Scan while the drive is empty so the binding stays unbound; then simulate
+  // a half-finished creation: the document was created but the content write
+  // failed before the binding was saved.
+  const scan = await engine.scan(root);
+  const stub = await remote.createDocument("root", "notes", "");
+  const synced = await engine.syncEntry(scan.entries[0]!, root);
+  assert.equal(synced.remoteToken, stub.token, "the empty stub is adopted, not duplicated");
+  assert.equal(synced.status, "clean", "the push fills the adopted stub");
+  assert.equal(remote.documents.get(stub.token)!.content, "# Notes\n\nbody");
   assert.equal(remote.documents.size, 1);
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });

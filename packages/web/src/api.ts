@@ -370,6 +370,9 @@ export const api = {
   retryTask: (id: string) => post<{ ok: boolean; operationId: string }>(`/api/tasks/${id}/retry`),
   cancelTask: (id: string) => post<{ ok: boolean; operationId: string }>(`/api/tasks/${id}/cancel`),
   batchRetryTasks: (operationIds: string[]) => post<{ accepted: number; total: number }>("/api/tasks/batch-retry", { operationIds }),
+  /** Task-center「忽略」— drops the failed records only; the entries keep
+   *  participating in future sync evaluations (no ignoredAt is set). */
+  dismissTasks: (operationIds: string[]) => post<{ dismissed: number; total: number }>("/api/tasks/batch-dismiss", { operationIds }),
   /** Task center「清空已完成」— deletes finished records now, unlike `prune`
    *  which only trims by retention and so usually reports zero. */
   clearCompletedTasks: (statuses?: Array<"succeeded" | "cancelled" | "failed">) =>

@@ -552,6 +552,26 @@ export class JsonMetaStorage implements MetaStorage {
     return cleared;
   }
 
+  /**
+   * Drop specific operation records by id (task-center dismissal) and report
+   * how many went away. Unknown ids are ignored; each root's ring buffer is
+   * rewritten only when at least one of its records matched.
+   */
+  async deleteOperations(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    const drop = new Set(ids);
+    let removed = 0;
+    for (const metaDir of this.metaDirs.values()) {
+      const opsPath = path.join(metaDir, 'operations.json');
+      const ops = await this.readJson<OperationRecord[]>(opsPath, []);
+      const kept = ops.filter((op) => !drop.has(op.id));
+      if (kept.length === ops.length) continue;
+      removed += ops.length - kept.length;
+      await this.writeJson(opsPath, kept);
+    }
+    return removed;
+  }
+
   // ============================================================================
   // Private Helpers
   // ============================================================================

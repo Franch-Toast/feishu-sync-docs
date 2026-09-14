@@ -393,16 +393,15 @@ export class SyncEngine {
       // down, so a local-only file is left untouched instead of being pushed.
       if (mode === "pull-only") return binding;
       const parent = await this.ensureRemoteParent(root, binding.relativePath);
-      // Feishu derives the drive-visible title from the markdown H1, so two
-      // local files sharing a first heading would push two identically named
-      // documents into the same folder. Adopt an unbound same-name document
-      // (e.g. this entry's own earlier creation after a partial failure)
-      // instead of creating another copy; block on same-name documents that
-      // are already bound elsewhere.
+      // The drive-visible title is the local file name (createDocument passes
+      // it explicitly), so the same-name guard matches on the file-derived
+      // title only. Adopt an unbound same-name document (e.g. this entry's
+      // own earlier creation after a partial failure) instead of creating
+      // another copy; block on same-name documents that are already bound
+      // elsewhere.
       const tree = await this.loadRemoteTree(root);
-      const expectedTitle = parseMarkdown(localContent).title ?? documentTitle(binding.relativePath);
-      const expectedNames = new Set([normalizeForMatch(expectedTitle), normalizeForMatch(documentTitle(binding.relativePath))]);
-      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && expectedNames.has(normalizeForMatch(node.name)));
+      const expectedName = normalizeForMatch(documentTitle(binding.relativePath));
+      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && expectedName === normalizeForMatch(node.name));
       if (duplicate) {
         const bound = await this.metaStorage.findBindingByToken(root.id, duplicate.token);
         // A binding on the very same relative path is this entry's own earlier
@@ -414,7 +413,11 @@ export class SyncEngine {
         }
         remote = await this.remote.getDocument(duplicate.token);
         const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
-        if (sha256(canonicalRemote) === sha256(localContent) || sha256(remote.content) === sha256(localContent)) {
+        // An empty document under our own title is a half-finished creation
+        // (created, then the content write failed before the binding was
+        // saved): take it over and let the push path fill it, instead of
+        // raising a conflict against our own stub.
+        if (remote.content.trim() === "" || sha256(canonicalRemote) === sha256(localContent) || sha256(remote.content) === sha256(localContent)) {
           // The existing copy matches the local file (most likely this
           // entry's own earlier creation); rebind and sync as usual.
           const adopted: EntryBinding = { ...binding, remoteToken: remote.token, remoteParentToken: parent, status: "pending", updatedAt: new Date().toISOString() };
@@ -471,7 +474,12 @@ export class SyncEngine {
     }
     const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
     const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
-    const base = baselineContent ?? localContent;
+    // An empty remote document is an unpopulated container (this entry's own
+    // half-finished creation adopted above, or a title-paired stub): with no
+    // baseline the three-way decision would read the empty body as a remote
+    // edit and pull it over the local file, so anchor the merge at the empty
+    // baseline and let the decision become a plain push.
+    const base = baselineContent ?? (canonicalRemote.trim() === "" ? "" : localContent);
     const decision = decideSync(base, localContent, canonicalRemote);
     let action = decision.action === "noop" && assetMaps.changed ? "push" as const : decision.action;
     // One-way modes override the three-way decision so the authoritative side

@@ -413,4 +413,7 @@ export interface MetaStorage {
    *  「清空已完成」. The retention prune keeps ~1000 recent records, so it would
    *  report nothing cleared long before any record actually expires. */
   clearCompletedOperations(statuses?: OperationRecord["status"][]): Promise<number>;
+  /** Delete specific operation records by id, backing the task center's
+   *  「忽略」 (dismiss a failed task without touching the entry itself). */
+  deleteOperations(ids: string[]): Promise<number>;
 }

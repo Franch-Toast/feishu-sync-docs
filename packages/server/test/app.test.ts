@@ -632,6 +632,42 @@ test("task center groups operations and supports retry/cancel/batch-retry", asyn
   }
 });
 
+test("batch-dismiss drops failed records and rejects malformed payloads", async () => {
+  const remote = new FakeRemote();
+  const app = buildIsolatedApp({ remote });
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-dismiss-"));
+  try {
+    writeFileSync(join(directory, "notes.md"), "shared line\n", "utf8");
+    const created = await app.inject({ method: "POST", url: "/api/roots", payload: { localPath: directory, remoteToken: "root-token" } });
+    assert.equal(created.statusCode, 201);
+    const rootId = created.json().id as string;
+    const synced = await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync`, payload: { trigger: "manual" } });
+    assert.equal(synced.statusCode, 200);
+    const entryId = (synced.json().entries as EntryView[])[0]!.entryId;
+
+    // A failed record bound to the entry, with the entry left in error so the
+    // failure is visible in the failed queue.
+    const failed = await app.metaStorage.addOperation({ rootId, entryId, direction: "pull", operation: "sync-entry", trigger: "poll" });
+    await app.metaStorage.updateOperation(failed.id, { status: "failed", errorCategory: "network", error: "simulated" });
+    const binding = await app.metaStorage.findBindingById(entryId);
+    if (binding) await app.metaStorage.setBinding(rootId, binding.relativePath, { ...binding, status: "error", updatedAt: new Date().toISOString() });
+    assert.equal(((await app.inject({ method: "GET", url: "/api/tasks?status=failed" })).json().tasks as Array<{ id: string }>).length, 1);
+
+    // A malformed payload is rejected before touching the runtime.
+    const malformed = await app.inject({ method: "POST", url: "/api/tasks/batch-dismiss", payload: { operationIds: "nope" } });
+    assert.equal(malformed.statusCode, 400);
+
+    // Dismissing removes the failed record but leaves the entry untouched.
+    const dismissed = await app.inject({ method: "POST", url: "/api/tasks/batch-dismiss", payload: { operationIds: [failed.id] } });
+    assert.equal(dismissed.statusCode, 200);
+    assert.deepEqual(dismissed.json(), { dismissed: 1, total: 1 });
+    assert.equal(((await app.inject({ method: "GET", url: "/api/tasks?status=failed" })).json().tasks as Array<{ id: string }>).length, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    await app.close();
+  }
+});
+
 test("task center clears completed operations on demand (B2)", async () => {
   const remote = new FakeRemote();
   const app = buildIsolatedApp({ remote });

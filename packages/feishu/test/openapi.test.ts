@@ -157,17 +157,68 @@ test("parses the flat create_folder response and soft-deletes with a type", asyn
   assert.match(deleted.path, /type=folder$/);
 });
 
-test("returns a stub document when the post-create read fails", async () => {
-  let createCalls = 0;
+test("creates with an explicit title and fills content through docs_ai overwrite", async () => {
+  const calls: Array<{ method: string; path: string; body?: string }> = [];
+  let revision = 1;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const body = init?.body === undefined ? undefined : String(init.body);
+    calls.push({ method: init?.method ?? "GET", path: url.pathname, body });
+    if (url.pathname === "/open-apis/docx/v1/documents") return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: revision, title: "notes" } } });
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new" && init?.method === "PUT") {
+      revision += 1;
+      return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: revision } } });
+    }
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new/fetch") return json({ code: 0, data: { document: { document_id: "doc-new", title: "notes", revision_id: revision, content: "# Notes\n\nbody" } } });
+    if (url.pathname === "/open-apis/docx/v1/documents/doc-new/blocks") return json({ code: 0, data: { items: [], has_more: false } });
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
+  const created = await provider.createDocument("fld-parent", "notes", "# Notes\n\nbody");
+  // Sequence: explicit-title create (empty document) -> content fill via the
+  // same docs_ai channel applyPatch uses -> read back.
+  assert.deepEqual(calls.map((call) => `${call.method} ${call.path}`), [
+    "POST /open-apis/docx/v1/documents",
+    "PUT /open-apis/docs_ai/v1/documents/doc-new",
+    "POST /open-apis/docs_ai/v1/documents/doc-new/fetch",
+    "GET /open-apis/docx/v1/documents/doc-new/blocks"
+  ]);
+  // The drive-visible title must be the local file name, not the markdown H1.
+  const create = calls[0]!;
+  assert.match(create.body ?? "", /"folder_token":"fld-parent"/);
+  assert.match(create.body ?? "", /"title":"notes"/);
+  const fill = calls[1]!;
+  assert.match(fill.body ?? "", /"format":"markdown"/);
+  assert.match(fill.body ?? "", /"command":"overwrite"/);
+  assert.match(fill.body ?? "", /"content":"# Notes\\n\\nbody"/);
+  assert.match(fill.body ?? "", /"revision_id":1/);
+  assert.equal(created.token, "doc-new");
+  assert.equal(created.name, "notes");
+  assert.equal(created.content, "# Notes\n\nbody");
+});
+
+test("throws when the content write fails so the engine can adopt the empty document on retry", async () => {
   const fetchImpl: typeof fetch = async (input) => {
     const url = new URL(String(input));
-    if (url.pathname === "/open-apis/docs_ai/v1/documents") {
-      createCalls += 1;
-      return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: 1 } } });
-    }
-    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new/fetch") {
-      return json({ code: 9499, msg: "Invalid parameter type in json: ExtraParam" });
-    }
+    if (url.pathname === "/open-apis/docx/v1/documents") return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: 1, title: "notes" } } });
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new") return json({ code: 99991679, msg: "write failed" });
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+  const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
+  // The empty document already exists in the drive; throwing lets the engine's
+  // same-name guard adopt it on the next attempt instead of leaving an
+  // orphaned duplicate behind.
+  await assert.rejects(provider.createDocument("fld-parent", "notes", "# Notes\n\nbody"), (error: unknown) => error instanceof FeishuApiError);
+});
+
+test("returns a stub document when the post-create read fails", async () => {
+  const calls: Array<{ method: string; path: string }> = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    calls.push({ method: init?.method ?? "GET", path: url.pathname });
+    if (url.pathname === "/open-apis/docx/v1/documents") return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: 1, title: "notes" } } });
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new") return json({ code: 0, data: { document: { document_id: "doc-new", revision_id: 2 } } });
+    if (url.pathname === "/open-apis/docs_ai/v1/documents/doc-new/fetch") return json({ code: 9499, msg: "Invalid parameter type in json: ExtraParam" });
     throw new Error(`unexpected request: ${url.pathname}`);
   };
   const provider = new FeishuOpenApiProvider({ accessToken: "token", fetchImpl });
@@ -175,8 +226,11 @@ test("returns a stub document when the post-create read fails", async () => {
   // the caller would re-create a duplicate on the next attempt.
   const created = await provider.createDocument("fld-parent", "notes", "# Notes\n\nbody");
   assert.equal(created.token, "doc-new");
+  assert.equal(created.name, "notes");
   assert.equal(created.content, "");
-  assert.equal(createCalls, 1);
+  // Both the create and the content fill happened exactly once.
+  assert.equal(calls.filter((call) => call.path === "/open-apis/docx/v1/documents").length, 1);
+  assert.equal(calls.filter((call) => call.path === "/open-apis/docs_ai/v1/documents/doc-new" && call.method === "PUT").length, 1);
 });
 
 test("classifies Feishu failures into semantic kinds", async () => {

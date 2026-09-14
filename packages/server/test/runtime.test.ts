@@ -899,3 +899,95 @@ test("auth abort cancels the still-queued operations", async () => {
     cleanup(scenario);
   }
 });
+
+test("queued records carry no startedAt; the first run stamps it and retries keep it", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    await scenario.runtime.syncRoot(root.id);
+    const { socket, messages } = createFakeSocket();
+    scenario.runtime.addClient(socket);
+    // Second round: one transient write failure forces an auto-retry within
+    // the round, exercised on the push path (applyPatch).
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    scenario.remote.failWritesTimes(1);
+    await scenario.runtime.syncRoot(root.id);
+
+    const payloads = messages.map((payload) => JSON.parse(payload) as { type: string; operation?: { id: string; status: string; startedAt?: string } });
+    const queued = payloads.find((payload) => payload.type === "operation-queued")?.operation;
+    assert.ok(queued);
+    assert.equal(queued.startedAt, undefined, "queueing is not execution: no startedAt at queue time");
+
+    const started = payloads.filter((payload) => payload.type === "operation-started");
+    assert.equal(started.length, 2, "the retry produces a second running transition");
+    assert.ok(started[0]!.operation!.startedAt, "the first execution stamps startedAt");
+    assert.equal(started[1]!.operation!.startedAt, started[0]!.operation!.startedAt, "the retry keeps the original start so the duration covers its own attempts");
+
+    const record = (await scenario.metaStorage.listOperations({ rootId: root.id, limit: 5 }))[0]!;
+    assert.equal(record.status, "succeeded");
+    assert.ok(record.startedAt);
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("dismissTasks removes every failed record of the entry and keeps it in error", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "shared line\n");
+    await scenario.runtime.syncRoot(root.id);
+    // Two consecutive failed rounds leave two failed records for the entry;
+    // the failed group only shows the newest one.
+    scenario.remote.failWrites = true;
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
+    await scenario.runtime.syncRoot(root.id);
+    writeFileSync(join(scenario.directory, "notes.md"), "local edit v2\n", "utf8");
+    await scenario.runtime.syncRoot(root.id);
+    const failed = await scenario.metaStorage.listOperations({ rootId: root.id, status: "failed", limit: 10 });
+    assert.equal(failed.length, 2);
+    assert.equal((await scenario.runtime.listTasks({ status: "failed" })).tasks.length, 1, "only the latest failure is visible");
+
+    const binding = (await scenario.metaStorage.listBindings(root.id))[0]!;
+    assert.equal(binding.status, "error");
+    const outcome = await scenario.runtime.dismissTasks([failed[0]!.id]);
+    assert.deepEqual(outcome, { dismissed: 2, total: 1 }, "the cascade removes the older failure too");
+    assert.equal((await scenario.metaStorage.listOperations({ rootId: root.id, status: "failed", limit: 10 })).length, 0);
+    const after = (await scenario.metaStorage.listBindings(root.id))[0]!;
+    assert.equal(after.status, "error", "dismiss only clears records; the entry stays in error");
+    assert.ok((await scenario.metaStorage.listOperations({ rootId: root.id, status: "succeeded", limit: 10 })).length > 0, "succeeded records of the same entry survive");
+
+    // Unknown or non-failed ids are skipped, never counted as dismissed.
+    const skipped = await scenario.runtime.dismissTasks(["missing-id"]);
+    assert.deepEqual(skipped, { dismissed: 0, total: 1 });
+  } finally {
+    cleanup(scenario);
+  }
+});
+
+test("listTasks orders the active group running-first, then by queue time", async () => {
+  const scenario = createScenario();
+  try {
+    writeFileSync(join(scenario.directory, "a.md"), "alpha\n", "utf8");
+    writeFileSync(join(scenario.directory, "b.md"), "beta\n", "utf8");
+    writeFileSync(join(scenario.directory, "c.md"), "gamma\n", "utf8");
+    const root = await createRoot(scenario);
+    await scenario.runtime.syncRoot(root.id);
+    const entryIdOf = (relativePath: string) => (scenario.metaStorage.listBindings(root.id).then((bindings) => bindings.find((binding) => binding.relativePath === relativePath)!.entryId));
+    // Queue c, then a, then flip b to running: the newest-first storage order
+    // is [b, a, c]; the active view must read like a queue instead.
+    const opC = await scenario.metaStorage.addOperation({ entryId: await entryIdOf("c.md"), rootId: root.id, direction: "merge", operation: "sync-entry", trigger: "manual", maxRetries: 3 });
+    await sleep(5);
+    const opA = await scenario.metaStorage.addOperation({ entryId: await entryIdOf("a.md"), rootId: root.id, direction: "merge", operation: "sync-entry", trigger: "manual", maxRetries: 3 });
+    await sleep(5);
+    const opB = await scenario.metaStorage.addOperation({ entryId: await entryIdOf("b.md"), rootId: root.id, direction: "merge", operation: "sync-entry", trigger: "manual", maxRetries: 3 });
+    await scenario.metaStorage.updateOperation(opB.id, { status: "running" });
+
+    const tasks = (await scenario.runtime.listTasks({ status: "active" })).tasks;
+    assert.deepEqual(tasks.map((task) => task.relativePath), ["b.md", "c.md", "a.md"], "running first, then queued in enqueue order");
+    assert.ok(new Date(tasks[1]!.createdAt).getTime() <= new Date(tasks[2]!.createdAt).getTime());
+    void opA;
+    void opC;
+  } finally {
+    cleanup(scenario);
+  }
+});

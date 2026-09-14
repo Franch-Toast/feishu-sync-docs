@@ -127,8 +127,9 @@ export function HistoryView({ operations, roots, root, activity, onPrune, onRefr
                 <td data-label="触发源" className="muted">{operation.trigger ? TRIGGER_LABELS[operation.trigger] : "—"}</td>
                 <td data-label="操作">{OPERATION_LABELS[operation.operation] ?? operation.operation}</td>
                 <td data-label="状态"><span className={`op-status ${operation.status}`}>{STATUS_LABELS[operation.status]}</span></td>
-                {/* B6.6: wall-clock duration from queueing to completion. */}
-                <td data-label="耗时" className="muted op-elapsed">{formatElapsed(operation.createdAt, operation.completedAt)}</td>
+                {/* Duration of the task's own execution (queue wait excluded;
+                  *  legacy records without startedAt fall back to createdAt). */}
+                <td data-label="耗时" className="muted op-elapsed">{formatElapsed(operation.startedAt ?? operation.createdAt, operation.completedAt)}</td>
                 {/* Name the semantic category like the task center does; the raw
                   *  upstream message stays one hover away. */}
                 <td data-label="错误" className="op-error" title={operation.error}>{operation.errorCategory ? ERROR_CATEGORY_LABELS[operation.errorCategory] : operation.error ?? ""}</td>

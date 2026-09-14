@@ -135,17 +135,31 @@ export class FeishuOpenApiProvider implements RemoteProvider {
   }
 
   async createDocument(parentToken: string, name: string, content: string): Promise<RemoteDocument> {
-    const data = await this.request<{ document?: { document_id?: string; revision_id?: number; title?: string } }>("POST", "/open-apis/docs_ai/v1/documents", { format: "markdown", content, parent_token: parentToken });
+    // Two-step creation keeps the drive-visible title a deterministic function
+    // of the local file name: the docs_ai create derives the title from the
+    // markdown H1, so two files sharing a first heading produced identically
+    // named documents and tripped the engine's same-name guard. The docx
+    // create accepts an explicit title (empty document); content is filled
+    // through the same docs_ai overwrite channel applyPatch uses. A content
+    // write failure throws — the engine's same-name guard adopts the empty
+    // document on retry instead of leaving an orphaned copy behind.
+    const data = await this.request<{ document?: { document_id?: string; revision_id?: number; title?: string } }>("POST", "/open-apis/docx/v1/documents", { folder_token: parentToken, title: name });
     const token = data.document?.document_id;
     if (!token) throw new Error("Feishu did not return the created document token");
+    await this.request("PUT", `/open-apis/docs_ai/v1/documents/${encodeURIComponent(token)}`, {
+      format: "markdown",
+      command: "overwrite",
+      content,
+      revision_id: data.document?.revision_id ?? -1
+    });
     try {
       return await this.getDocument(token);
     } catch {
-      // The document was created but the follow-up read failed (e.g. schema
-      // errors like code 9499). Returning a stub lets the caller persist the
-      // binding; throwing here would re-create the document on retry and
-      // leave an orphaned duplicate in the drive. The next scan refreshes
-      // the stub's content/hash through getDocument.
+      // The document was created and filled but the follow-up read failed
+      // (e.g. schema errors like code 9499). Returning a stub lets the caller
+      // persist the binding; throwing here would re-create the document on
+      // retry and leave an orphaned duplicate in the drive. The next scan
+      // refreshes the stub's content/hash through getDocument.
       return {
         token,
         name: data.document?.title ?? name,
