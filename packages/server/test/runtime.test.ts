@@ -1029,3 +1029,42 @@ test("listTasks returns the whole active group regardless of the page limit", as
     cleanup(scenario);
   }
 });
+
+test("single-entry operations re-sync one document without a full root scan", async () => {
+  const scenario = createScenario();
+  try {
+    const root = await createRoot(scenario, "v1\n");
+    const first = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
+    const entryId = first.entries[0]!.entryId;
+    const token = first.entries[0]!.remoteToken!;
+
+    // A second committed version gives the rollback a distinct target.
+    writeFileSync(join(scenario.directory, "notes.md"), "v2\n", "utf8");
+    await scenario.runtime.syncRoot(root.id);
+    assert.equal(scenario.remote.documents.get(token)?.content, "v2\n");
+
+    // Spy on the engine's full scan only after setup (syncRoot scans by design).
+    const engineRef = (scenario.runtime as unknown as { engine: { scan: (...args: unknown[]) => Promise<unknown> } }).engine;
+    const originalScan = engineRef.scan;
+    let scanCalls = 0;
+    engineRef.scan = async (...args: unknown[]) => { scanCalls += 1; return originalScan(...args); };
+
+    // Roll back to the oldest commit: just this entry is pushed, no scan.
+    const history = await scenario.runtime.getRootHistory(root.id, "notes.md", 50);
+    const oldest = history[history.length - 1]!;
+    const rolledBack = await scenario.runtime.rollbackEntry(entryId, oldest.hash);
+    assert.equal(rolledBack.ok, true);
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "v1\n");
+    assert.equal(scenario.remote.documents.get(token)?.content, "v1\n", "the remote follows the rollback");
+    assert.equal(scanCalls, 0, "rollback must not trigger a full root scan");
+
+    // Reverting a drifted working tree to the baseline also stays single-entry.
+    writeFileSync(join(scenario.directory, "notes.md"), "drifted\n", "utf8");
+    const restored = await scenario.runtime.restoreBase(entryId);
+    assert.equal(restored.ok, true);
+    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "v1\n", "the file is reverted to the baseline");
+    assert.equal(scanCalls, 0, "restore-base must not trigger a full root scan");
+  } finally {
+    cleanup(scenario);
+  }
+});

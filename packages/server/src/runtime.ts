@@ -311,7 +311,12 @@ export class SyncRuntime {
       entryId: randomUUID(), rootId, relativePath, kind: "document", status: "pending", updatedAt: new Date().toISOString()
     };
     await this.metaStorage.setBinding(rootId, relativePath, { ...binding, kind: "document", remoteToken, remoteParentToken: remoteDocument.parentToken || root.remoteToken, status: "pending", updatedAt: new Date().toISOString() });
-    return this.syncRoot(rootId);
+    // Manual pairing affects exactly this one file: sync it directly instead of
+    // re-scanning (and potentially re-arming) every other entry in the root.
+    const paired = await this.metaStorage.getBinding(rootId, relativePath);
+    if (paired) await this.enqueue(rootId, () => this.syncSingleEntryAndCommit(paired, root));
+    this.broadcast({ type: "sync", rootId });
+    return this.metaStorage.getBinding(rootId, relativePath);
   }
 
   async deleteRemoteEntry(entryId: string): Promise<unknown> {
@@ -331,7 +336,7 @@ export class SyncRuntime {
       if (abortedBinding) {
         await this.metaStorage.setBinding(abortedBinding.rootId, abortedBinding.relativePath, { ...abortedBinding, status: "pending", updatedAt: new Date().toISOString() });
         const abortedRoot = await this.metaStorage.getRoot(abortedBinding.rootId);
-        if (abortedRoot) await this.enqueue(abortedRoot.id, () => this.scanAndSync(abortedRoot, 'manual'));
+        if (abortedRoot) await this.enqueue(abortedRoot.id, () => this.syncSingleEntryAndCommit(abortedBinding, abortedRoot));
       }
       this.broadcast({ type: "conflict-aborted", conflict: aborted });
       return aborted;
@@ -352,8 +357,15 @@ export class SyncRuntime {
     await this.engine.applyResolvedContent(binding, root, content, currentRemote);
     await this.local.writeText(root, binding.relativePath, content);
     const resolved = await this.metaStorage.resolveConflict(conflict.id, input.resolution, content);
-    await this.enqueue(binding.rootId, () => this.scanAndSync(root, 'manual'));
+    // applyResolvedContent already pushed the merged content, wrote the local
+    // file and marked the entry clean; only the baseline needs refreshing. A
+    // full scanAndSync here would re-probe every unrelated document.
+    await this.enqueue(binding.rootId, async () => {
+      const clean = await this.metaStorage.getBinding(root.id, binding.relativePath);
+      if (clean?.status === "clean") await this.gitStorage.commitBaseline(root.id, "resolve: conflict", "manual", new Set([clean.relativePath]));
+    });
     this.broadcast({ type: "conflict-resolved", conflict: resolved });
+    this.broadcast({ type: "sync", rootId: root.id });
     return resolved;
   }
 
@@ -390,7 +402,7 @@ export class SyncRuntime {
     if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
     await this.local.writeText(root, binding.relativePath, baselineContent);
     await this.metaStorage.setBinding(binding.rootId, binding.relativePath, { ...binding, status: "pending", updatedAt: new Date().toISOString() });
-    await this.enqueue(root.id, () => this.scanAndSync(root, 'manual'));
+    await this.enqueue(root.id, () => this.syncSingleEntryAndCommit(binding, root));
     return { ok: true, entryId, relativePath: binding.relativePath };
   }
 
@@ -430,7 +442,7 @@ export class SyncRuntime {
     if (content === undefined) throw Object.assign(new Error(`No such version for this entry: ${commit}`), { statusCode: 404 });
     await this.local.writeText(root, binding.relativePath, content);
     await this.metaStorage.setBinding(binding.rootId, binding.relativePath, { ...binding, status: "pending", updatedAt: new Date().toISOString() });
-    await this.enqueue(root.id, () => this.scanAndSync(root, 'manual'));
+    await this.enqueue(root.id, () => this.syncSingleEntryAndCommit(binding, root));
     return { ok: true, entryId, relativePath: binding.relativePath };
   }
 
@@ -518,6 +530,34 @@ export class SyncRuntime {
     });
     this.broadcast({ type: "sync", rootId });
     return { rootId, synced, total: missing.length };
+  }
+
+  /** Sync one bound entry through the root queue and, on success, commit just
+   *  that path as the new baseline. Single-entry operations (conflict resolve,
+   *  restore, rollback, retry, manual pairing) must NOT trigger a full scan of
+   *  every document: only the affected entry changed, and a full round is both
+   *  slower and re-arms unrelated pending entries. */
+  private async syncSingleEntryAndCommit(binding: EntryBinding, root: SyncRoot, trigger: SyncTrigger = 'manual'): Promise<EntryBinding> {
+    // Route the single entry through the same operation-record pipeline a full
+    // round uses, so the task center still shows a queued/running/failed record
+    // for this retry (and audit history stays complete) even though we no longer
+    // scan the whole root. syncEntryWithRetry owns the retry/backoff and echoes.
+    const operation = await this.metaStorage.addOperation({
+      entryId: binding.entryId, rootId: root.id, direction: "merge",
+      operation: "sync-entry", trigger, maxRetries: 3
+    });
+    this.broadcast({ type: "operation-queued", rootId: root.id, operation });
+    await this.syncEntryWithRetry(binding, root, trigger, operation);
+    const current = await this.metaStorage.getBinding(root.id, binding.relativePath);
+    if (current?.status === "clean") {
+      try {
+        await this.gitStorage.commitBaseline(root.id, "sync: single-entry", trigger, new Set([current.relativePath]));
+      } catch (error) {
+        this.log("warn", "git commit failed after single-entry sync", { rootId: root.id, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    this.broadcast({ type: "sync", rootId: root.id, trigger });
+    return current ?? binding;
   }
 
   /** Execute one forced entry sync without queueing; shared by the single
@@ -759,7 +799,9 @@ export class SyncRuntime {
     if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
     // Re-arm as pending (and un-ignore) so the next round re-evaluates it.
     await this.metaStorage.setBinding(binding.rootId, binding.relativePath, { ...binding, status: "pending", ignoredAt: undefined, updatedAt: new Date().toISOString() });
-    await this.enqueue(root.id, () => this.scanAndSync(root, 'manual'));
+    // Retry is a per-task action: re-run only this entry rather than the whole
+    // root, so unrelated documents are not re-scanned on every retry click.
+    await this.enqueue(root.id, () => this.syncSingleEntryAndCommit(binding, root));
     return { ok: true, operationId };
   }
 

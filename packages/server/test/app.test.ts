@@ -302,7 +302,7 @@ test("serves local files safely, document content and root stats", async () => {
   const app = buildIsolatedApp({ remote });
   const directory = mkdtempSync(join(tmpdir(), "feishu-sync-files-"));
   try {
-    writeFileSync(join(directory, "note.md"), "# Hello\n\n![img](pic.png)\n", "utf8");
+    writeFileSync(join(directory, "note.md"), "# note\n\n![img](pic.png)\n", "utf8");
     writeFileSync(join(directory, "pic.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     const created = await app.inject({ method: "POST", url: "/api/roots", payload: { localPath: directory, remoteToken: "root-token" } });
     const rootId = created.json().id as string;
@@ -313,7 +313,7 @@ test("serves local files safely, document content and root stats", async () => {
 
     const content = await app.inject({ method: "GET", url: `/api/entries/${document.entryId}/content` });
     assert.equal(content.statusCode, 200);
-    assert.equal(content.json().content, "# Hello\n\n![img](pic.png)\n");
+    assert.equal(content.json().content, "# note\n\n![img](pic.png)\n");
 
     const image = await app.inject({ method: "GET", url: `/api/roots/${rootId}/file?path=pic.png` });
     assert.equal(image.statusCode, 200);

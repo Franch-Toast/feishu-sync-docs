@@ -11,7 +11,7 @@ test("sync engine creates once, pulls remote changes, and records conflicts", as
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
   const path = join(directory, "notes.md");
-  await writeFile(path, "# Notes\n\noriginal", "utf8");
+  await writeFile(path, "# notes\n\noriginal", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -29,7 +29,7 @@ test("sync engine creates once, pulls remote changes, and records conflicts", as
   await gitStorage.commitBaseline(root.id, "sync: manual", "manual");
   assert.equal((await engine.scan(root)).entries[0]?.status, "clean");
 
-  remote.edit(token, "# Notes\n\nremote change");
+  remote.edit(token, "# notes\n\nremote change");
   scan = await engine.scan(root);
   assert.equal(scan.entries[0]?.status, "pending");
   entry = await engine.syncEntry(scan.entries[0]!, root);
@@ -38,16 +38,16 @@ test("sync engine creates once, pulls remote changes, and records conflicts", as
   // Commit baseline after pull
   await gitStorage.commitBaseline(root.id, "sync: manual", "manual");
 
-  await writeFile(path, "# Notes\n\nlocal change", "utf8");
+  await writeFile(path, "# notes\n\nlocal change", "utf8");
   await engine.scan(root);
-  remote.edit(token, "# Notes\n\nremote again");
+  remote.edit(token, "# notes\n\nremote again");
   scan = await engine.scan(root);
   assert.equal(scan.entries[0]?.status, "pending");
   await engine.syncEntry(scan.entries[0]!, root);
   assert.equal((await metaStorage.listConflicts("open")).length, 1);
-  remote.edit(token, "# Notes\n\nremote after conflict");
+  remote.edit(token, "# notes\n\nremote after conflict");
   await engine.scan(root);
-  assert.equal((await metaStorage.listConflicts("open"))[0]?.remoteContent, "# Notes\n\nremote after conflict");
+  assert.equal((await metaStorage.listConflicts("open"))[0]?.remoteContent, "# notes\n\nremote after conflict");
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
@@ -72,16 +72,19 @@ test("imports a remote-only document into the local tree", async () => {
   await rm(globalDir, { recursive: true, force: true });
 });
 
-test("the same-name guard matches on file names, and a drifted title is pinned back", async () => {
+test("each fresh document aligns to its own H1, and a foreign same-name document still blocks", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-dup-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
-  await writeFile(join(directory, "one.md"), "# Same Title\n\nfirst", "utf8");
-  await writeFile(join(directory, "two.md"), "# Same Title\n\nsecond", "utf8");
+  // Two documents that used to collide under the old "pin the drive title back
+  // to the file name" scheme. Now each aligns its local name to its own H1 at
+  // first binding, so both reach the drive under distinct, self-consistent titles.
+  await writeFile(join(directory, "one.md"), "# First Doc\n\nfirst", "utf8");
+  await writeFile(join(directory, "two.md"), "# Second Doc\n\nsecond", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
-  // Old-provider behaviour: every content write re-derives the drive title
-  // from the markdown H1, which used to collide two files sharing a heading.
+  // Provider behaviour: every content write re-derives the drive title from the
+  // markdown H1 — which the name alignment now keeps equal to the file name.
   remote.simulateH1Title = true;
   const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
   await gitStorage.initRoot(root);
@@ -89,37 +92,37 @@ test("the same-name guard matches on file names, and a drifted title is pinned b
   const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
 
   const scan = await engine.scan(root);
-  const first = scan.entries.find((entry) => entry.relativePath === "one.md")!;
-  assert.equal((await engine.syncEntry(first, root)).status, "clean");
-  // The shared H1 no longer blocks: the drive-visible title is pinned back to
-  // the local file name after the write, so both pushes succeed.
-  const second = scan.entries.find((entry) => entry.relativePath === "two.md")!;
-  assert.equal((await engine.syncEntry(second, root)).status, "clean");
+  const first = scan.entries.find((entry) => entry.relativePath === "First Doc.md");
+  const second = scan.entries.find((entry) => entry.relativePath === "Second Doc.md");
+  assert.ok(first && second, "both files were renamed to match their H1");
+  assert.equal((await engine.syncEntry(first!, root)).status, "clean");
+  assert.equal((await engine.syncEntry(second!, root)).status, "clean");
   assert.equal(remote.documents.size, 2);
   const names = [...remote.documents.values()].map((document) => document.name).sort();
-  assert.deepEqual(names, ["one", "two"], "each drive title is the file name again after the pin");
+  assert.deepEqual(names, ["First Doc", "Second Doc"], "each drive title follows the aligned file name");
 
-  // A document already bound to another path under the same name still
-  // blocks: the guard protects bindings, not titles.
-  const shadow = await remote.createDocument("root", "Same Title", "# Same Title\n\nshadow");
+  // A document already bound to another path under the same name still blocks:
+  // the guard protects bindings, not titles.
+  const shadow = await remote.createDocument("root", "Blocked", "# Blocked\n\nshadow");
   await metaStorage.setBinding(root.id, "other.md", {
     entryId: "other-entry", rootId: root.id, relativePath: "other.md", kind: "document",
     remoteToken: shadow.token, remoteParentToken: "root", status: "pending", updatedAt: new Date().toISOString()
   });
-  await writeFile(join(directory, "Same Title.md"), "# Different Heading\n\nthird", "utf8");
+  await writeFile(join(directory, "Blocked.md"), "# Blocked\n\nthird", "utf8");
   const rescanned = await engine.scan(root);
-  const third = rescanned.entries.find((entry) => entry.relativePath === "Same Title.md")!;
-  await assert.rejects(() => engine.syncEntry(third, root), /already has a document named "Same Title"/);
+  const third = rescanned.entries.find((entry) => entry.relativePath === "Blocked.md")!;
+  await assert.rejects(() => engine.syncEntry(third, root), /already has a document named "Blocked"/);
   assert.equal(remote.documents.size, 3);
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
 
-test("creates the remote document with the local file name as its title", async () => {
+test("a first-sync file whose H1 differs from its name is renamed so name, H1 and drive title align", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-title-create-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-title-create-global-"));
-  // H1 deliberately differs from the file name: the drive-visible title must
-  // be the file name passed to createDocument, never the markdown H1.
+  // Feishu shows the markdown H1 as the drive document name, so a local file
+  // whose name disagrees with its own H1 is renamed at first binding to make
+  // `file name == H1 == drive title` hold from the start.
   await writeFile(join(directory, "notes.md"), "# Completely Different Heading\n\nbody", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
@@ -132,8 +135,11 @@ test("creates the remote document with the local file name as its title", async 
   const scan = await engine.scan(root);
   const entry = await engine.syncEntry(scan.entries[0]!, root);
   assert.equal(entry.status, "clean");
+  // The local file followed its H1; the misnamed original is gone.
+  assert.equal(entry.relativePath, "Completely Different Heading.md");
+  await assert.rejects(readFile(join(directory, "notes.md")), "the old file name no longer exists");
   const created = remote.documents.get(entry.remoteToken!)!;
-  assert.equal(created.name, "notes", "the remote title is the local file name, not the H1");
+  assert.equal(created.name, "Completely Different Heading", "the drive title equals the aligned file name and H1");
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
@@ -141,7 +147,7 @@ test("creates the remote document with the local file name as its title", async 
 test("adopts an empty same-name stub left by a failed creation and fills it on push", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-stub-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-stub-global-"));
-  await writeFile(join(directory, "notes.md"), "# Notes\n\nbody", "utf8");
+  await writeFile(join(directory, "notes.md"), "# notes\n\nbody", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -158,7 +164,7 @@ test("adopts an empty same-name stub left by a failed creation and fills it on p
   const synced = await engine.syncEntry(scan.entries[0]!, root);
   assert.equal(synced.remoteToken, stub.token, "the empty stub is adopted, not duplicated");
   assert.equal(synced.status, "clean", "the push fills the adopted stub");
-  assert.equal(remote.documents.get(stub.token)!.content, "# Notes\n\nbody");
+  assert.equal(remote.documents.get(stub.token)!.content, "# notes\n\nbody");
   assert.equal(remote.documents.size, 1);
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
@@ -247,7 +253,7 @@ test("reuses the cached remote tree so nested pushes create each folder once", a
 test("an incremental scan scope only probes the in-scope entries", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-scope-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
-  for (const name of ["a.md", "b.md", "c.md"]) await writeFile(join(directory, name), `# ${name}\n\nbody`, "utf8");
+  for (const name of ["a.md", "b.md", "c.md"]) await writeFile(join(directory, name), `# ${name.replace(/\.md$/, "")}\n\nbody`, "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -282,7 +288,7 @@ test("an incremental scan scope only probes the in-scope entries", async () => {
 test("pull-only mode never creates a remote document for a local-only file", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-pull-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
-  await writeFile(join(directory, "local-only.md"), "# Local\n\nonly here", "utf8");
+  await writeFile(join(directory, "local-only.md"), "# local-only\n\nonly here", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -325,7 +331,7 @@ test("folder bindings persist so a cold engine reuses the remote folder instead 
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-folderbind-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
   await mkdir(join(directory, "deep"), { recursive: true });
-  await writeFile(join(directory, "deep", "a.md"), "# A\n\nfirst", "utf8");
+  await writeFile(join(directory, "deep", "a.md"), "# a\n\nfirst", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -344,7 +350,7 @@ test("folder bindings persist so a cold engine reuses the remote folder instead 
   // Simulate a restart: a cold engine (no cached remote tree) against a drive
   // that has not been re-listed. A second file in the same folder must resolve
   // its parent from folders.json — no folder is created and none is listed.
-  await writeFile(join(directory, "deep", "b.md"), "# B\n\nsecond", "utf8");
+  await writeFile(join(directory, "deep", "b.md"), "# b\n\nsecond", "utf8");
   const remote2 = new FakeRemote();
   const engine2 = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote2);
   const scan2 = await engine2.scan(root);
@@ -361,7 +367,7 @@ test("folder bindings persist so a cold engine reuses the remote folder instead 
 test("a local rename is detected as a move and does not create a duplicate remote document (B3)", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-rename-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
-  await writeFile(join(directory, "old.md"), "# Doc\n\nbody", "utf8");
+  await writeFile(join(directory, "old.md"), "# old\n\nbody", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -378,7 +384,7 @@ test("a local rename is detected as a move and does not create a duplicate remot
 
   // Rename locally: identical content resurfaces at a new, unbound path.
   await rm(join(directory, "old.md"));
-  await writeFile(join(directory, "new.md"), "# Doc\n\nbody", "utf8");
+  await writeFile(join(directory, "new.md"), "# old\n\nbody", "utf8");
 
   scan = await engine.scan(root);
   const moved = await metaStorage.getBinding(root.id, "new.md");
@@ -397,7 +403,7 @@ test("a local rename is detected as a move and does not create a duplicate remot
 test("an ambiguous rename surfaces a conflict instead of guessing the successor (B3)", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-rename-amb-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
-  await writeFile(join(directory, "original.md"), "# Doc\n\nbody", "utf8");
+  await writeFile(join(directory, "original.md"), "# original\n\nbody", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -413,8 +419,8 @@ test("an ambiguous rename surfaces a conflict instead of guessing the successor 
   // The bound path vanishes and TWO identical unbound files appear: the engine
   // cannot tell which one is the successor, so it defers to the user.
   await rm(join(directory, "original.md"));
-  await writeFile(join(directory, "copy-a.md"), "# Doc\n\nbody", "utf8");
-  await writeFile(join(directory, "copy-b.md"), "# Doc\n\nbody", "utf8");
+  await writeFile(join(directory, "copy-a.md"), "# original\n\nbody", "utf8");
+  await writeFile(join(directory, "copy-b.md"), "# original\n\nbody", "utf8");
 
   await engine.scan(root);
   const binding = await metaStorage.getBinding(root.id, "original.md");
@@ -430,12 +436,12 @@ test("an ambiguous rename surfaces a conflict instead of guessing the successor 
 test("exclude globs keep matching paths out of the scan and freeze already-bound entries (B6.5)", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-exclude-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
-  await writeFile(join(directory, "keep.md"), "# Keep\n\nsynced", "utf8");
+  await writeFile(join(directory, "keep.md"), "# keep\n\nsynced", "utf8");
   await writeFile(join(directory, "tmp-notes.md"), "# Tmp\n\nexcluded by pattern", "utf8");
   await mkdir(join(directory, "drafts"), { recursive: true });
   await writeFile(join(directory, "drafts", "scratch.md"), "# Scratch\n\nnever synced", "utf8");
   await mkdir(join(directory, "archive"), { recursive: true });
-  await writeFile(join(directory, "archive", "old.md"), "# Old\n\nsynced first", "utf8");
+  await writeFile(join(directory, "archive", "old.md"), "# old\n\nsynced first", "utf8");
 
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
@@ -550,7 +556,7 @@ test("identical same-name remote duplicates collapse onto the bound copy", async
 test("divergent same-name remote duplicates surface a conflict instead of auto-deletion", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-diverge-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
-  await writeFile(join(directory, "notes.md"), "# Notes\n\nshared body", "utf8");
+  await writeFile(join(directory, "notes.md"), "# notes\n\nshared body", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -588,11 +594,11 @@ test("divergent same-name remote duplicates surface a conflict instead of auto-d
   await rm(globalDir, { recursive: true, force: true });
 });
 
-test("rebinds by content hash after a metadata reset (H1 title ≠ file name)", async () => {
+test("rebinds by content hash after a metadata reset (drive title ≠ file name)", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feishu-sync-hashpair-"));
   const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-hashpair-global-"));
   await mkdir(join(directory, "sub"), { recursive: true });
-  await writeFile(join(directory, "sub", "data_flow.md"), "# sensor_radar 数据流详解\n\nrange doppler cfar", "utf8");
+  await writeFile(join(directory, "sub", "data_flow.md"), "# data_flow\n\nrange doppler cfar", "utf8");
   const gitStorage = new GitStorageImpl();
   const metaStorage = new JsonMetaStorage(globalDir);
   const remote = new FakeRemote();
@@ -601,9 +607,9 @@ test("rebinds by content hash after a metadata reset (H1 title ≠ file name)", 
   await metaStorage.initRootMeta(root.id, root.localPath);
   const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
 
-  // First push succeeds; Feishu derives the drive-visible title from the
-  // markdown H1, so once the local binding is lost the document pairs with
-  // neither the path nor the base name.
+  // First push succeeds; the drive-visible title later drifts to a value that
+  // matches neither the local path nor the base name, so once the local binding
+  // is lost only the content hash can pair the two sides back together.
   const scan = await engine.scan(root);
   const entry = await engine.syncEntry(scan.entries[0]!, root);
   assert.equal(entry.status, "clean");
@@ -660,6 +666,68 @@ test("treats a same-name remote document bound to the same local path as its own
   assert.equal(result.status, "clean");
   assert.equal(result.remoteToken, token, "the same-path copy is adopted, not duplicated");
   assert.equal([...remote.documents.keys()].filter((key) => key.endsWith("/notes")).length, 1);
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("first binding renames local files to their H1, keeps no-H1 files, and rewrites links", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-normalize-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  await writeFile(join(directory, "guide.md"), "# Alpha\n\nsee [draft](./draft.md)", "utf8");
+  await writeFile(join(directory, "draft.md"), "# Beta\n\ncontent", "utf8");
+  await writeFile(join(directory, "plain.md"), "no heading here at all", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const scan = await engine.scan(root);
+  const paths = scan.entries.map((entry) => entry.relativePath).sort();
+  // guide/draft followed their H1; the heading-less file kept its name.
+  assert.deepEqual(paths, ["Alpha.md", "Beta.md", "plain.md"]);
+  await assert.rejects(readFile(join(directory, "guide.md")), "the old name is gone");
+  // The internal link was cascaded onto the renamed destination.
+  assert.match(await readFile(join(directory, "Alpha.md"), "utf8"), /\[draft\]\(Beta\.md\)/);
+  assert.equal(await readFile(join(directory, "Beta.md"), "utf8"), "# Beta\n\ncontent");
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("name alignment skips already-bound files and never overwrites a sibling on collision", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-normalize-edge-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  // An already-bound document is left alone even though its H1 differs, so
+  // established pairings never churn on a later scan.
+  await writeFile(join(directory, "manual.md"), "# Other\n\nbound body", "utf8");
+  await remote.createDocument("root", "manual", "# Other\n\nbound body");
+  await metaStorage.setBinding(root.id, "manual.md", {
+    entryId: "manual-entry", rootId: root.id, relativePath: "manual.md", kind: "document",
+    remoteToken: "root/manual", remoteParentToken: "root", status: "clean", updatedAt: new Date().toISOString()
+  });
+  // Two fresh files that both want the same aligned name: the first wins, the
+  // second keeps its own file name rather than overwriting its sibling.
+  await writeFile(join(directory, "a.md"), "# Dup\n\nfirst", "utf8");
+  await writeFile(join(directory, "b.md"), "# Dup\n\nsecond", "utf8");
+
+  const scan = await engine.scan(root);
+  const paths = scan.entries.map((entry) => entry.relativePath).sort();
+  assert.deepEqual(paths, ["Dup.md", "b.md", "manual.md"]);
+  // The bound file was neither renamed nor lost.
+  assert.equal((await metaStorage.getBinding(root.id, "manual.md"))?.remoteToken, "root/manual");
+  assert.equal(await readFile(join(directory, "Dup.md"), "utf8"), "# Dup\n\nfirst");
 
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
