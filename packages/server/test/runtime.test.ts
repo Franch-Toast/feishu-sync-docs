@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { FilesystemProvider } from "@feishu-sync/core";
+import { FilesystemProvider, stripEnvelope } from "@feishu-sync/core";
 import type { RemoteTree, SyncRoot } from "@feishu-sync/core";
 import { FeishuApiError } from "@feishu-sync/feishu";
 import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
@@ -11,6 +11,7 @@ import { SyncRuntime, watcherIgnore } from "../src/runtime.js";
 import { AppConfigStore } from "../src/appconfig.js";
 import type { WebSocket } from "ws";
 import { FakeRemote } from "./helpers/fake-remote.js";
+import { readBody } from "./helpers/read_body.js";
 
 interface Scenario {
   gitStorage: GitStorageImpl;
@@ -69,9 +70,11 @@ test("pushes a new local document and records a baseline", async () => {
     assert.equal(entry.status, "clean");
     assert.ok(entry.remoteToken);
     assert.equal(scenario.remote.documents.get(entry.remoteToken!)?.content, "shared line\n");
-    // Baseline is stored in Git; verify via getBaseline
+    // Baseline is stored in Git; verify via getBaseline. The committed file
+    // carries the identity envelope (history needs it); the synced body is
+    // what the assertion compares.
     const baseline = await scenario.gitStorage.getBaseline(root.id, "notes.md");
-    assert.equal(baseline, "shared line\n");
+    assert.equal(baseline === undefined ? baseline : stripEnvelope(baseline), "shared line\n");
   } finally {
     cleanup(scenario);
   }
@@ -85,7 +88,7 @@ test("pulls remote changes into the local file", async () => {
     const token = result.entries[0]!.remoteToken!;
     scenario.remote.edit(token, "remote edit\n");
     await scenario.runtime.syncRoot(root.id);
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "remote edit\n");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "remote edit\n");
   } finally {
     cleanup(scenario);
   }
@@ -123,7 +126,7 @@ test("resolves a conflict with merged content on both sides", async () => {
 
     const resolved = await scenario.runtime.resolveConflict(conflict, { resolution: "merged", mergedContent: "local edit\nremote edit\n" });
     assert.equal(resolved.status, "resolved");
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "local edit\nremote edit\n");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "local edit\nremote edit\n");
     assert.equal(scenario.remote.documents.get(token)?.content, "local edit\nremote edit\n");
     assert.equal((await scenario.metaStorage.listConflicts("open")).length, 0);
 
@@ -325,7 +328,7 @@ test("reclassifies vanished local files as local-missing and re-pulls them on de
 
     const restored = await scenario.runtime.syncEntryNow(entry.entryId);
     assert.equal(restored.status, "clean");
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "shared line\n");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "shared line\n");
     assert.equal(scenario.remote.documents.get(token)?.content, "shared line\n");
   } finally {
     cleanup(scenario);
@@ -410,7 +413,7 @@ test("syncMissingEntries heals every missing entry of a root in one call", async
     const healed = await scenario.metaStorage.listBindings(root.id);
     assert.equal(healed.find((entry) => entry.relativePath === "notes.md")?.status, "clean");
     assert.equal(healed.find((entry) => entry.relativePath === "extra.md")?.status, "clean");
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "shared line\n");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "shared line\n");
     assert.equal(scenario.remote.documents.get(healed.find((entry) => entry.relativePath === "extra.md")!.remoteToken!)?.content, "extra line\n");
   } finally {
     cleanup(scenario);
@@ -446,7 +449,7 @@ test("pull-only mode pulls remote edits and never pushes local changes", async (
     scenario.remote.edit(token, "remote wins\n");
     writeFileSync(join(scenario.directory, "notes.md"), "local edit\n", "utf8");
     const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "remote wins\n");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "remote wins\n");
     assert.equal(scenario.remote.documents.get(token)?.content, "remote wins\n", "the local edit must never be pushed");
     assert.equal(synced.entries[0]?.status, "clean");
   } finally {
@@ -478,7 +481,7 @@ test("push-only mode pushes local edits and never pulls remote changes", async (
     scenario.remote.edit(token, "remote edit\n");
     writeFileSync(join(scenario.directory, "notes.md"), "local wins\n", "utf8");
     const synced = (await scenario.runtime.syncRoot(root.id)) as { entries: EntryView[] };
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "local wins\n", "the remote edit must never be pulled");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "local wins\n", "the remote edit must never be pulled");
     assert.equal(scenario.remote.documents.get(token)?.content, "local wins\n");
     assert.equal(synced.entries[0]?.status, "clean");
   } finally {
@@ -617,7 +620,7 @@ test("version history diffs against a commit and rolls back both sides (B4)", as
     // Rolling back to the oldest version rewrites local AND pushes to remote.
     const result = await scenario.runtime.rollbackEntry(entryId, oldest!.hash);
     assert.equal(result.ok, true);
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "v1\n");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "v1\n");
     assert.equal(scenario.remote.documents.get(token)?.content, "v1\n", "the remote follows the rollback");
 
     // The rollback is itself a new version on the timeline.
@@ -1054,7 +1057,7 @@ test("single-entry operations re-sync one document without a full root scan", as
     const oldest = history[history.length - 1]!;
     const rolledBack = await scenario.runtime.rollbackEntry(entryId, oldest.hash);
     assert.equal(rolledBack.ok, true);
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "v1\n");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "v1\n");
     assert.equal(scenario.remote.documents.get(token)?.content, "v1\n", "the remote follows the rollback");
     assert.equal(scanCalls, 0, "rollback must not trigger a full root scan");
 
@@ -1062,7 +1065,7 @@ test("single-entry operations re-sync one document without a full root scan", as
     writeFileSync(join(scenario.directory, "notes.md"), "drifted\n", "utf8");
     const restored = await scenario.runtime.restoreBase(entryId);
     assert.equal(restored.ok, true);
-    assert.equal(readFileSync(join(scenario.directory, "notes.md"), "utf8"), "v1\n", "the file is reverted to the baseline");
+    assert.equal(await readBody(new FilesystemProvider(), root, "notes.md"), "v1\n", "the file is reverted to the baseline");
     assert.equal(scanCalls, 0, "restore-base must not trigger a full root scan");
   } finally {
     cleanup(scenario);

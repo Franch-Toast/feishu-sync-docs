@@ -14,3 +14,7 @@ export * from "./remote_tree.js";
 export * from "./importer.js";
 export * from "./rename.js";
 export * from "./name_align.js";
+// Local-only identity envelope (frontmatter) and the resolver that arbitrates
+// it against bindings.json.
+export * from "./frontmatter.js";
+export * from "./identity.js";

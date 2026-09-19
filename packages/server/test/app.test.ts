@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { RemoteTree, SyncRoot } from "@feishu-sync/core";
+import { splitDocument, stripEnvelope } from "@feishu-sync/core";
 import { FeishuApiError } from "@feishu-sync/feishu";
 import type { WebSocket } from "ws";
 import { buildApp } from "../src/app.js";
@@ -105,7 +106,7 @@ test("syncs through the API and surfaces conflicts for resolution", async () => 
     const merged = await app.inject({ method: "POST", url: `/api/conflicts/${conflictId}/resolve`, payload: { resolution: "merged", mergedContent: "local edit\nremote edit\n" } });
     assert.equal(merged.statusCode, 200);
     assert.equal(merged.json().status, "resolved");
-    assert.equal(readFileSync(join(directory, "notes.md"), "utf8"), "local edit\nremote edit\n");
+    assert.equal(stripEnvelope(readFileSync(join(directory, "notes.md"), "utf8")), "local edit\nremote edit\n");
     assert.equal(remote.documents.get(token)?.content, "local edit\nremote edit\n");
     assert.equal((await app.inject({ method: "GET", url: "/api/conflicts" })).json().length, 0);
 
@@ -270,7 +271,7 @@ test("the batch entry endpoint applies retry/ignore to many entries at once (B6.
     const retried = await app.inject({ method: "POST", url: "/api/entries/batch", payload: { entryIds: [alpha!.entryId, "no-such-entry"], action: "retry" } });
     assert.deepEqual(retried.json(), { accepted: 1, total: 2, failed: 1 });
     assert.equal((await app.metaStorage.findBindingById(alpha!.entryId))?.status, "clean");
-    assert.equal(readFileSync(join(directory, "alpha.md"), "utf8"), "alpha\n");
+    assert.equal(stripEnvelope(readFileSync(join(directory, "alpha.md"), "utf8")), "alpha\n");
   } finally {
     rmSync(directory, { recursive: true, force: true });
     await app.close();
@@ -364,10 +365,74 @@ test("restores the baseline snapshot for an entry", async () => {
     const restored = await app.inject({ method: "POST", url: `/api/entries/${entry.entryId}/restore-base` });
     assert.equal(restored.statusCode, 200);
     assert.equal(restored.json().ok, true);
-    assert.equal(readFileSync(join(directory, "note.md"), "utf8"), "shared line\n");
+    assert.equal(stripEnvelope(readFileSync(join(directory, "note.md"), "utf8")), "shared line\n");
 
     const ghost = await app.inject({ method: "POST", url: "/api/entries/no-such-entry/restore-base" });
     assert.equal(ghost.statusCode, 404);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    await app.close();
+  }
+});
+
+test("stamp-identity back-fills envelopes and reports every category", async () => {
+  interface StampReport {
+    rootId: string;
+    stamped: string[];
+    alreadyOk: string[];
+    skippedUnbound: string[];
+    malformed: string[];
+    conflicts: string[];
+  }
+  const remote = new FakeRemote();
+  const app = buildIsolatedApp({ remote });
+  const directory = mkdtempSync(join(tmpdir(), "feishu-sync-stamp-"));
+  try {
+    writeFileSync(join(directory, "a.md"), "alpha\n", "utf8");
+    writeFileSync(join(directory, "b.md"), "beta\n", "utf8");
+    writeFileSync(join(directory, "c.md"), "gamma\n", "utf8");
+    const created = await app.inject({ method: "POST", url: "/api/roots", payload: { localPath: directory, remoteToken: "root-token" } });
+    const rootId = created.json().id as string;
+    await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync` });
+    assert.equal((await app.inject({ method: "POST", url: "/api/roots/no-such-root/stamp-identity" })).statusCode, 404);
+
+    // One file lost its envelope (a crash between the binding write and the
+    // stamp), another never had a binding at all, and a third is frozen in
+    // conflict — the endpoint must treat the three cases differently.
+    writeFileSync(join(directory, "a.md"), "alpha\n", "utf8");
+    writeFileSync(join(directory, "c.md"), "gamma\n", "utf8");
+    const bindingC = await app.metaStorage.getBinding(rootId, "c.md");
+    assert.ok(bindingC?.remoteToken);
+    await app.metaStorage.setBinding(rootId, "c.md", { ...bindingC, status: "conflict", updatedAt: new Date().toISOString() });
+    writeFileSync(join(directory, "unbound.md"), "delta\n", "utf8");
+    await app.metaStorage.setBinding(rootId, "unbound.md", {
+      entryId: "unbound-entry", rootId, relativePath: "unbound.md", kind: "document", status: "pending", updatedAt: new Date().toISOString()
+    });
+
+    const response = await app.inject({ method: "POST", url: `/api/roots/${rootId}/stamp-identity` });
+    assert.equal(response.statusCode, 200);
+    const report = response.json() as StampReport;
+    assert.equal(report.rootId, rootId);
+    assert.deepEqual(report.stamped, ["a.md"]);
+    assert.deepEqual(report.alreadyOk, ["b.md"]);
+    assert.deepEqual(report.skippedUnbound, ["unbound.md"]);
+    assert.deepEqual(report.malformed, []);
+    assert.deepEqual(report.conflicts, ["c.md"]);
+
+    // The back-filled identity matches the bound token, and stamping stayed
+    // entirely local: no extra document, no second remote revision.
+    const token = remote.documents.get("root-token/a") ? "root-token/a" : undefined;
+    assert.ok(token, "the pushed document must keep its drive token");
+    assert.equal(splitDocument(readFileSync(join(directory, "a.md"), "utf8")).token, token);
+    assert.equal(readFileSync(join(directory, "c.md"), "utf8"), "gamma\n", "a conflicted pair is left untouched");
+    assert.equal(remote.documents.size, 3);
+    assert.equal(stripEnvelope(readFileSync(join(directory, "a.md"), "utf8")), "alpha\n");
+
+    // The stamp write must not look like a user edit to the next round.
+    const after = await app.inject({ method: "POST", url: `/api/roots/${rootId}/sync` });
+    const entries = (after.json().entries as Array<{ relativePath: string; status: string; remoteToken?: string }>)
+      .filter((entry) => entry.relativePath === "a.md" || entry.relativePath === "b.md");
+    assert.deepEqual(entries.map((entry) => entry.status), ["clean", "clean"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
     await app.close();
@@ -497,7 +562,7 @@ test("issue workbench APIs drive single-entry sync, ignore and batch missing res
     const pulled = await app.inject({ method: "POST", url: `/api/entries/${entry.entryId}/sync` });
     assert.equal(pulled.statusCode, 200);
     assert.equal(pulled.json().status, "clean");
-    assert.equal(readFileSync(join(directory, "notes.md"), "utf8"), "shared line\n");
+    assert.equal(stripEnvelope(readFileSync(join(directory, "notes.md"), "utf8")), "shared line\n");
 
     // The remote document disappears -> remote-missing; ignoring freezes it
     // so the batch resync skips it until it is restored.
@@ -769,7 +834,7 @@ test("version history endpoints list commits, diff and roll back (B4)", async ()
     const rolled = await app.inject({ method: "POST", url: `/api/entries/${entryId}/rollback`, payload: { commit: oldest } });
     assert.equal(rolled.statusCode, 200);
     assert.equal(rolled.json().ok, true);
-    assert.equal(readFileSync(join(directory, "notes.md"), "utf8"), "v1\n");
+    assert.equal(stripEnvelope(readFileSync(join(directory, "notes.md"), "utf8")), "v1\n");
     assert.equal(remote.documents.get(token)?.content, "v1\n");
   } finally {
     rmSync(directory, { recursive: true, force: true });

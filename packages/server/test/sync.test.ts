@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FilesystemProvider, SyncEngine, parseMarkdown } from "@feishu-sync/core";
+import { FilesystemProvider, SyncEngine, parseMarkdown, stripEnvelope } from "@feishu-sync/core";
 import { GitStorageImpl, JsonMetaStorage } from "@feishu-sync/storage";
 import { FakeRemote } from "./helpers/fake-remote.js";
 
@@ -67,7 +67,12 @@ test("imports a remote-only document into the local tree", async () => {
   const result = await engine.scan(root);
   assert.equal(result.entries.length, 1);
   assert.equal(result.entries[0]?.status, "clean");
-  assert.equal(await readFile(join(directory, "remote-notes.md"), "utf8"), "# Remote\n\nCreated in Feishu");
+  // The imported file carries the identity envelope; the body must equal the
+  // remote canonical content byte for byte.
+  assert.equal(
+    stripEnvelope(await readFile(join(directory, "remote-notes.md"), "utf8")),
+    "# Remote\n\nCreated in Feishu",
+  );
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });

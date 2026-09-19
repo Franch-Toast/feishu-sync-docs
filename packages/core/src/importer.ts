@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import { parseMarkdown, restoreAssetReferences, restoreInternalLinks, rewriteAssetReferences, rewriteInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
+import { stripEnvelope, writeSyncDocument } from "./frontmatter.js";
 import { isRemoteNotFound, mimeType, resolveRelativePath } from "./sync_paths.js";
 import type { SyncServices } from "./sync_services.js";
 import type { EntryBinding, LocalFile, RemoteDocument, RemoteNode, SyncRoot } from "./types.js";
@@ -118,7 +119,10 @@ export class RemoteImporter {
     const entryId = existingBinding?.entryId ?? randomUUID();
     const assetImport = await this.importRemoteAssets(root, entryId, document.content, remoteAssetPaths, remoteAssetParents, knownFiles);
     const canonicalContent = restoreAssetReferences(restoreInternalLinks(document.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
-    await local.writeText(root, relativePath, canonicalContent);
+    // The imported file is stamped right away: the envelope exists only in the
+    // bytes on disk, never in the hash below or in the block mapping, so the
+    // block sequence stays aligned with the remote document.
+    await local.writeText(root, relativePath, writeSyncDocument(canonicalContent, { token: document.token, rootId: root.id }).text);
     const hash = sha256(canonicalContent);
     const next: EntryBinding = {
       entryId,
@@ -130,6 +134,7 @@ export class RemoteImporter {
       remoteContentHash: hash,
       remoteRevision: document.revisionId,
       status: "clean",
+      identitySource: "frontmatter",
       updatedAt: new Date().toISOString()
     };
     await metaStorage.setBinding(root.id, relativePath, next);
@@ -142,11 +147,11 @@ export class RemoteImporter {
    *  than silently overwriting either side. */
   async recordRemoteCollision(root: SyncRoot, binding: EntryBinding, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>, knownFiles?: Map<string, LocalFile>): Promise<void> {
     const { local, remote, metaStorage, gitStorage } = this.services;
-    const localContent = await local.readText(root, relativePath);
+    const localContent = stripEnvelope(await local.readText(root, relativePath));
     const document = await remote.getDocument(node.token);
     const assetImport = await this.importRemoteAssets(root, binding.entryId, document.content, remoteAssetPaths, remoteAssetParents, knownFiles);
     const remoteContent = restoreAssetReferences(restoreInternalLinks(document.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
-    const baselineContent = await gitStorage.getBaseline(root.id, relativePath);
+    const baselineContent = stripEnvelope(await gitStorage.getBaseline(root.id, relativePath) ?? "");
     const baseContent = baselineContent ?? "";
     await metaStorage.setBinding(root.id, relativePath, { ...binding, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, remoteContentHash: sha256(remoteContent), remoteRevision: document.revisionId, status: "conflict", updatedAt: new Date().toISOString() });
     const open = (await metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);

@@ -2,6 +2,8 @@ import { normalizeForMatch } from "./names.js";
 import { isRemoteNotFound } from "./sync_paths.js";
 import { restoreAssetReferences, restoreInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
+import { stripEnvelope } from "./frontmatter.js";
+import type { TokenIndex } from "./identity.js";
 import type { SyncServices } from "./sync_services.js";
 import type { EntryBinding, LocalFile, RemoteDocument, RemoteNode, RemoteTree, SyncMode, SyncRoot } from "./types.js";
 
@@ -31,11 +33,29 @@ export class RenameDetector {
   /** Decide whether a vanished binding was actually renamed/moved locally.
    *  Returns "moved" once the binding was re-pointed to the new path,
    *  "conflict" when several unbound files match and the target is ambiguous,
-   *  or "none" when there is no rename evidence (a genuine local deletion). */
-  async detectRename(root: SyncRoot, binding: EntryBinding, localByPath: Map<string, LocalFile>, boundPaths: Set<string>): Promise<"moved" | "conflict" | "none"> {
+   *  or "none" when there is no rename evidence (a genuine local deletion).
+   *  With a token index the search is exact first (R1): the moved file still
+   *  declares `binding.remoteToken` in its envelope, so content hashing is
+   *  only the fallback for unstamped files. */
+  async detectRename(root: SyncRoot, binding: EntryBinding, localByPath: Map<string, LocalFile>, boundPaths: Set<string>, index?: TokenIndex): Promise<"moved" | "conflict" | "none"> {
     const { remote, metaStorage, gitStorage } = this.services;
     const hash = binding.remoteContentHash;
     if (!hash || !binding.remoteToken) return "none";
+    if (index) {
+      const claimPath = index.byToken.get(binding.remoteToken);
+      if (claimPath && claimPath !== binding.relativePath && localByPath.has(claimPath) && !boundPaths.has(claimPath)) {
+        await metaStorage.deleteBinding(root.id, binding.relativePath);
+        await metaStorage.setBinding(root.id, claimPath, {
+          ...binding,
+          relativePath: claimPath,
+          kind: "document",
+          status: binding.status === "conflict" ? "conflict" : "clean",
+          identitySource: "frontmatter",
+          updatedAt: new Date().toISOString()
+        });
+        return "moved";
+      }
+    }
     const candidates = [...localByPath.values()].filter((file) =>
       file.relativePath !== binding.relativePath &&
       file.contentHash === hash &&
@@ -49,7 +69,7 @@ export class RenameDetector {
       try {
         remoteContent = (await remote.getDocument(binding.remoteToken)).content;
       } catch { /* a missing remote doc leaves the comparison empty */ }
-      const baseContent = await gitStorage.getBaseline(root.id, binding.relativePath) ?? "";
+      const baseContent = stripEnvelope(await gitStorage.getBaseline(root.id, binding.relativePath) ?? "");
       await metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "conflict", updatedAt: new Date().toISOString() });
       const open = (await metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
       if (!open) await metaStorage.createConflict({ entryId: binding.entryId, baseContent, localContent: "", remoteContent, remoteRevision: binding.remoteRevision, remoteContentHash: hash });
@@ -124,9 +144,9 @@ export class RenameDetector {
         if (open) continue;
         let localContent = "";
         try {
-          localContent = await local.readText(root, binding.relativePath);
+          localContent = stripEnvelope(await local.readText(root, binding.relativePath));
         } catch { /* local-missing entries contribute an empty side */ }
-        const baselineContent = await gitStorage.getBaseline(root.id, binding.relativePath) ?? "";
+        const baselineContent = stripEnvelope(await gitStorage.getBaseline(root.id, binding.relativePath) ?? "");
         await metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "conflict", updatedAt: new Date().toISOString() });
         await metaStorage.createConflict({ entryId: binding.entryId, baseContent: baselineContent, localContent, remoteContent: loserDocument.content, remoteRevision: winnerDocument.revisionId, remoteContentHash: winnerDocument.contentHash });
       }

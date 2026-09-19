@@ -3,9 +3,11 @@ import { posix } from "node:path";
 import { buildBlockPatch, decideSync } from "./merge.js";
 import { parseMarkdown, restoreAssetReferences, restoreInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
+import { readSyncDocument, stripEnvelope, withBody, writeSyncDocument } from "./frontmatter.js";
 import { titleToLocalSegmentKey } from "./names.js";
 import { matchesAnyGlob } from "./glob.js";
 import { documentTitle, isRemoteNotFound, mimeType, resolveRelativePath } from "./sync_paths.js";
+import { IdentityResolver, type TokenIndex } from "./identity.js";
 import { LocalNameAligner } from "./name_align.js";
 import { RemoteImporter } from "./importer.js";
 import { RemoteTreeCache } from "./remote_tree.js";
@@ -29,6 +31,7 @@ export class SyncEngine {
   private readonly importer: RemoteImporter;
   private readonly rename: RenameDetector;
   private readonly nameAlign: LocalNameAligner;
+  private readonly identity: IdentityResolver;
 
   constructor(
     private readonly gitStorage: GitStorage,
@@ -41,6 +44,7 @@ export class SyncEngine {
     this.importer = new RemoteImporter(this.services);
     this.rename = new RenameDetector(this.services);
     this.nameAlign = new LocalNameAligner(this.services);
+    this.identity = new IdentityResolver(this.services);
   }
 
   /** Consume the direction recorded by the last sync for this entry. */
@@ -56,7 +60,11 @@ export class SyncEngine {
 
   /** One sync round: refresh both sides, pair them, and arm EntryBindings.
    *
-   *  Matching priority is deliberately two-tier and must stay that way:
+   *  Matching priority is deliberately tiered and must stay that way:
+   *  0. frontmatter token (authoritative) — a local file that declares a
+   *     `feishu_token` pairs with exactly that remote token; the identity is
+   *     reconciled against bindings.json first (see `identity.ts`) and claimed
+   *     files never fall into the heuristic tiers below (R1).
    *  1. token 1:1 (authoritative) — a binding that already owns a remoteToken is
    *     probed directly against that token below (getDocument + canonical hash
    *     diff) and NEVER re-enters the fuzzy pairing loop; the drive token is the
@@ -90,8 +98,8 @@ export class SyncEngine {
     } else {
       files = await this.local.scan(root);
     }
-    const initialBindings = await this.metaStorage.listBindings(root.id);
-    const existingByPath = new Map(initialBindings.map((binding) => [binding.relativePath, binding]));
+    let initialBindings = await this.metaStorage.listBindings(root.id);
+    let existingByPath = new Map(initialBindings.map((binding) => [binding.relativePath, binding]));
     let localByPath = new Map(files.map((file) => [file.relativePath, file]));
     // First-binding name alignment (see normalizeLocalNames): Feishu derives the
     // drive document name from the markdown H1, so freshly-seen local documents
@@ -171,6 +179,17 @@ export class SyncEngine {
     // Same-name duplicate governance: only on full rounds, where the tree is
     // complete and the pairing loops below can rely on a deduplicated listing.
     if (!incremental) await this.governRemoteDuplicates(root, remoteTree, mode);
+    // Identity frontmatter (Tier 0): index every local document's declared
+    // token and reconcile it against bindings.json with the fixed arbitration
+    // matrix before any pairing happens — back-filling lost envelopes,
+    // migrating renames and escalating collisions (R2) so the loops below can
+    // assume a consistent path→token set. An incremental round indexes only
+    // the scoped files, which is safe: reconcile makes no destructive change
+    // for paths it cannot see.
+    const tokenIndex = await this.identity.index(root, files);
+    await this.identity.reconcile(root, tokenIndex, remoteTree);
+    initialBindings = await this.metaStorage.listBindings(root.id);
+    existingByPath = new Map(initialBindings.map((binding) => [binding.relativePath, binding]));
     const remotePathMaps = this.buildRemotePathMaps(root.remoteToken, remoteTree);
     const remoteDocumentPaths = remotePathMaps.documents;
     const remoteAssetPaths = remotePathMaps.assets;
@@ -182,6 +201,10 @@ export class SyncEngine {
     const unboundLocalFiles: Array<{ relativePath: string; contentHash: string }> = [];
     for (const file of files) {
       if (file.kind !== "document") continue;
+      // R1: a file whose envelope declares a token (or belongs to another
+      // root) is paired exactly by that token in Tier 0 — the title and
+      // content-hash tiers must never steal it for a different document.
+      if (tokenIndex.tokens.has(file.relativePath) || tokenIndex.foreign.has(file.relativePath)) continue;
       const binding = existingByPath.get(file.relativePath);
       if (binding?.remoteToken || binding?.ignoredAt) continue;
       unboundLocalFiles.push({ relativePath: file.relativePath, contentHash: file.contentHash });
@@ -201,6 +224,29 @@ export class SyncEngine {
       if (!inScope(relativePath, node.token)) continue;
       const alreadyBound = initialBindings.some((binding) => binding.remoteToken === node.token);
       if (alreadyBound) continue;
+      // Tier 0 pairing: a local file that declares exactly this token in its
+      // frontmatter binds to it unconditionally — before path/title/content
+      // heuristics, and instead of importing a second copy at the drive path.
+      const claimPath = tokenIndex.byToken.get(node.token);
+      if (claimPath && localByPath.has(claimPath)) {
+        const claim = await this.metaStorage.getBinding(root.id, claimPath);
+        if (!claim?.remoteToken) {
+          await this.metaStorage.setBinding(root.id, claimPath, {
+            entryId: claim?.entryId ?? randomUUID(),
+            rootId: root.id,
+            relativePath: claimPath,
+            kind: "document",
+            remoteToken: node.token,
+            remoteParentToken: node.parentToken || root.remoteToken,
+            status: "pending",
+            remoteContentHash: localByPath.get(claimPath)?.contentHash,
+            identitySource: "frontmatter",
+            lastSyncCommit: claim?.lastSyncCommit,
+            updatedAt: new Date().toISOString()
+          });
+        }
+        continue;
+      }
       const existing = await this.metaStorage.getBinding(root.id, relativePath);
       if (existing?.remoteToken && existing.remoteToken !== node.token) continue;
       if (existing && existing.kind === "document" && localByPath.has(relativePath)) {
@@ -265,6 +311,33 @@ export class SyncEngine {
             }
           }
         }
+        if (targets.length > 1) {
+          // Ambiguous content pairing: several unbound files carry identical
+          // content, so neither auto-binding nor importing another copy is
+          // safe — surface the choice to the user (one conflict per candidate).
+          for (const candidate of targets) {
+            const candidateBinding = await this.metaStorage.getBinding(root.id, candidate.relativePath);
+            const entryId = candidateBinding?.entryId ?? randomUUID();
+            await this.metaStorage.setBinding(root.id, candidate.relativePath, {
+              ...candidateBinding,
+              entryId,
+              rootId: root.id,
+              relativePath: candidate.relativePath,
+              kind: "document",
+              status: "conflict",
+              updatedAt: new Date().toISOString()
+            });
+            const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === entryId);
+            if (!open) {
+              let localContent = "";
+              try {
+                localContent = readSyncDocument(await this.local.readText(root, candidate.relativePath), candidate.relativePath).body;
+              } catch { /* vanished mid-round; the conflict still stands */ }
+              await this.metaStorage.createConflict({ entryId, baseContent: "", localContent, remoteContent: "", remoteContentHash: node.contentHash, kind: "content" });
+            }
+          }
+          continue;
+        }
         if (targets.length === 1) {
           const target = targets[0]!;
           const targetBinding = await this.metaStorage.getBinding(root.id, target.relativePath);
@@ -300,8 +373,11 @@ export class SyncEngine {
     }
     if (remoteTree.nodes.some((node) => node.type === "document" && remoteDocumentPaths.has(node.token) && !localByPath.has(remoteDocumentPaths.get(node.token)!))) {
       // Rescan after imports; stay scoped during incremental rounds so a
-      // single new remote document does not force a full local walk.
-      const rescanPaths = [...(scopedPaths ?? []), ...importedPaths];
+      // single new remote document does not force a full local walk. A full
+      // round must always re-walk: the scoped fast path returns *only* the
+      // listed paths, which would make every other bound file look vanished and
+      // mis-classify it as local-missing.
+      const rescanPaths = incremental ? [...(scopedPaths ?? []), ...importedPaths] : [];
       files = this.local.scanEntries && rescanPaths.length > 0
         ? await this.local.scanEntries(root, rescanPaths)
         : await this.local.scan(root);
@@ -322,7 +398,7 @@ export class SyncEngine {
         // same content resurfaces at exactly one new, still-unbound path we
         // re-point the binding (the remote document follows) instead of
         // flagging local-missing and later pushing a duplicate copy.
-        const outcome = await this.detectRename(root, binding, localByPath, boundPaths);
+        const outcome = await this.detectRename(root, binding, localByPath, boundPaths, tokenIndex);
         if (outcome !== "none") continue;
         await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "local-missing", updatedAt: new Date().toISOString() });
       }
@@ -335,7 +411,7 @@ export class SyncEngine {
       // Incremental rounds only rebuild references for the scoped documents;
       // unscoped assets keep their stored references untouched below.
       if (incremental && !(scopedPaths?.has(file.relativePath) ?? false)) continue;
-      const content = await this.local.readText(root, file.relativePath);
+      const content = stripEnvelope(await this.local.readText(root, file.relativePath));
       const documentBinding = bindingByPath.get(file.relativePath);
       if (!documentBinding) continue;
       for (const reference of parseMarkdown(content).assets) {
@@ -388,7 +464,7 @@ export class SyncEngine {
       const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetReverseMap, binding.relativePath);
       const remoteHash = sha256(canonicalRemote);
       const remoteChanged = binding.remoteContentHash !== undefined && remoteHash !== binding.remoteContentHash;
-      const localContent = binding.status === "conflict" ? await this.local.readText(root, binding.relativePath) : undefined;
+      const localContent = binding.status === "conflict" ? stripEnvelope(await this.local.readText(root, binding.relativePath)) : undefined;
       const openConflict = binding.status === "conflict"
         ? openConflicts.find((conflict) => conflict.entryId === binding.entryId)
         : undefined;
@@ -420,13 +496,51 @@ export class SyncEngine {
     return this.nameAlign.normalize(root, files, existingByPath);
   }
 
+  /** The git baseline stripped to its syncable body: baselines commit the real
+   *  (envelope-carrying) file so history keeps the identity, but three-way
+   *  decisions must compare body ↔ body ↔ canonical-remote on the same base. */
+  private async baselineBody(rootId: string, relativePath: string): Promise<string | undefined> {
+    const stored = await this.gitStorage.getBaseline(rootId, relativePath);
+    return stored === undefined ? undefined : stripEnvelope(stored);
+  }
+
+  /** Write the remote document's identity into the local file's envelope.
+   *  Always performed *after* the binding/commit persisted, so a crash between
+   *  the two leaves the recovery path (arbitration matrix #2 back-fill). A
+   *  refused stamp (malformed envelope) silently keeps the file unstamped —
+   *  the binding still carries the pair. */
+  private async stampLocalDocument(root: SyncRoot, relativePath: string, token: string): Promise<void> {
+    let raw: string;
+    try {
+      raw = await this.local.readText(root, relativePath);
+    } catch {
+      return; // the file vanished mid-sync; the next round back-fills
+    }
+    const result = writeSyncDocument(raw, { token, rootId: root.id });
+    if (!result.warning && result.changed) await this.local.writeText(root, relativePath, result.text);
+  }
+
+  /** Persist a synced body to disk, keeping the file's existing envelope (and
+   *  the identity in it) across the replacement. */
+  private async writeBodyToLocal(root: SyncRoot, relativePath: string, body: string, token: string): Promise<void> {
+    let raw = "";
+    try {
+      raw = await this.local.readText(root, relativePath);
+    } catch { /* new or vanished file: nothing to preserve */ }
+    const merged = withBody(raw, body);
+    const stamp = writeSyncDocument(merged, { token, rootId: root.id });
+    await this.local.writeText(root, relativePath, stamp.warning ? merged : stamp.text);
+  }
+
   async syncEntry(binding: EntryBinding, root: SyncRoot): Promise<EntryBinding> {
     // Ignored entries are never evaluated until the user restores them.
     if (binding.ignoredAt) return binding;
     if (binding.kind === "asset") return this.syncAsset(binding, root);
     const mode: SyncMode = root.mode ?? "bidirectional";
 
-    const localContent = await this.local.readText(root, binding.relativePath);
+    // The sync pipeline works on the body only; the envelope never reaches the
+    // remote, the merge or a hash.
+    const localContent = readSyncDocument(await this.local.readText(root, binding.relativePath), binding.relativePath).body;
     const { forwardMap, reverseMap } = await this.buildLinkMaps(root.id);
     let remote;
     if (binding.remoteToken) {
@@ -481,7 +595,7 @@ export class SyncEngine {
         // silently overwriting either side.
         const conflicting: EntryBinding = { ...binding, remoteToken: remote.token, remoteParentToken: parent, remoteContentHash: sha256(canonicalRemote), remoteRevision: remote.revisionId, status: "conflict", updatedAt: new Date().toISOString() };
         await this.metaStorage.setBinding(root.id, binding.relativePath, conflicting);
-        const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
+        const baselineContent = await this.baselineBody(root.id, binding.relativePath);
         await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent: baselineContent ?? "", localContent, remoteContent: canonicalRemote, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
         return conflicting;
       }
@@ -510,6 +624,9 @@ export class SyncEngine {
       };
       await this.metaStorage.setBinding(root.id, binding.relativePath, next);
       await this.saveBlockMapping(binding.entryId, localContent, created);
+      // Stamp after the binding persisted: the body hash is envelope-blind, so
+      // this write never looks like a user edit on the next round.
+      await this.stampLocalDocument(root, binding.relativePath, created.token);
       await this.markDocumentReferences(root, binding.relativePath);
       this.setDirection(binding.entryId, "push");
       return next;
@@ -518,7 +635,7 @@ export class SyncEngine {
     const assetConflict = await this.hydrateChangedRemoteAssets(root, binding, localContent, remote.content);
     assetMaps = await this.prepareAssets(root, binding, localContent, remote.token, false);
     if (assetConflict) {
-      const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
+      const baselineContent = await this.baselineBody(root.id, binding.relativePath);
       const base = baselineContent ?? localContent;
       const remoteConflictContent = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
       const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
@@ -529,7 +646,7 @@ export class SyncEngine {
       return next;
     }
     const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remote.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
-    const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath);
+    const baselineContent = await this.baselineBody(root.id, binding.relativePath);
     // An empty remote document is an unpopulated container (this entry's own
     // half-finished creation adopted above, or a title-paired stub): with no
     // baseline the three-way decision would read the empty body as a remote
@@ -554,7 +671,7 @@ export class SyncEngine {
 
     this.setDirection(binding.entryId, action === "pull" ? "pull" : action === "push" ? "push" : "merge");
     const content = action === "pull" ? canonicalRemote : action === "merge" ? decision.mergedContent ?? localContent : localContent;
-    if (action === "pull") await this.local.writeText(root, binding.relativePath, content);
+    if (action === "pull") await this.writeBodyToLocal(root, binding.relativePath, content, remote.token);
 
     let remoteAfter = remote;
     if (action === "push" || action === "merge") {
@@ -580,25 +697,32 @@ export class SyncEngine {
     };
     await this.metaStorage.setBinding(root.id, binding.relativePath, next);
     await this.saveBlockMapping(binding.entryId, content, remoteAfter);
+    // Covers push/merge/noop and adopted-duplicate re-entries: after any
+    // successful round the local file carries the pair's identity.
+    await this.stampLocalDocument(root, binding.relativePath, remoteAfter.token);
     return next;
   }
 
   async applyResolvedContent(binding: EntryBinding, root: SyncRoot, content: string, expectedRemote?: RemoteDocument): Promise<EntryBinding> {
     if (!binding.remoteToken) throw new Error("Resolved content requires a bound remote document");
+    // Callers may hand us the file as it sits on disk; only the body syncs.
+    const body = stripEnvelope(content);
     const remote = expectedRemote ?? await this.remote.getDocument(binding.remoteToken);
     const { forwardMap, reverseMap } = await this.buildLinkMaps(root.id);
-    const assetMaps = await this.prepareAssets(root, binding, content, remote.token, true);
-    const remoteContent = this.renderRemoteContent(content, binding.relativePath, forwardMap, assetMaps.forwardMap);
+    const assetMaps = await this.prepareAssets(root, binding, body, remote.token, true);
+    const remoteContent = this.renderRemoteContent(body, binding.relativePath, forwardMap, assetMaps.forwardMap);
     const remoteAfter = (await this.remote.applyPatch(remote.token, {
       operations: [{ type: "overwrite", content: remoteContent }],
       expectedRevisionId: remote.revisionId,
       expectedContentHash: remote.contentHash
     })).document;
-    const hash = sha256(content);
+    const hash = sha256(body);
     const canonicalRemote = restoreAssetReferences(restoreInternalLinks(remoteAfter.content, reverseMap, binding.relativePath), assetMaps.reverseMap, binding.relativePath);
     const next: EntryBinding = { ...binding, status: "clean", remoteContentHash: sha256(canonicalRemote), remoteRevision: remoteAfter.revisionId, updatedAt: new Date().toISOString() };
     await this.metaStorage.setBinding(root.id, binding.relativePath, next);
-    await this.saveBlockMapping(binding.entryId, content, remoteAfter);
+    await this.saveBlockMapping(binding.entryId, body, remoteAfter);
+    // Persist the resolution locally with the identity envelope in place.
+    await this.writeBodyToLocal(root, binding.relativePath, body, binding.remoteToken);
     return next;
   }
 
@@ -800,8 +924,8 @@ export class SyncEngine {
 
   /** Decide whether a vanished binding was actually renamed/moved locally
    *  (delegated to {@link RenameDetector}). */
-  private async detectRename(root: SyncRoot, binding: EntryBinding, localByPath: Map<string, LocalFile>, boundPaths: Set<string>): Promise<"moved" | "conflict" | "none"> {
-    return this.rename.detectRename(root, binding, localByPath, boundPaths);
+  private async detectRename(root: SyncRoot, binding: EntryBinding, localByPath: Map<string, LocalFile>, boundPaths: Set<string>, index?: TokenIndex): Promise<"moved" | "conflict" | "none"> {
+    return this.rename.detectRename(root, binding, localByPath, boundPaths, index);
   }
 
   /** Persist the local-block↔remote-block mapping (delegated to {@link RemoteImporter}). */
@@ -817,7 +941,7 @@ export class SyncEngine {
       if (binding.status === "local-missing") continue;
       let content: string;
       try {
-        content = await this.local.readText(root, binding.relativePath);
+        content = stripEnvelope(await this.local.readText(root, binding.relativePath));
       } catch {
         continue;
       }

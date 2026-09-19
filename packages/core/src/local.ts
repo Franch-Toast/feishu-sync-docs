@@ -2,6 +2,7 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/p
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { sha256 } from "./hash.js";
 import { matchesAnyGlob } from "./glob.js";
+import { stripEnvelope } from "./frontmatter.js";
 import type { LocalFile, LocalProvider, SyncRoot } from "./types.js";
 
 const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]);
@@ -55,14 +56,7 @@ export class FilesystemProvider implements LocalProvider {
     const extension = extname(relativePath).toLowerCase();
     if (extension !== ".md" && !imageExtensions.has(extension)) return;
     const data = await readFile(absolutePath);
-    files.push({
-      relativePath,
-      absolutePath,
-      kind: extension === ".md" ? "document" : "asset",
-      size: metadata.size,
-      mtimeMs: metadata.mtimeMs,
-      contentHash: sha256(data)
-    });
+    files.push(this.toLocalFile(relativePath, absolutePath, extension, metadata.size, metadata.mtimeMs, data));
   }
 
   async readText(root: SyncRoot, relativePath: string): Promise<string> {
@@ -100,16 +94,38 @@ export class FilesystemProvider implements LocalProvider {
         if (extension !== ".md" && !imageExtensions.has(extension)) continue;
         const data = await readFile(absolutePath);
         const metadata = await stat(absolutePath);
-        output.push({
-          relativePath,
-          absolutePath,
-          kind: extension === ".md" ? "document" : "asset",
-          size: metadata.size,
-          mtimeMs: metadata.mtimeMs,
-          contentHash: sha256(data)
-        });
+        output.push(this.toLocalFile(relativePath, absolutePath, extension, metadata.size, metadata.mtimeMs, data));
       }
     }
+  }
+
+  /** One LocalFile projection shared by scan() and scanEntries(): markdown
+   *  documents hash their *body* (the identity envelope is invisible to the
+   *  sync pipeline, so stamping never looks like a user edit), while `rawHash`
+   *  keeps the whole-file digest for change detection that must see the exact
+   *  bytes. Assets keep the raw byte hash. Files without an envelope hash
+   *  exactly as before: `body === raw`, so `sha256(body) === sha256(raw)`. */
+  private toLocalFile(relativePath: string, absolutePath: string, extension: string, size: number, mtimeMs: number, data: Buffer): LocalFile {
+    if (extension === ".md") {
+      const text = data.toString("utf8");
+      return {
+        relativePath,
+        absolutePath,
+        kind: "document",
+        size,
+        mtimeMs,
+        contentHash: sha256(stripEnvelope(text)),
+        rawHash: sha256(data)
+      };
+    }
+    return {
+      relativePath,
+      absolutePath,
+      kind: "asset",
+      size,
+      mtimeMs,
+      contentHash: sha256(data)
+    };
   }
 
   private safePath(root: SyncRoot, relativePath: string): string {

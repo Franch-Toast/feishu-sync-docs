@@ -41,7 +41,12 @@ export interface LocalFile {
   kind: EntryKind;
   size: number;
   mtimeMs: number;
+  /** For markdown documents this is the hash of the *body* (identity envelope
+   *  stripped), so stamping a file never changes it; other kinds keep the
+   *  whole-file hash. */
   contentHash: string;
+  /** Hash of the complete file bytes, envelope included (documents only). */
+  rawHash?: string;
 }
 
 export interface RemoteNode {
@@ -202,6 +207,9 @@ export interface ConflictRecord {
   resolution?: "local" | "remote" | "merged" | "abort";
   remoteRevision?: number;
   remoteContentHash?: string;
+  /** "identity" marks arbitration conflicts (duplicate feishu_token claims)
+   *  that no content merge can resolve; absent means a content conflict. */
+  kind?: "content" | "identity";
   createdAt: string;
   resolvedAt?: string;
 }
@@ -297,6 +305,9 @@ export interface EntryBinding {
   ignoredAt?: string;
   lastSyncCommit?: string;
   updatedAt: string;
+  /** Which source established this binding — diagnostic/audit only, never
+   *  consulted by the pairing logic itself. */
+  identitySource?: "frontmatter" | "binding" | "pairing";
 }
 
 /** Binding between a local folder and its remote counterpart */

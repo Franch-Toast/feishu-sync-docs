@@ -346,6 +346,13 @@ export function buildApp(options: AppOptions = {}): FastifyInstance & { runtime:
     if (!root) return reply.code(404).send({ error: "root not found" });
     return runtime.syncMissingEntries(request.params.id);
   });
+  // One-click identity stamping: (re)writes the feishu_token envelope into
+  // every bound document of the root and reports what changed.
+  app.post<{ Params: { id: string } }>("/api/roots/:id/stamp-identity", async (request, reply) => {
+    const root = await metaStorage.getRoot(request.params.id);
+    if (!root) return reply.code(404).send({ error: "root not found" });
+    return runtime.stampAll(request.params.id);
+  });
   app.get<{ Querystring: { status?: string } }>("/api/conflicts", async (request) => {
     const status = request.query.status;
     const list = status === "all"

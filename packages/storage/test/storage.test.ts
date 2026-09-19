@@ -304,3 +304,54 @@ test("GitStorageImpl reads blobs and lists commits per path (B4 version history)
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("JsonMetaStorage round-trips the identity fields through disk", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "feishu-meta-identity-"));
+  const globalDir = mkdtempSync(join(tmpdir(), "feishu-global-identity-"));
+  try {
+    const meta = new JsonMetaStorage(globalDir);
+    const rootId = "identity-root";
+    await meta.initRootMeta(rootId, dir);
+    await meta.setBinding(rootId, "test.md", {
+      entryId: "entry-identity",
+      rootId,
+      relativePath: "test.md",
+      kind: "document",
+      remoteToken: "remote-token",
+      status: "clean",
+      identitySource: "frontmatter",
+      updatedAt: new Date().toISOString()
+    });
+    await meta.createConflict({
+      entryId: "entry-identity",
+      baseContent: "",
+      localContent: "local",
+      remoteContent: "token is claimed twice",
+      kind: "identity"
+    });
+
+    // A fresh instance has no cache: the optional fields must come back from
+    // the JSON files verbatim, otherwise a restart would silently downgrade
+    // every identity diagnosis.
+    const reopened = new JsonMetaStorage(globalDir);
+    await reopened.initRootMeta(rootId, dir);
+    assert.equal((await reopened.getBinding(rootId, "test.md"))?.identitySource, "frontmatter");
+    const conflicts = await reopened.listConflicts("open");
+    assert.equal(conflicts.length, 1);
+    assert.equal(conflicts[0]?.kind, "identity");
+    assert.equal(conflicts[0]?.entryId, "entry-identity");
+
+    // Legacy records written before the field existed keep loading.
+    const rawBindings = JSON.parse(readFileSync(join(dir, ".feishu-sync", "bindings.json"), "utf-8")) as Record<string, { identitySource?: string }>;
+    delete rawBindings["test.md"]!.identitySource;
+    writeFileSync(join(dir, ".feishu-sync", "bindings.json"), JSON.stringify(rawBindings), "utf-8");
+    const legacy = new JsonMetaStorage(globalDir);
+    await legacy.initRootMeta(rootId, dir);
+    const loaded = await legacy.getBinding(rootId, "test.md");
+    assert.equal(loaded?.identitySource, undefined);
+    assert.equal(loaded?.remoteToken, "remote-token");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(globalDir, { recursive: true, force: true });
+  }
+});

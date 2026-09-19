@@ -2,6 +2,7 @@ import { posix } from "node:path";
 import { parseMarkdown } from "./markdown.js";
 import { normalizeForMatch, sanitizeLocalSegment } from "./names.js";
 import { resolveRelativePath } from "./sync_paths.js";
+import { stripEnvelope, withBody } from "./frontmatter.js";
 import type { SyncServices } from "./sync_services.js";
 import type { EntryBinding, LocalFile, SyncRoot } from "./types.js";
 import { sha256 } from "./hash.js";
@@ -40,7 +41,8 @@ export class LocalNameAligner {
       if (existingByPath.has(file.relativePath)) { renamed.push(file); continue; }
       if (file.contentHash && boundContentHashes.has(file.contentHash)) { renamed.push(file); continue; }
       const content = await local.readText(root, file.relativePath);
-      const h1 = parseMarkdown(content).title;
+      // The H1 lives in the body; the envelope never becomes a title.
+      const h1 = parseMarkdown(stripEnvelope(content)).title;
       if (!h1) { renamed.push(file); continue; }
       const dir = posix.dirname(file.relativePath);
       const baseName = posix.basename(file.relativePath).replace(/\.md$/i, "");
@@ -51,6 +53,8 @@ export class LocalNameAligner {
       // Destination already used by another document: leave this one alone so we
       // never overwrite a sibling; the four-tier pairing still handles it.
       if (takenPaths.has(newPath)) { renamed.push(file); continue; }
+      // The whole raw file (identity envelope included) is carried to the new
+      // path verbatim, so a rename can never lose a document its token.
       await this.renameFile(root, file.relativePath, newPath, content);
       takenPaths.delete(file.relativePath);
       takenPaths.add(newPath);
@@ -89,7 +93,10 @@ export class LocalNameAligner {
     for (const [oldPath, newPath] of renameMap) byNormalized.set(normalizeForMatch(oldPath), newPath);
     for (const file of files) {
       if (file.kind !== "document") continue;
-      const content = await local.readText(root, file.relativePath);
+      const raw = await local.readText(root, file.relativePath);
+      // Links are matched and rewritten inside the body only; the envelope is
+      // re-joined verbatim on write-back so the identity survives the rewrite.
+      const content = stripEnvelope(raw);
       const { links } = parseMarkdown(content);
       if (links.length === 0) continue;
       let modified = content;
@@ -112,7 +119,7 @@ export class LocalNameAligner {
         modified = `${modified.slice(0, link.start)}${newSpan}${modified.slice(link.end)}`;
       }
       if (modified !== content) {
-        await local.writeText(root, file.relativePath, modified);
+        await local.writeText(root, file.relativePath, withBody(raw, modified));
         file.contentHash = sha256(modified);
       }
     }

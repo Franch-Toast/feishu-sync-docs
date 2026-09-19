@@ -4,7 +4,7 @@ import { watch, type FSWatcher } from "chokidar";
 import { randomUUID } from "node:crypto";
 import { relative, resolve, sep } from "node:path";
 import { SyncEngine } from "@feishu-sync/core";
-import { sha256, matchesAnyGlob } from "@feishu-sync/core";
+import { sha256, matchesAnyGlob, splitDocument, stripEnvelope, writeSyncDocument } from "@feishu-sync/core";
 import { categorizeError, FeishuApiError, RETRIABLE_ERROR_CATEGORIES } from "@feishu-sync/feishu";
 import type { AuthStateStore } from "./appconfig.js";
 import { NoopNotifier, type Notifier, type NotificationEvent } from "./notify.js";
@@ -17,6 +17,21 @@ import type { Commit, ConflictRecord, EntryBinding, ErrorCategory, FolderBinding
 export type TaskStatus = "active" | "queued" | "running" | "succeeded" | "failed" | "cancelled" | "all";
 /** An operation record joined with its entry's relativePath/kind for display. */
 export type TaskView = OperationRecord & { relativePath?: string; kind?: string };
+
+/** Report of a one-click `stampAll` identity-envelope run. */
+export interface IdentityStampReport {
+  rootId: string;
+  /** Files whose envelope was written/corrected. */
+  stamped: string[];
+  /** Files that already carried exactly the bound identity. */
+  alreadyOk: string[];
+  /** Unbound or locally missing entries — nothing to stamp into. */
+  skippedUnbound: string[];
+  /** Files whose existing frontmatter block is malformed; left untouched. */
+  malformed: string[];
+  /** Entries skipped because their pair is in conflict (identity or else). */
+  conflicts: string[];
+}
 
 /** Directories the sync engine writes inside the user's tree. */
 const METADATA_DIRECTORIES = new Set([".git", ".feishu-sync"]);
@@ -363,8 +378,11 @@ export class SyncRuntime {
     }
     const content = input.resolution === "local" ? conflict.localContent : input.resolution === "remote" ? conflict.remoteContent : input.mergedContent;
     if (content === undefined) throw new Error("mergedContent is required for merged resolution");
+    // applyResolvedContent pushes, writes the local file (identity envelope
+    // included) and marks the entry clean; a second raw write here would drop
+    // the envelope again.
     await this.engine.applyResolvedContent(binding, root, content, currentRemote);
-    await this.local.writeText(root, binding.relativePath, content);
+    this.registerLocalWrite(root, binding.relativePath);
     const resolved = await this.metaStorage.resolveConflict(conflict.id, input.resolution, content);
     // applyResolvedContent already pushed the merged content, wrote the local
     // file and marked the entry clean; only the baseline needs refreshing. A
@@ -390,14 +408,16 @@ export class SyncRuntime {
     this.broadcast(event);
   }
 
-  /** Return the stored local text of a document entry for browser preview. */
+  /** Return the stored local text of a document entry for browser preview.
+   *  The identity envelope is stripped: the workbench never shows or edits the
+   *  `feishu_token` lines, and a save round-trips through the sync engine. */
   async readDocument(entryId: string): Promise<{ relativePath: string; content: string }> {
     const binding = await this.metaStorage.findBindingById(entryId);
     if (!binding) throw Object.assign(new Error(`Entry not found: ${entryId}`), { statusCode: 404 });
     if (binding.kind !== "document") throw Object.assign(new Error("Only document entries can be previewed"), { statusCode: 400 });
     const root = await this.metaStorage.getRoot(binding.rootId);
     if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
-    return { relativePath: binding.relativePath, content: await this.local.readText(root, binding.relativePath) };
+    return { relativePath: binding.relativePath, content: stripEnvelope(await this.local.readText(root, binding.relativePath)) };
   }
 
   /** Restore the entry's local file to the last known common baseline. */
@@ -430,10 +450,12 @@ export class SyncRuntime {
     if (binding.kind !== "document") throw Object.assign(new Error("Only document entries can be diffed"), { statusCode: 400 });
     const root = await this.metaStorage.getRoot(binding.rootId);
     if (!root) throw Object.assign(new Error(`Root not found: ${binding.rootId}`), { statusCode: 404 });
-    const currentContent = await this.local.readText(root, binding.relativePath);
+    const currentContent = stripEnvelope(await this.local.readText(root, binding.relativePath));
+    // Both sides of the diff are bodies: the workbench compares what syncs,
+    // not the local-only identity envelope the blobs also carry.
     const baseContent = against === "baseline"
-      ? await this.gitStorage.getBaseline(binding.rootId, binding.relativePath) ?? ""
-      : await this.gitStorage.readBlobAt(binding.rootId, against, binding.relativePath) ?? "";
+      ? stripEnvelope(await this.gitStorage.getBaseline(binding.rootId, binding.relativePath) ?? "")
+      : stripEnvelope(await this.gitStorage.readBlobAt(binding.rootId, against, binding.relativePath) ?? "");
     return { relativePath: binding.relativePath, against, baseContent, currentContent };
   }
 
@@ -539,6 +561,72 @@ export class SyncRuntime {
     });
     this.broadcast({ type: "sync", rootId });
     return { rootId, synced, total: missing.length };
+  }
+
+  /** Outcome of the one-click identity stamping endpoint: per-path lists add up
+   *  so a caller can tell what changed without diffing the tree. */
+  async stampAll(rootId: string): Promise<IdentityStampReport> {
+    const root = await this.metaStorage.getRoot(rootId);
+    if (!root) throw Object.assign(new Error(`Root not found: ${rootId}`), { statusCode: 404 });
+    // Serialized on the root's lane so stamping never races a sync round for
+    // the same files; returns through enqueueResult so the HTTP caller gets it.
+    return this.enqueueResult(rootId, async () => {
+      const report: IdentityStampReport = {
+        rootId,
+        stamped: [],
+        alreadyOk: [],
+        skippedUnbound: [],
+        malformed: [],
+        conflicts: []
+      };
+      const bindings = (await this.metaStorage.listBindings(rootId)).filter((binding) => binding.kind === "document");
+      // R2 pre-flight: a token owned by two binding records is a conflict the
+      // stamp run must not paper over by writing either file.
+      const tokenOwners = new Map<string, string[]>();
+      for (const binding of bindings) {
+        if (!binding.remoteToken) continue;
+        const owners = tokenOwners.get(binding.remoteToken);
+        if (owners) owners.push(binding.relativePath);
+        else tokenOwners.set(binding.remoteToken, [binding.relativePath]);
+      }
+      for (const binding of bindings) {
+        if (!binding.remoteToken) {
+          report.skippedUnbound.push(binding.relativePath);
+          continue;
+        }
+        if ((tokenOwners.get(binding.remoteToken)?.length ?? 0) > 1 || binding.status === "conflict") {
+          report.conflicts.push(binding.relativePath);
+          continue;
+        }
+        let raw: string;
+        try {
+          raw = await this.local.readText(root, binding.relativePath);
+        } catch {
+          report.skippedUnbound.push(binding.relativePath); // local-missing: nothing to stamp
+          continue;
+        }
+        if (splitDocument(raw).malformed) {
+          report.malformed.push(binding.relativePath);
+          continue;
+        }
+        const result = writeSyncDocument(raw, { token: binding.remoteToken, rootId });
+        if (result.warning) {
+          report.malformed.push(binding.relativePath);
+          continue;
+        }
+        if (!result.changed) {
+          report.alreadyOk.push(binding.relativePath);
+          continue;
+        }
+        // The envelope is local-only, but the watcher must still not read the
+        // write back as a user edit.
+        this.registerLocalWrite(root, binding.relativePath);
+        await this.local.writeText(root, binding.relativePath, result.text);
+        report.stamped.push(binding.relativePath);
+      }
+      this.broadcast({ type: "identity-stamped", rootId, stamped: report.stamped.length });
+      return report;
+    });
   }
 
   /** Sync one bound entry through the root queue and, on success, commit just
@@ -699,7 +787,10 @@ export class SyncRuntime {
         // Register echo guards for the side we just wrote so the watcher /
         // drive-event channel ignores our own change instead of looping it back.
         const after = await this.metaStorage.findBindingById(binding.entryId);
-        if (direction === "pull") this.registerLocalWrite(root, binding.relativePath);
+        // Any successful round may have stamped the local file (push/merge
+        // included), so always swallow our own write in the watcher window.
+        if (binding.kind === "document") this.registerLocalWrite(root, binding.relativePath);
+        else if (direction === "pull") this.registerLocalWrite(root, binding.relativePath);
         if ((direction === "push" || direction === "merge") && after?.remoteToken) this.registerRemotePush(after.remoteToken);
         const succeeded = await this.metaStorage.updateOperation(operation.id, { status: "succeeded", direction, completedAt: new Date().toISOString() });
         this.broadcast({ type: "operation-completed", rootId: root.id, operation: succeeded });
