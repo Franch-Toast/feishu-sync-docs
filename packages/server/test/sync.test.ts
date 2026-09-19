@@ -732,3 +732,105 @@ test("name alignment skips already-bound files and never overwrites a sibling on
   await rm(directory, { recursive: true, force: true });
   await rm(globalDir, { recursive: true, force: true });
 });
+
+test("pairs a lost binding back to a drive title carrying '/' (a/b ↔ a-b.md)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-slash-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  // Local file carries the sanitized name; the drive copy lives in a subfolder
+  // under the raw title "a/b". Path pairing can never match (sub/a-b.md vs
+  // a-b.md), so only a sanitize-then-normalize title key pairs them back —
+  // comparing the raw node.name would miss and import a duplicate.
+  await writeFile(join(directory, "a-b.md"), "# a-b\n\nbody", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const sub = await remote.createFolder("root", "sub");
+  const created = await remote.createDocument(sub.token, "a/b", "# a-b\n\nbody");
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  await engine.scan(root);
+  assert.equal(remote.documents.size, 1, "the '/'-titled document is re-paired, not re-imported");
+  const binding = await metaStorage.getBinding(root.id, "a-b.md");
+  assert.equal(binding?.remoteToken, created.token, "title pairing crosses the '/'→'-' sanitization");
+  await assert.rejects(readFile(join(directory, "sub", "a-b.md")), "no title-derived duplicate file is written");
+  const entry = await engine.syncEntry(binding!, root);
+  assert.equal(entry.status, "clean");
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("two same-parent titles that sanitize alike ('a/b' & 'a-b') both import without loss", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-slash-collide-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  // Both drive titles collapse to the local base name "a-b"; without collision
+  // disambiguation the second document would be silently dropped by the
+  // already-imported-path guard.
+  await remote.createDocument("root", "a/b", "# one\n\nfirst body");
+  await remote.createDocument("root", "a-b", "# two\n\nsecond body");
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const scan = await engine.scan(root);
+  const imported = scan.entries.filter((binding) => binding.kind === "document" && !binding.ignoredAt);
+  assert.equal(imported.length, 2, "both documents land as distinct local files");
+  assert.ok(imported.every((binding) => binding.status === "clean"), "both import clean");
+  const paths = imported.map((binding) => binding.relativePath).sort();
+  assert.deepEqual(paths, ["a-b-2.md", "a-b.md"], "the collision gets a deterministic -2 suffix");
+  assert.equal(remote.documents.size, 2, "neither drive copy is deleted");
+  const first = await readFile(join(directory, "a-b.md"), "utf8");
+  const second = await readFile(join(directory, "a-b-2.md"), "utf8");
+  assert.notEqual(first, second, "the two files keep their own content");
+  assert.match(first + second, /first body/);
+  assert.match(first + second, /second body/);
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});
+
+test("a failed push leaves the binding recoverable and the next round self-heals", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-sync-faultinject-"));
+  const globalDir = await mkdtemp(join(tmpdir(), "feishu-sync-global-"));
+  await writeFile(join(directory, "notes.md"), "# notes\n\nfirst", "utf8");
+  const gitStorage = new GitStorageImpl();
+  const metaStorage = new JsonMetaStorage(globalDir);
+  const remote = new FakeRemote();
+  const root = await metaStorage.createRoot({ localPath: directory, remoteToken: "root", remoteType: "folder", enabled: true, pollIntervalMs: 60000 });
+  await gitStorage.initRoot(root);
+  await metaStorage.initRootMeta(root.id, root.localPath);
+  const engine = new SyncEngine(gitStorage, metaStorage, new FilesystemProvider(), remote);
+
+  const first = await engine.scan(root);
+  const established = await engine.syncEntry(first.entries[0]!, root);
+  assert.equal(established.status, "clean");
+  const token = established.remoteToken!;
+  await gitStorage.commitBaseline(root.id, "sync: manual", "manual");
+
+  // Local edit; the push's applyPatch is injected to fail once.
+  await writeFile(join(directory, "notes.md"), "# notes\n\nsecond", "utf8");
+  const pending = await engine.scan(root);
+  const target = pending.entries.find((binding) => binding.relativePath === "notes.md")!;
+  remote.failNextWrite("simulated transient network blip");
+  await assert.rejects(engine.syncEntry(target, root), "the failed write surfaces to the caller");
+  // The binding must NOT be left falsely clean, and the drive copy unchanged.
+  const after = await metaStorage.getBinding(root.id, "notes.md");
+  assert.notEqual(after?.status, "clean", "a failed push is never recorded as clean");
+  assert.equal(remote.documents.get(token)!.content, "# notes\n\nfirst", "the remote body is untouched");
+
+  // Next round self-heals once the transient fault clears.
+  const rescan = await engine.scan(root);
+  const healed = await engine.syncEntry(rescan.entries.find((binding) => binding.relativePath === "notes.md")!, root);
+  assert.equal(healed.status, "clean");
+  assert.match(remote.documents.get(token)!.content, /second/);
+
+  await rm(directory, { recursive: true, force: true });
+  await rm(globalDir, { recursive: true, force: true });
+});

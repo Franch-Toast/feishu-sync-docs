@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeForMatch, sanitizeLocalSegment } from "../src/index.js";
+import { normalizeForMatch, sanitizeLocalSegment, titleToLocalSegmentKey } from "../src/index.js";
 
 test("sanitizeLocalSegment replaces filesystem-illegal characters", () => {
   assert.equal(sanitizeLocalSegment('a/b\\c:d*e?f"g<h>i|j'), "a-b-c-d-e-f-g-h-i-j");
@@ -44,4 +44,18 @@ test("normalizeForMatch compares composed forms and ignores outer whitespace", (
   // Decomposed vs composed CJK accents must pair.
   assert.equal(normalizeForMatch("\u00e9"), normalizeForMatch("e\u0301"));
   assert.equal(normalizeForMatch("a"), "a");
+});
+
+test("titleToLocalSegmentKey sanitizes then normalizes so a '/' title pairs with its '-' file", () => {
+  // The whole point: a drive title "a/b" lands locally as "a-b", so pairing on
+  // this key makes the two line up instead of comparing the raw title.
+  assert.equal(titleToLocalSegmentKey("a/b"), titleToLocalSegmentKey("a-b"));
+  assert.equal(titleToLocalSegmentKey("a/b"), "a-b");
+  // Illegal characters collapse before match-normalization.
+  assert.equal(titleToLocalSegmentKey('x:y*z'), "x-y-z");
+  // Composed/decomposed Unicode and outer whitespace still pair.
+  assert.equal(titleToLocalSegmentKey("  Data Flow  "), titleToLocalSegmentKey("Data Flow"));
+  assert.equal(titleToLocalSegmentKey("e\u0301tude"), titleToLocalSegmentKey("\u00e9tude"));
+  // Distinct sanitized names stay distinct (no false collision).
+  assert.notEqual(titleToLocalSegmentKey("a-b"), titleToLocalSegmentKey("a--b"));
 });

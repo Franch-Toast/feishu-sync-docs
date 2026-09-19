@@ -1,31 +1,47 @@
 import { randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import { buildBlockPatch, decideSync } from "./merge.js";
-import { parseMarkdown, restoreAssetReferences, restoreInternalLinks, rewriteAssetReferences, rewriteInternalLinks } from "./markdown.js";
+import { parseMarkdown, restoreAssetReferences, restoreInternalLinks } from "./markdown.js";
 import { sha256 } from "./hash.js";
-import { normalizeForMatch, sanitizeLocalSegment } from "./names.js";
+import { titleToLocalSegmentKey } from "./names.js";
 import { matchesAnyGlob } from "./glob.js";
+import { documentTitle, isRemoteNotFound, mimeType, resolveRelativePath } from "./sync_paths.js";
+import { LocalNameAligner } from "./name_align.js";
+import { RemoteImporter } from "./importer.js";
+import { RemoteTreeCache } from "./remote_tree.js";
+import { RenameDetector } from "./rename.js";
+import type { SyncServices } from "./sync_services.js";
 import type {
   EntryBinding, GitStorage, LocalFile, LocalProvider, MetaStorage, RemoteDocument, RemoteNode, RemoteProvider, RemoteTree, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger
 } from "./types.js";
 
 export class SyncEngine {
-  /** Remote-tree cache keyed by root id. A scan refreshes it once and the
-   *  sync-entry loop it triggers reuses the same listing; repeated per-entry
-   *  drive walks were slow and allowed duplicate-folder creation races. */
-  private readonly remoteTreeCache = new Map<string, { tree: RemoteTree; at: number }>();
-  private readonly remoteTreeJobs = new Map<string, Promise<RemoteTree>>();
-  private static readonly REMOTE_TREE_TTL_MS = 60_000;
   /** Direction taken by the most recent syncEntry/syncAsset per entry; the
    *  runtime consumes it via takeDirection() to label operation records. */
   private readonly lastDirections = new Map<string, SyncDirection>();
+  /** Collaborators each own one focused responsibility; `SyncEngine` stays the
+   *  orchestrator (`scan` + `syncEntry`) and delegates the remote-tree cache,
+   *  remote import / asset handling, rename & duplicate governance, and
+   *  first-binding name alignment to them. They share one injected service set
+   *  so they never import each other. */
+  private readonly services: SyncServices;
+  private readonly tree: RemoteTreeCache;
+  private readonly importer: RemoteImporter;
+  private readonly rename: RenameDetector;
+  private readonly nameAlign: LocalNameAligner;
 
   constructor(
     private readonly gitStorage: GitStorage,
     private readonly metaStorage: MetaStorage,
     private readonly local: LocalProvider,
     private readonly remote: RemoteProvider
-  ) {}
+  ) {
+    this.services = { gitStorage, metaStorage, local, remote };
+    this.tree = new RemoteTreeCache(this.services);
+    this.importer = new RemoteImporter(this.services);
+    this.rename = new RenameDetector(this.services);
+    this.nameAlign = new LocalNameAligner(this.services);
+  }
 
   /** Consume the direction recorded by the last sync for this entry. */
   takeDirection(entryId: string): SyncDirection | undefined {
@@ -169,7 +185,7 @@ export class SyncEngine {
       const binding = existingByPath.get(file.relativePath);
       if (binding?.remoteToken || binding?.ignoredAt) continue;
       unboundLocalFiles.push({ relativePath: file.relativePath, contentHash: file.contentHash });
-      const baseName = normalizeForMatch(posix.basename(file.relativePath).replace(/\.md$/i, ""));
+      const baseName = titleToLocalSegmentKey(posix.basename(file.relativePath).replace(/\.md$/i, ""));
       if (!baseName) continue;
       const bucket = unboundTitlePaths.get(baseName);
       if (bucket) bucket.push(file.relativePath); else unboundTitlePaths.set(baseName, [file.relativePath]);
@@ -198,7 +214,7 @@ export class SyncEngine {
       // re-importing the document under its title-derived path — which used
       // to duplicate the document and block the next push of the original.
       if (!localByPath.has(relativePath)) {
-        const candidates = unboundTitlePaths.get(normalizeForMatch(node.name));
+        const candidates = unboundTitlePaths.get(titleToLocalSegmentKey(node.name));
         if (candidates && candidates.length === 1) {
           const targetPath = candidates[0]!;
           const target = await this.metaStorage.getBinding(root.id, targetPath);
@@ -398,100 +414,10 @@ export class SyncEngine {
   }
 
   /** Rename freshly-seen local documents so the file name equals the document's
-   *  own H1 (sanitized), because Feishu shows the markdown H1 as the drive
-   *  document name. Files that already own a binding are never touched, so the
-   *  alignment happens exactly once per document (at first binding). The pass
-   *  cascades into internal links so references keep resolving after the move. */
+   *  own H1 (sanitized), aligning `file name == H1 == remote name` at first
+   *  binding. Delegated to {@link LocalNameAligner}; only run on full rounds. */
   private async normalizeLocalNames(root: SyncRoot, files: LocalFile[], existingByPath: Map<string, EntryBinding>): Promise<LocalFile[]> {
-    const renamed: LocalFile[] = [];
-    const takenPaths = new Set(files.map((file) => file.relativePath));
-    const renameMap = new Map<string, string>();
-    // Content hashes already represented by a binding. An unbound file that
-    // shares one of these is a move/duplicate candidate for an established
-    // document, not a fresh one — renaming it would fight B3 rename detection
-    // and same-name governance, so the pairing tiers must handle it instead.
-    const boundContentHashes = new Set(
-      [...existingByPath.values()].map((binding) => binding.remoteContentHash).filter((hash): hash is string => Boolean(hash))
-    );
-    for (const file of files) {
-      if (file.kind !== "document") { renamed.push(file); continue; }
-      if (existingByPath.has(file.relativePath)) { renamed.push(file); continue; }
-      if (file.contentHash && boundContentHashes.has(file.contentHash)) { renamed.push(file); continue; }
-      const content = await this.local.readText(root, file.relativePath);
-      const h1 = parseMarkdown(content).title;
-      if (!h1) { renamed.push(file); continue; }
-      const dir = posix.dirname(file.relativePath);
-      const baseName = posix.basename(file.relativePath).replace(/\.md$/i, "");
-      const newBaseName = sanitizeLocalSegment(h1);
-      if (normalizeForMatch(baseName) === normalizeForMatch(newBaseName)) { renamed.push(file); continue; }
-      const newPath = posix.join(dir === "." ? "" : dir, `${newBaseName}.md`).replace(/^\.\//, "");
-      if (newPath === file.relativePath) { renamed.push(file); continue; }
-      // Destination already used by another document: leave this one alone so we
-      // never overwrite a sibling; the four-tier pairing still handles it.
-      if (takenPaths.has(newPath)) { renamed.push(file); continue; }
-      await this.renameLocalFile(root, file.relativePath, newPath, content);
-      takenPaths.delete(file.relativePath);
-      takenPaths.add(newPath);
-      renameMap.set(file.relativePath, newPath);
-      renamed.push({ ...file, relativePath: newPath });
-    }
-    if (renameMap.size > 0) await this.rewriteLocalLinks(root, renamed, renameMap);
-    return renamed;
-  }
-
-  /** Move a local file's content to a new path. The plain write-then-delete
-   *  order corrupts a case-only rename on case-insensitive filesystems (the new
-   *  path aliases the old one, so the delete removes the fresh write), so those
-   *  go through a temporary intermediate path. */
-  private async renameLocalFile(root: SyncRoot, oldPath: string, newPath: string, content: string): Promise<void> {
-    const caseOnly = oldPath !== newPath && oldPath.toLowerCase() === newPath.toLowerCase();
-    if (caseOnly) {
-      const tempPath = `${newPath}.feishu-sync.tmp`;
-      await this.local.writeText(root, tempPath, content);
-      await this.local.delete(root, oldPath);
-      await this.local.writeText(root, newPath, content);
-      await this.local.delete(root, tempPath);
-      return;
-    }
-    await this.local.writeText(root, newPath, content);
-    await this.local.delete(root, oldPath);
-  }
-
-  /** Rewrite markdown/wiki links that pointed at a renamed document. Matches
-   *  by normalized resolved path so `./a.md`, `a.md` and casing variants all
-   *  resolve to the same rename entry; anchors and query suffixes are preserved. */
-  private async rewriteLocalLinks(root: SyncRoot, files: LocalFile[], renameMap: Map<string, string>): Promise<void> {
-    const byNormalized = new Map<string, string>();
-    for (const [oldPath, newPath] of renameMap) byNormalized.set(normalizeForMatch(oldPath), newPath);
-    for (const file of files) {
-      if (file.kind !== "document") continue;
-      const content = await this.local.readText(root, file.relativePath);
-      const { links } = parseMarkdown(content);
-      if (links.length === 0) continue;
-      let modified = content;
-      // Descending start offsets so an earlier edit never invalidates a later span.
-      for (const link of [...links].sort((left, right) => right.start - left.start)) {
-        if (/^https?:\/\//i.test(link.target)) continue;
-        const pathTarget = link.target.split(/[?#]/, 1)[0] ?? link.target;
-        if (!pathTarget) continue;
-        const resolved = resolveRelativePath(file.relativePath, link.target);
-        const newPath = byNormalized.get(normalizeForMatch(resolved));
-        if (!newPath) continue;
-        const anchor = link.target.slice(pathTarget.length);
-        const relativeTarget = posix.relative(posix.dirname(file.relativePath), newPath).replace(/^\.\//, "") || posix.basename(newPath);
-        const replacement = `${relativeTarget}${anchor}`;
-        const span = modified.slice(link.start, link.end);
-        let newSpan = span.replace(`(${link.target}`, `(${replacement}`);
-        if (newSpan === span) newSpan = span.replace(`[[${link.target}]]`, `[[${replacement}]]`);
-        if (newSpan === span) newSpan = span.replace(`[[${link.target}|`, `[[${replacement}|`);
-        if (newSpan === span) continue;
-        modified = `${modified.slice(0, link.start)}${newSpan}${modified.slice(link.end)}`;
-      }
-      if (modified !== content) {
-        await this.local.writeText(root, file.relativePath, modified);
-        file.contentHash = sha256(modified);
-      }
-    }
+    return this.nameAlign.normalize(root, files, existingByPath);
   }
 
   async syncEntry(binding: EntryBinding, root: SyncRoot): Promise<EntryBinding> {
@@ -527,8 +453,8 @@ export class SyncEngine {
       // another copy; block on same-name documents that are already bound
       // elsewhere.
       const tree = await this.loadRemoteTree(root);
-      const expectedName = normalizeForMatch(documentTitle(binding.relativePath));
-      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && expectedName === normalizeForMatch(node.name));
+      const expectedName = titleToLocalSegmentKey(documentTitle(binding.relativePath));
+      const duplicate = tree.nodes.find((node) => node.type === "document" && node.parentToken === parent && expectedName === titleToLocalSegmentKey(node.name));
       if (duplicate) {
         const bound = await this.metaStorage.findBindingByToken(root.id, duplicate.token);
         // A binding on the very same relative path is this entry's own earlier
@@ -752,386 +678,89 @@ export class SyncEngine {
     return this.syncEntry(rearmed, root);
   }
 
-  /** Same-name duplicate governance: within one remote parent folder, two or
-   *  more documents sharing a normalized title are collapsed — the bound copy
-   *  (else the earliest-updated one) wins, and every other copy whose content
-   *  hash matches the winner is soft-deleted so the pairing loops below see a
-   *  one-to-one listing. Divergent duplicates surface as a conflict on the
-   *  winner's entry once it is bound; an unbound winner gets imported first
-   *  and the conflict is raised on the next full round. */
+  /** Same-name duplicate governance (delegated to {@link RenameDetector}). */
   private async governRemoteDuplicates(root: SyncRoot, tree: RemoteTree, mode: SyncMode): Promise<void> {
-    const groups = new Map<string, RemoteNode[]>();
-    for (const node of tree.nodes) {
-      if (node.type !== "document") continue;
-      const key = `${node.parentToken || root.remoteToken}|${normalizeForMatch(node.name)}`;
-      const bucket = groups.get(key);
-      if (bucket) bucket.push(node); else groups.set(key, [node]);
-    }
-    for (const group of groups.values()) {
-      if (group.length < 2) continue;
-      const bound = new Map<string, EntryBinding>();
-      for (const node of group) {
-        const binding = await this.metaStorage.findBindingByToken(root.id, node.token);
-        if (binding && !binding.ignoredAt) bound.set(node.token, binding);
-      }
-      const winner = group.find((node) => bound.has(node.token))
-        ?? [...group].sort((left, right) => (left.updatedAt ?? "").localeCompare(right.updatedAt ?? ""))[0]!;
-      const documents = new Map<string, RemoteDocument>();
-      for (const node of group) {
-        try {
-          documents.set(node.token, await this.remote.getDocument(node.token));
-        } catch {
-          // An unreadable copy is left alone rather than deleted blindly.
-        }
-      }
-      const winnerDocument = documents.get(winner.token);
-      if (!winnerDocument) continue;
-      for (const loser of group) {
-        if (loser.token === winner.token) continue;
-        const loserDocument = documents.get(loser.token);
-        if (!loserDocument) continue;
-        if (loserDocument.contentHash === winnerDocument.contentHash) {
-          await this.remote.softDelete(loser.token, "docx");
-          const index = tree.nodes.indexOf(loser);
-          if (index >= 0) tree.nodes.splice(index, 1);
-          continue;
-        }
-        // Divergent duplicate: only surface a conflict once the winner is
-        // bound — the conflict record needs an entry to attach to.
-        const binding = bound.get(winner.token);
-        if (!binding || mode === "push-only") continue;
-        const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
-        if (open) continue;
-        let localContent = "";
-        try {
-          localContent = await this.local.readText(root, binding.relativePath);
-        } catch { /* local-missing entries contribute an empty side */ }
-        const baselineContent = await this.gitStorage.getBaseline(root.id, binding.relativePath) ?? "";
-        await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "conflict", updatedAt: new Date().toISOString() });
-        await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent: baselineContent, localContent, remoteContent: loserDocument.content, remoteRevision: winnerDocument.revisionId, remoteContentHash: winnerDocument.contentHash });
-      }
-    }
+    return this.rename.governDuplicates(root, tree, mode);
   }
 
-  /** Minimal remote tree for the incremental fast path: every announced token
-   *  is read as a single document; unbound tokens must be locatable in one of
-   *  the announced parent folders via listFolderChildren. Returns undefined
-   *  whenever the preconditions fail so the caller falls back to the full
-   *  drive walk (correctness first, speed second). */
+  /** Minimal remote tree for the incremental fast path (delegated to
+   *  {@link RemoteTreeCache}); returns undefined so the caller falls back to a
+   *  full drive walk when preconditions fail. */
   private async buildScopedRemoteTree(root: SyncRoot, tokens: ReadonlySet<string>, parentTokens: readonly string[], documents?: Map<string, RemoteDocument>): Promise<RemoteTree | undefined> {
-    const rootNode: RemoteNode = { token: root.remoteToken, name: root.remoteToken, type: "folder", parentToken: "" };
-    const nodes: RemoteNode[] = [];
-    for (const token of tokens) {
-      const binding = await this.metaStorage.findBindingByToken(root.id, token);
-      if (binding) {
-        try {
-          const document = await this.remote.getDocument(token);
-          documents?.set(token, document);
-          nodes.push({ ...document, parentToken: binding.remoteParentToken || root.remoteToken, name: document.name || binding.relativePath });
-        } catch (error) {
-          // A deleted document is simply absent from the minimal tree; the
-          // full round reclassifies its binding. Network failures fall back.
-          if (isRemoteNotFound(error)) continue;
-          return undefined;
-        }
-        continue;
-      }
-      // Unbound token: a drive event announced it; look only inside the
-      // folders the event named instead of walking the whole drive.
-      let found: RemoteNode | undefined;
-      for (const parentToken of parentTokens.length > 0 ? parentTokens : [root.remoteToken]) {
-        if (!this.remote.listFolderChildren) return undefined;
-        let children: RemoteNode[];
-        try {
-          children = await this.remote.listFolderChildren(parentToken);
-        } catch {
-          return undefined;
-        }
-        const hit = children.find((node) => node.token === token);
-        if (hit) {
-          found = hit;
-          break;
-        }
-      }
-      if (!found) return undefined;
-      nodes.push(found);
-    }
-    return { root: rootNode, nodes };
+    return this.tree.buildScoped(root, tokens, parentTokens, documents);
   }
 
-  /** Token→relative-path maps for one remote tree snapshot, shared by scan
-   *  and the single-entry pull path. */
+  /** Token→relative-path maps for one remote tree snapshot (delegated to
+   *  {@link RemoteTreeCache.buildPathMaps}). */
   private buildRemotePathMaps(rootToken: string, tree: RemoteTree): { documents: Map<string, string>; assets: Map<string, string>; assetParents: Map<string, string> } {
-    const nodesByToken = new Map(tree.nodes.map((node) => [node.token, node]));
-    const documents = new Map<string, string>();
-    const assets = new Map<string, string>();
-    const assetParents = new Map<string, string>();
-    for (const node of tree.nodes) {
-      const path = remoteRelativePath(rootToken, node, nodesByToken);
-      if (!path) continue;
-      if (node.type === "document") documents.set(node.token, ensureMarkdownPath(path));
-      if (node.type === "asset") {
-        assets.set(node.token, path);
-        assetParents.set(node.token, node.parentToken);
-      }
-    }
-    return { documents, assets, assetParents };
+    return this.tree.buildPathMaps(rootToken, tree);
   }
 
+  /** Import a remote-only document and its images (delegated to {@link RemoteImporter}). */
   private async importRemoteDocument(root: SyncRoot, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>, knownFiles?: Map<string, LocalFile>): Promise<void> {
-    let remote: RemoteDocument;
-    try {
-      remote = await this.remote.getDocument(node.token);
-    } catch (error) {
-      if (isRemoteNotFound(error)) return;
-      throw error;
-    }
-    const existingBinding = await this.metaStorage.getBinding(root.id, relativePath);
-    const entryId = existingBinding?.entryId ?? randomUUID();
-    const assetImport = await this.importRemoteAssets(root, entryId, remote.content, remoteAssetPaths, remoteAssetParents, knownFiles);
-    const canonicalContent = restoreAssetReferences(restoreInternalLinks(remote.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
-    await this.local.writeText(root, relativePath, canonicalContent);
-    const hash = sha256(canonicalContent);
-    const next: EntryBinding = {
-      entryId,
-      rootId: root.id,
-      relativePath,
-      kind: "document",
-      remoteToken: remote.token,
-      remoteParentToken: node.parentToken || root.remoteToken,
-      remoteContentHash: hash,
-      remoteRevision: remote.revisionId,
-      status: "clean",
-      updatedAt: new Date().toISOString()
-    };
-    await this.metaStorage.setBinding(root.id, relativePath, next);
-    await this.metaStorage.saveAssetBindings(entryId, assetImport.bindings);
-    await this.saveBlockMapping(entryId, canonicalContent, remote);
+    return this.importer.importRemoteDocument(root, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents, knownFiles);
   }
 
+  /** Record a foreign-token/path divergence as a conflict (delegated to {@link RemoteImporter}). */
   private async recordRemoteCollision(root: SyncRoot, binding: EntryBinding, node: RemoteNode, relativePath: string, remoteDocumentPaths: Map<string, string>, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>, knownFiles?: Map<string, LocalFile>): Promise<void> {
-    const localContent = await this.local.readText(root, relativePath);
-    const remote = await this.remote.getDocument(node.token);
-    const assetImport = await this.importRemoteAssets(root, binding.entryId, remote.content, remoteAssetPaths, remoteAssetParents, knownFiles);
-    const remoteContent = restoreAssetReferences(restoreInternalLinks(remote.content, remoteDocumentPaths, relativePath), assetImport.reverseMap, relativePath);
-    const baselineContent = await this.gitStorage.getBaseline(root.id, relativePath);
-    const baseContent = baselineContent ?? "";
-    await this.metaStorage.setBinding(root.id, relativePath, { ...binding, remoteToken: node.token, remoteParentToken: node.parentToken || root.remoteToken, remoteContentHash: sha256(remoteContent), remoteRevision: remote.revisionId, status: "conflict", updatedAt: new Date().toISOString() });
-    const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
-    if (open) await this.metaStorage.updateConflict(open.id, { localContent, remoteContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-    else await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent, localContent, remoteContent, remoteRevision: remote.revisionId, remoteContentHash: sha256(remote.content) });
-    await this.metaStorage.saveAssetBindings(binding.entryId, assetImport.bindings);
+    return this.importer.recordRemoteCollision(root, binding, node, relativePath, remoteDocumentPaths, remoteAssetPaths, remoteAssetParents, knownFiles);
   }
 
-  private async importRemoteAssets(root: SyncRoot, documentEntryId: string, content: string, remoteAssetPaths: Map<string, string>, remoteAssetParents: Map<string, string>, knownFiles?: Map<string, LocalFile>): Promise<{ reverseMap: Map<string, string>; bindings: Array<{ documentEntryId: string; assetEntryId: string; token: string; contentHash: string }> }> {
-    const reverseMap = new Map<string, string>();
-    const bindings: Array<{ documentEntryId: string; assetEntryId: string; token: string; contentHash: string }> = [];
-    const tokens = [...content.matchAll(/<img\s+[^>]*?(?:src|token)="([^"]+)"/g)].map((match) => match[1]).filter((token): token is string => Boolean(token));
-    // Reuse the caller's scan when available; per-token scans would walk the
-    // whole tree for every image.
-    const localFiles = knownFiles ?? new Map((await this.local.scan(root)).map((file) => [file.relativePath, file]));
-    for (const token of tokens) {
-      const relativePath = remoteAssetPaths.get(token);
-      if (!relativePath || reverseMap.has(token)) continue;
-      let binary: Uint8Array;
-      try {
-        binary = await this.remote.downloadAsset(token);
-      } catch {
-        continue;
-      }
-      const hash = sha256(binary);
-      const existing = await this.metaStorage.getBinding(root.id, relativePath);
-      const localFile = localFiles.get(relativePath);
-      if (localFile && localFile.contentHash !== hash) continue;
-      if (!localFile) await this.local.writeBinary(root, relativePath, binary);
-      const assetEntryId = existing?.entryId ?? randomUUID();
-      const assetBinding: EntryBinding = {
-        entryId: assetEntryId,
-        rootId: root.id,
-        relativePath,
-        kind: "asset",
-        remoteToken: token,
-        remoteParentToken: remoteAssetParents.get(token) ?? root.remoteToken,
-        remoteContentHash: hash,
-        status: "clean",
-        updatedAt: new Date().toISOString()
-      };
-      await this.metaStorage.setBinding(root.id, relativePath, assetBinding);
-      reverseMap.set(token, relativePath);
-      bindings.push({ documentEntryId, assetEntryId, token, contentHash: hash });
-    }
-    return { reverseMap, bindings };
-  }
-
+  /** Sync changed inline assets down from a remote edit (delegated to {@link RemoteImporter}). */
   private async hydrateChangedRemoteAssets(root: SyncRoot, documentBinding: EntryBinding, localContent: string, remoteContent: string): Promise<boolean> {
-    const references = parseMarkdown(localContent).assets;
-    if (references.length === 0) return false;
-    const remoteTokens = [...remoteContent.matchAll(/<img\s+[^>]*?(?:src|token)="([^"]+)"/g)].map((match) => match[1]).filter((token): token is string => Boolean(token));
-    if (remoteTokens.length === 0) return false;
-    const bindings = await this.metaStorage.getAssetBindings(documentBinding.entryId);
-    let conflict = false;
-    for (let index = 0; index < Math.min(references.length, remoteTokens.length); index += 1) {
-      const assetPath = resolveRelativePath(documentBinding.relativePath, references[index]!.target);
-      const assetBinding = await this.metaStorage.getBinding(root.id, assetPath);
-      const binding = assetBinding ? bindings.find((item) => item.assetEntryId === assetBinding.entryId) : undefined;
-      const remoteToken = remoteTokens[index]!;
-      if (!assetBinding || !binding || binding.token === remoteToken) continue;
-      try {
-        const binary = await this.remote.downloadAsset(remoteToken);
-        const hash = sha256(binary);
-        if (assetBinding.remoteContentHash !== binding.contentHash && assetBinding.remoteContentHash !== hash) {
-          conflict = true;
-          continue;
-        }
-        await this.local.writeBinary(root, assetPath, binary);
-        await this.metaStorage.setBinding(root.id, assetPath, { ...assetBinding, remoteContentHash: hash, status: "clean", updatedAt: new Date().toISOString() });
-        await this.metaStorage.saveAssetBindings(documentBinding.entryId, bindings.map((item) => item.assetEntryId === assetBinding.entryId ? { ...item, token: remoteToken, contentHash: hash } : item));
-      } catch {
-        conflict = true;
-      }
-    }
-    return conflict;
+    return this.importer.hydrateChangedRemoteAssets(root, documentBinding, localContent, remoteContent);
   }
 
+  /** Render local markdown for a remote write (delegated to {@link RemoteImporter}). */
   private renderRemoteContent(content: string, currentPath: string, linkMap: Map<string, { token: string; url?: string }>, assetMap: Map<string, string>): string {
-    return rewriteAssetReferences(rewriteInternalLinks(content, currentPath, linkMap), currentPath, assetMap);
+    return this.importer.renderRemoteContent(content, currentPath, linkMap, assetMap);
   }
 
+  /** Resolve a document's asset maps and optionally upload changed images
+   *  (delegated to {@link RemoteImporter}). */
   private async prepareAssets(root: SyncRoot, documentBinding: EntryBinding, content: string, documentToken?: string, uploadInline = false): Promise<{ forwardMap: Map<string, string>; reverseMap: Map<string, string>; hasLocalAssets: boolean; changed: boolean }> {
-    const forwardMap = new Map<string, string>();
-    const reverseMap = new Map<string, string>();
-    for (const binding of await this.metaStorage.listBindings(root.id)) {
-      if (binding.kind === "asset" && binding.remoteToken) {
-        forwardMap.set(binding.relativePath, binding.remoteToken);
-        reverseMap.set(binding.remoteToken, binding.relativePath);
-      }
-    }
-    for (const assetBinding of await this.metaStorage.getAssetBindings(documentBinding.entryId)) {
-      const asset = await this.metaStorage.findBindingById(assetBinding.assetEntryId);
-      if (asset) {
-        reverseMap.set(assetBinding.token, asset.relativePath);
-        forwardMap.set(asset.relativePath, assetBinding.token);
-      }
-    }
-
-    const bindings = [];
-    let changed = false;
-    const references = parseMarkdown(content).assets;
-    for (const reference of references) {
-      const assetPath = resolveRelativePath(documentBinding.relativePath, reference.target);
-      const assetBinding = await this.metaStorage.getBinding(root.id, assetPath);
-      if (!assetBinding || assetBinding.kind !== "asset") continue;
-      let token = assetBinding.remoteToken;
-      const existingBinding = (await this.metaStorage.getAssetBindings(documentBinding.entryId)).find((b) => b.assetEntryId === assetBinding.entryId);
-      const targetDocumentToken = documentToken ?? documentBinding.remoteToken;
-      const bindingChanged = existingBinding !== undefined && existingBinding.contentHash !== assetBinding.remoteContentHash;
-      if (bindingChanged) changed = true;
-      if (uploadInline && targetDocumentToken && this.remote.uploadInlineAsset && (!existingBinding || bindingChanged)) {
-        const binary = await this.local.readBinary(root, assetPath);
-        if (existingBinding) reverseMap.set(existingBinding.token, assetPath);
-        const uploaded = await this.remote.uploadInlineAsset(targetDocumentToken, posix.basename(assetPath), binary, mimeType(assetPath));
-        token = uploaded.token;
-        changed = true;
-      }
-      if (existingBinding && (!uploadInline || existingBinding.contentHash === assetBinding.remoteContentHash)) token = existingBinding.token;
-      if (token) {
-        forwardMap.set(assetPath, token);
-        reverseMap.set(token, assetPath);
-        bindings.push({ documentEntryId: documentBinding.entryId, assetEntryId: assetBinding.entryId, token, contentHash: assetBinding.remoteContentHash ?? "" });
-      }
-    }
-    await this.metaStorage.saveAssetBindings(documentBinding.entryId, bindings);
-    return { forwardMap, reverseMap, hasLocalAssets: references.length > 0, changed };
+    return this.importer.prepareAssets(root, documentBinding, content, documentToken, uploadInline);
   }
 
+  /** Binding-derived document link maps for internal-link rewriting
+   *  (delegated to {@link RemoteImporter}). */
   private async buildLinkMaps(rootId: string): Promise<{ forwardMap: Map<string, { token: string; url?: string }>; reverseMap: Map<string, string> }> {
-    const forwardMap = new Map<string, { token: string; url?: string }>();
-    const reverseMap = new Map<string, string>();
-    for (const binding of await this.metaStorage.listBindings(rootId)) {
-      if (binding.kind !== "document" || !binding.remoteToken) continue;
-      const path = binding.relativePath;
-      forwardMap.set(path, { token: binding.remoteToken });
-      forwardMap.set(path.replace(/\.md$/i, ""), { token: binding.remoteToken });
-      reverseMap.set(binding.remoteToken, path);
-    }
-    return { forwardMap, reverseMap };
+    return this.importer.buildLinkMaps(rootId);
   }
 
   /** Drop the cached remote tree so the next guard lookup observes documents
-   *  created after the snapshot was taken: the same-round auto-retry after
-   *  "the API failed but the document was actually created" must find and
-   *  adopt the half-finished document instead of creating it again. */
+   *  created after the snapshot was taken (delegated to {@link RemoteTreeCache}). */
   invalidateRemoteTree(rootId: string): void {
-    this.remoteTreeCache.delete(rootId);
+    this.tree.invalidate(rootId);
   }
 
-  /** Keep the drive-visible title equal to the local file name: the docs_ai
-   *  markdown pipeline can re-derive the title from the document's first H1,
-   *  so after any content write the title is compared and patched back when
-   *  it drifted. A no-op for providers without block-level renames. */
+  /** Pin the drive-visible title back to the local file name after a content
+   *  write (delegated to {@link RenameDetector}). */
   private async ensureRemoteTitle(doc: RemoteDocument, expected: string): Promise<RemoteDocument> {
-    if (doc.name === expected || !this.remote.renameDocument) return doc;
-    await this.remote.renameDocument(doc.token, expected);
-    return { ...doc, name: expected };
+    return this.rename.ensureRemoteTitle(doc, expected);
   }
 
-  /** Return the local document path whose content equals the remote document,
-   *  comparing raw and canonicalized content hashes across every local file
-   *  (bound or not — the original behind a stale duplicate is usually
-   *  already bound). Undefined when nothing matches. */
+  /** Return the local document path whose content equals a remote duplicate
+   *  (delegated to {@link RenameDetector}). */
   private async findDuplicateLocalDocument(node: RemoteNode, localByPath: Map<string, LocalFile>, scanReverseMap: Map<string, string>): Promise<string | undefined> {
-    const documents = [...localByPath.values()].filter((file) => file.kind === "document");
-    if (documents.length === 0) return undefined;
-    if (node.contentHash) {
-      const fast = documents.find((file) => file.contentHash === node.contentHash);
-      if (fast) return fast.relativePath;
-    }
-    let remote: RemoteDocument | undefined;
-    try {
-      remote = await this.remote.getDocument(node.token);
-    } catch (error) {
-      if (!isRemoteNotFound(error)) throw error;
-      return undefined;
-    }
-    if (!remote) return undefined;
-    const raw = sha256(remote.content);
-    for (const file of documents) {
-      if (file.contentHash === raw) return file.relativePath;
-      // Asset references have no reverse map at pairing time and keep their
-      // token form, which only ever weakens the match (same as above).
-      const canonical = restoreAssetReferences(restoreInternalLinks(remote.content, scanReverseMap, file.relativePath), new Map(), file.relativePath);
-      if (sha256(canonical) === file.contentHash) return file.relativePath;
-    }
-    return undefined;
+    return this.rename.findDuplicateLocalDocument(node, localByPath, scanReverseMap);
   }
 
-  /** Force-refresh the cached remote tree for a root; used at scan start so
-   *  the engine works on a consistent snapshot. */
+  /** Force-refresh the cached remote tree for a root (delegated to {@link RemoteTreeCache}). */
   private async refreshRemoteTree(root: SyncRoot): Promise<RemoteTree> {
-    this.remoteTreeCache.delete(root.id);
-    return this.loadRemoteTree(root);
+    return this.tree.refresh(root);
   }
 
-  /** Return the cached remote tree, fetching it once per TTL window and
-   *  de-duplicating concurrent fetches. */
+  /** Return the cached remote tree, fetching once per TTL window (delegated to
+   *  {@link RemoteTreeCache}). */
   private async loadRemoteTree(root: SyncRoot): Promise<RemoteTree> {
-    const cached = this.remoteTreeCache.get(root.id);
-    if (cached && Date.now() - cached.at < SyncEngine.REMOTE_TREE_TTL_MS) return cached.tree;
-    const pending = this.remoteTreeJobs.get(root.id);
-    if (pending) return pending;
-    const job = this.remote.listTree(root).then((tree) => {
-      this.remoteTreeCache.set(root.id, { tree, at: Date.now() });
-      return tree;
-    }).finally(() => { this.remoteTreeJobs.delete(root.id); });
-    this.remoteTreeJobs.set(root.id, job);
-    return job;
+    return this.tree.load(root);
   }
 
-  /** Register a newly created remote node in the cached tree so subsequent
-   *  lookups in this round see it even if the drive listing lags behind. */
+  /** Register a newly created remote node in the cached tree (delegated to
+   *  {@link RemoteTreeCache}). */
   private cacheRemoteNode(root: SyncRoot, node: RemoteNode): void {
-    const cached = this.remoteTreeCache.get(root.id);
-    if (cached) cached.tree.nodes.push(node);
+    this.tree.cacheNode(root, node);
   }
 
   private async ensureRemoteParent(root: SyncRoot, relativePath: string): Promise<string> {
@@ -1169,54 +798,15 @@ export class SyncEngine {
     return parentToken;
   }
 
-  /** Decide whether a vanished binding was actually renamed/moved locally.
-   *  Returns "moved" once the binding was re-pointed to the new path,
-   *  "conflict" when several unbound files match and the target is ambiguous,
-   *  or "none" when there is no rename evidence (a genuine local deletion). */
+  /** Decide whether a vanished binding was actually renamed/moved locally
+   *  (delegated to {@link RenameDetector}). */
   private async detectRename(root: SyncRoot, binding: EntryBinding, localByPath: Map<string, LocalFile>, boundPaths: Set<string>): Promise<"moved" | "conflict" | "none"> {
-    const hash = binding.remoteContentHash;
-    if (!hash || !binding.remoteToken) return "none";
-    const candidates = [...localByPath.values()].filter((file) =>
-      file.relativePath !== binding.relativePath &&
-      file.contentHash === hash &&
-      !boundPaths.has(file.relativePath));
-    if (candidates.length === 0) return "none";
-    if (candidates.length > 1) {
-      // Ambiguous: two or more unbound files carry identical content. Surface a
-      // conflict so the user picks the real successor rather than the engine
-      // guessing and silently orphaning the remote document.
-      let remoteContent = "";
-      try {
-        remoteContent = (await this.remote.getDocument(binding.remoteToken)).content;
-      } catch { /* a missing remote doc leaves the comparison empty */ }
-      const baseContent = await this.gitStorage.getBaseline(root.id, binding.relativePath) ?? "";
-      await this.metaStorage.setBinding(root.id, binding.relativePath, { ...binding, status: "conflict", updatedAt: new Date().toISOString() });
-      const open = (await this.metaStorage.listConflicts("open")).find((conflict) => conflict.entryId === binding.entryId);
-      if (!open) await this.metaStorage.createConflict({ entryId: binding.entryId, baseContent, localContent: "", remoteContent, remoteRevision: binding.remoteRevision, remoteContentHash: hash });
-      return "conflict";
-    }
-    const target = candidates[0]!;
-    // Re-point: drop the stale path and hand the entry's identity (and remote
-    // token) to the new path. Content is unchanged, so the entry stays clean
-    // and the next round neither re-pushes it nor creates a duplicate document.
-    await this.metaStorage.deleteBinding(root.id, binding.relativePath);
-    await this.metaStorage.setBinding(root.id, target.relativePath, {
-      ...binding,
-      relativePath: target.relativePath,
-      kind: target.kind,
-      remoteContentHash: target.contentHash,
-      status: "clean",
-      updatedAt: new Date().toISOString()
-    });
-    return "moved";
+    return this.rename.detectRename(root, binding, localByPath, boundPaths);
   }
 
+  /** Persist the local-block↔remote-block mapping (delegated to {@link RemoteImporter}). */
   private async saveBlockMapping(entryId: string, content: string, remote: RemoteDocument): Promise<void> {
-    const blocks = parseMarkdown(content).blocks;
-    await this.metaStorage.saveBlocks(entryId, blocks.flatMap((block, position) => {
-      const remoteBlock = remote.blocks[position];
-      return remoteBlock ? [{ entryId, stableId: block.stableId, blockId: remoteBlock.id, kind: block.kind, contentHash: block.contentHash, position }] : [];
-    }));
+    return this.importer.saveBlockMapping(entryId, content, remote);
   }
 
   private async markDocumentReferences(root: SyncRoot, targetPath: string): Promise<void> {
@@ -1239,45 +829,3 @@ export class SyncEngine {
   }
 }
 
-function resolveRelativePath(currentPath: string, target: string): string {
-  const cleanTarget = target.split("#", 1)[0]?.split("?", 1)[0] ?? target;
-  return posix.normalize(posix.join(posix.dirname(currentPath), cleanTarget)).replace(/^\.\//, "");
-}
-
-function isRemoteNotFound(error: unknown): boolean {
-  return /(?:HTTP\s+404|not[ -]?found|notexisted|deleted)/i.test(error instanceof Error ? error.message : String(error));
-}
-
-function documentTitle(relativePath: string): string {
-  return posix.basename(relativePath).replace(/\.md$/i, "") || "Untitled";
-}
-
-function mimeType(relativePath: string): string {
-  const extension = posix.extname(relativePath).toLowerCase();
-  return ({ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml" } as Record<string, string>)[extension] ?? "application/octet-stream";
-}
-
-function remoteRelativePath(rootToken: string, node: RemoteNode, nodes: Map<string, RemoteNode>): string | undefined {
-  // Each segment is sanitized so drive titles that carry filesystem-illegal
-  // characters ("a:b", trailing dots…) map onto writable local names; the
-  // sanitized path is the single shared key between the binding table and
-  // the drive listing.
-  const segments = [sanitizeLocalSegment(node.name)];
-  const visited = new Set<string>();
-  let parentToken = node.parentToken;
-  while (parentToken && parentToken !== rootToken) {
-    if (visited.has(parentToken)) return undefined;
-    visited.add(parentToken);
-    const parent = nodes.get(parentToken);
-    if (!parent || parent.type !== "folder") return undefined;
-    segments.unshift(sanitizeLocalSegment(parent.name));
-    parentToken = parent.parentToken;
-  }
-  const path = posix.normalize(posix.join(...segments));
-  if (!path || path === "." || path.startsWith("../") || path.startsWith("/")) return undefined;
-  return path;
-}
-
-function ensureMarkdownPath(path: string): string {
-  return /\.md$/i.test(path) ? path : `${path}.md`;
-}

@@ -65,3 +65,14 @@ export function sanitizeLocalSegment(name: string): string {
 export function normalizeForMatch(value: string): string {
   return value.normalize("NFC").trim();
 }
+
+/** Shared comparison key between a remote drive title and a local file-name
+ *  segment. Feishu titles may carry characters that the filesystem forbids
+ *  (`/`, `:`, control bytes, ...); those are replaced by `sanitizeLocalSegment`
+ *  when the name is turned into a file, so any title↔file-name pairing must
+ *  run both sides through the same sanitize-then-normalize key or a title like
+ *  "a/b" (stored locally as "a-b") never matches. Idempotent on already-safe
+ *  names, so it is a no-op for well-formed local basenames. */
+export function titleToLocalSegmentKey(name: string): string {
+  return normalizeForMatch(sanitizeLocalSegment(name));
+}

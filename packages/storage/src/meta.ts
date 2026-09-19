@@ -20,6 +20,12 @@ const SETTINGS_FILE = 'settings.json';
 export class JsonMetaStorage implements MetaStorage {
   private readonly metaDirs: Map<string, string> = new Map();
   private readonly globalConfigDir: string;
+  /** Read-through cache of each root's parsed `bindings.json`. A sync round
+   *  reads the full binding set many times per entry (link maps, asset prep,
+   *  per-entry probes), which was O(N²) whole-file reads on a 500-doc root. The
+   *  cache is dropped on every binding write, so it is always coherent with disk
+   *  and never surfaces a stale view within or across processes. */
+  private readonly bindingsCache = new Map<string, Record<string, EntryBinding>>();
 
   constructor(globalConfigPath?: string) {
     this.globalConfigDir = globalConfigPath ?? path.join(
@@ -86,6 +92,7 @@ export class JsonMetaStorage implements MetaStorage {
   async initRootMeta(rootId: string, localPath: string): Promise<void> {
     const metaDir = path.join(localPath, '.feishu-sync');
     this.metaDirs.set(rootId, metaDir);
+    this.bindingsCache.delete(rootId);
 
     await fsp.mkdir(metaDir, { recursive: true });
     await fsp.mkdir(path.join(metaDir, 'blocks'), { recursive: true });
@@ -117,6 +124,7 @@ export class JsonMetaStorage implements MetaStorage {
         // Directory may not exist
       }
       this.metaDirs.delete(rootId);
+      this.bindingsCache.delete(rootId);
     }
   }
 
@@ -125,27 +133,37 @@ export class JsonMetaStorage implements MetaStorage {
   // ============================================================================
 
   async getBinding(rootId: string, relativePath: string): Promise<EntryBinding | undefined> {
-    const bindings = await this.readJson<Record<string, EntryBinding>>(this.getBindingsPath(rootId), {});
+    const bindings = await this.loadBindings(rootId);
     return bindings[relativePath];
   }
 
   async setBinding(rootId: string, relativePath: string, binding: EntryBinding): Promise<void> {
-    const bindingsPath = this.getBindingsPath(rootId);
-    const bindings = await this.readJson<Record<string, EntryBinding>>(bindingsPath, {});
-    bindings[relativePath] = binding;
-    await this.writeJson(bindingsPath, bindings);
+    const current = await this.loadBindings(rootId);
+    const next = { ...current, [relativePath]: binding };
+    await this.writeJson(this.getBindingsPath(rootId), next);
+    this.bindingsCache.delete(rootId);
   }
 
   async deleteBinding(rootId: string, relativePath: string): Promise<void> {
-    const bindingsPath = this.getBindingsPath(rootId);
-    const bindings = await this.readJson<Record<string, EntryBinding>>(bindingsPath, {});
-    delete bindings[relativePath];
-    await this.writeJson(bindingsPath, bindings);
+    const current = await this.loadBindings(rootId);
+    const next = { ...current };
+    delete next[relativePath];
+    await this.writeJson(this.getBindingsPath(rootId), next);
+    this.bindingsCache.delete(rootId);
   }
 
   async listBindings(rootId: string): Promise<EntryBinding[]> {
-    const bindings = await this.readJson<Record<string, EntryBinding>>(this.getBindingsPath(rootId), {});
+    const bindings = await this.loadBindings(rootId);
     return Object.values(bindings);
+  }
+
+  /** Cached read of a root's binding table; repopulates from disk on miss. */
+  private async loadBindings(rootId: string): Promise<Record<string, EntryBinding>> {
+    const cached = this.bindingsCache.get(rootId);
+    if (cached) return cached;
+    const bindings = await this.readJson<Record<string, EntryBinding>>(this.getBindingsPath(rootId), {});
+    this.bindingsCache.set(rootId, bindings);
+    return bindings;
   }
 
   async findBindingByToken(rootId: string, remoteToken: string): Promise<EntryBinding | undefined> {
@@ -570,6 +588,29 @@ export class JsonMetaStorage implements MetaStorage {
       await this.writeJson(opsPath, kept);
     }
     return removed;
+  }
+
+  /**
+   * Cancel `queued`/`running` operation records for one root at startup. The
+   * runtime's per-root queue is a Promise chain held in memory, so any task that
+   * was mid-flight when the process died can never finish; without this the task
+   * center shows a permanent ghost. Rewrites the ring buffer in place, stamping
+   * a terminal `cancelled` state so the entry self-heals on the next scan.
+   */
+  async recoverStaleOperations(rootId: string): Promise<number> {
+    const metaDir = this.metaDirs.get(rootId);
+    if (!metaDir) return 0;
+    const opsPath = path.join(metaDir, 'operations.json');
+    const ops = await this.readJson<OperationRecord[]>(opsPath, []);
+    const now = new Date().toISOString();
+    let recovered = 0;
+    const patched = ops.map((op) => {
+      if (op.status !== 'queued' && op.status !== 'running') return op;
+      recovered += 1;
+      return { ...op, status: 'cancelled' as const, completedAt: now, error: 'Cancelled: interrupted by service restart' };
+    });
+    if (recovered > 0) await this.writeJson(opsPath, patched);
+    return recovered;
   }
 
   // ============================================================================

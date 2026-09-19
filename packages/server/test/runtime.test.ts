@@ -1068,3 +1068,30 @@ test("single-entry operations re-sync one document without a full root scan", as
     cleanup(scenario);
   }
 });
+
+test("start() cancels operations a previous crash left running or queued", async () => {
+  const scenario = createScenario();
+  try {
+    // An enabled root so start() runs the recovery path for it; the directory
+    // stays empty so the start-root scan has nothing to sync and cannot race
+    // the assertion on the preset records.
+    const root = await scenario.metaStorage.createRoot({ localPath: scenario.directory, remoteToken: "root-token", remoteType: "folder", enabled: true, pollIntervalMs: 60_000 });
+    await scenario.gitStorage.initRoot(root);
+    await scenario.metaStorage.initRootMeta(root.id, root.localPath);
+    // Simulate a mid-flight crash: one record stuck running, one never started.
+    const running = await scenario.metaStorage.addOperation({ rootId: root.id, entryId: "e-running", direction: "push", operation: "sync", trigger: "manual" });
+    await scenario.metaStorage.updateOperation(running.id, { status: "running", startedAt: new Date().toISOString() });
+    const queued = await scenario.metaStorage.addOperation({ rootId: root.id, entryId: "e-queued", direction: "push", operation: "sync", trigger: "manual" });
+
+    await scenario.runtime.start();
+
+    const operations = await scenario.metaStorage.listOperations({ rootId: root.id, limit: 50 });
+    const afterRunning = operations.find((op) => op.id === running.id);
+    const afterQueued = operations.find((op) => op.id === queued.id);
+    assert.equal(afterRunning?.status, "cancelled", "a stale running record is cancelled on restart");
+    assert.equal(afterQueued?.status, "cancelled", "a stale queued record is cancelled on restart");
+    assert.ok(afterRunning?.completedAt, "the cancelled record is stamped with a completion time");
+  } finally {
+    cleanup(scenario);
+  }
+});

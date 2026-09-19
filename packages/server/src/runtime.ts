@@ -2,13 +2,15 @@ import type { WebSocket } from "ws";
 import type { FastifyBaseLogger } from "fastify";
 import { watch, type FSWatcher } from "chokidar";
 import { randomUUID } from "node:crypto";
-import { join, relative, resolve, sep } from "node:path";
+import { relative, resolve, sep } from "node:path";
 import { SyncEngine } from "@feishu-sync/core";
 import { sha256, matchesAnyGlob } from "@feishu-sync/core";
 import { categorizeError, FeishuApiError, RETRIABLE_ERROR_CATEGORIES } from "@feishu-sync/feishu";
 import type { AuthStateStore } from "./appconfig.js";
 import { NoopNotifier, type Notifier, type NotificationEvent } from "./notify.js";
 import { ApiCallStats, instrumentRemote, type ApiStatsSnapshot } from "./apistats.js";
+import { EchoGuard } from "./echo_guard.js";
+import { TaskQueue } from "./task_queue.js";
 import type { Commit, ConflictRecord, EntryBinding, ErrorCategory, FolderBinding, GitStorage, LocalProvider, MetaStorage, OperationRecord, PruneHistoryOptions, PruneHistoryResult, RemoteProvider, SyncDirection, SyncMode, SyncRoot, SyncScope, SyncTrigger } from "@feishu-sync/core";
 
 /** Task-center status filter; "active" groups queued + running operations. */
@@ -73,16 +75,14 @@ export class SyncRuntime {
   private readonly watchers = new Map<string, FSWatcher>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly clients = new Set<WebSocket>();
-  private readonly queues = new Map<string, Promise<void>>();
+  /** Per-root serial lanes; a task failure is logged/broadcast via the handler
+   *  wired in the constructor. */
+  private readonly taskQueue: TaskQueue;
+  /** Guards against the runtime re-syncing its own writes (watcher/drive echo). */
+  private readonly echoGuard = new EchoGuard();
   private readonly engine: SyncEngine;
   private maintenanceTimer?: NodeJS.Timeout;
   private currentTrigger: SyncTrigger = 'manual';
-  /** Echo guards (TTL 5s): local paths we just pulled and remote tokens we just
-   *  pushed, so the watcher / drive-event channel ignores our own writes instead
-   *  of looping them back into another sync round. */
-  private readonly recentLocalWrites = new Map<string, number>();
-  private readonly recentRemotePushes = new Map<string, number>();
-  private static readonly ECHO_TTL_MS = 5_000;
   private readonly backoffMs: number[];
   private readonly sleepImpl: (ms: number) => Promise<void>;
   /** Tally of remote API calls, surfaced as the settings-page 调用统计 (B6.2). */
@@ -115,6 +115,11 @@ export class SyncRuntime {
     this.backoffMs = retryOptions?.backoffMs ?? [1_000, 2_000, 4_000];
     this.sleepImpl = retryOptions?.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.notifier = notifier ?? new NoopNotifier();
+    this.taskQueue = new TaskQueue((id, error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log("error", "queued task failed", { rootId: id, error: message });
+      this.broadcast({ type: "error", rootId: id, error: message });
+    });
   }
 
   /** Remote provider whose calls are tallied; API routes should use this one. */
@@ -148,6 +153,10 @@ export class SyncRuntime {
         // Initialize Git repo and meta storage for this root
         await this.gitStorage.initRoot(root);
         await this.metaStorage.initRootMeta(root.id, root.localPath);
+        // Cancel any task the previous process left mid-flight (in-memory queue
+        // died with it), so the task center never shows a permanent ghost.
+        const recovered = await this.metaStorage.recoverStaleOperations(root.id);
+        if (recovered > 0) this.log("info", `recovered ${recovered} stale operation(s) as cancelled`, { rootId: root.id });
         this.startRoot(root);
       }
     }
@@ -864,62 +873,39 @@ export class SyncRuntime {
     return this.sleepImpl(ms);
   }
 
-  /** Remember a local path we just pulled so the watcher ignores our own write. */
+  /** Remember a local path we just pulled so the watcher ignores our own write
+   *  (delegated to {@link EchoGuard}). */
   private registerLocalWrite(root: SyncRoot, relativePath: string): void {
-    this.pruneEchoMap(this.recentLocalWrites);
-    this.recentLocalWrites.set(join(root.localPath, relativePath), Date.now() + SyncRuntime.ECHO_TTL_MS);
+    this.echoGuard.registerLocalWrite(root, relativePath);
   }
 
-  /** Remember a remote token we just pushed so drive events ignore the echo. */
+  /** Remember a remote token we just pushed so drive events ignore the echo
+   *  (delegated to {@link EchoGuard}). */
   private registerRemotePush(remoteToken: string): void {
-    this.pruneEchoMap(this.recentRemotePushes);
-    this.recentRemotePushes.set(remoteToken, Date.now() + SyncRuntime.ECHO_TTL_MS);
+    this.echoGuard.registerRemotePush(remoteToken);
   }
 
   private isRecentLocalWrite(absolutePath: string): boolean {
-    const expiry = this.recentLocalWrites.get(absolutePath);
-    if (expiry === undefined) return false;
-    if (expiry < Date.now()) { this.recentLocalWrites.delete(absolutePath); return false; }
-    return true;
+    return this.echoGuard.isRecentLocalWrite(absolutePath);
   }
 
   private isRecentRemotePush(remoteToken: string): boolean {
-    const expiry = this.recentRemotePushes.get(remoteToken);
-    if (expiry === undefined) return false;
-    if (expiry < Date.now()) { this.recentRemotePushes.delete(remoteToken); return false; }
-    return true;
+    return this.echoGuard.isRecentRemotePush(remoteToken);
   }
 
-  private pruneEchoMap(map: Map<string, number>): void {
-    const now = Date.now();
-    for (const [key, expiry] of map) if (expiry < now) map.delete(key);
-  }
-
+  /** Fire-and-forget: queue a task on the root's serial lane (delegated to
+   *  {@link TaskQueue}); errors are logged/broadcast, the lane never wedges. */
   private enqueue(id: string, callback: () => Promise<unknown>): Promise<void> {
-    const previous = this.queues.get(id) ?? Promise.resolve();
-    const next = previous.then(() => callback()).then(() => undefined).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      this.log("error", "queued task failed", { rootId: id, error: message });
-      this.broadcast({ type: "error", rootId: id, error: message });
-    });
-    this.queues.set(id, next);
-    return next;
+    return this.taskQueue.enqueue(id, callback);
   }
 
   /** Run a task serialized with the root's queue and return its result.
    *  Watcher/poll tasks use enqueue() (fire-and-forget, errors broadcast);
    *  API routes use this so the caller receives the result or the thrown error.
    *  The shared queue promise still never rejects, preserving fire-and-forget
-   *  semantics for any task queued after this one. */
+   *  semantics for any task queued after this one. (Delegated to {@link TaskQueue}.) */
   private enqueueResult<T>(id: string, callback: () => Promise<T>): Promise<T> {
-    const previous = this.queues.get(id) ?? Promise.resolve();
-    const result = previous.then(() => callback());
-    this.queues.set(id, result.then(() => undefined).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      this.log("error", "queued task failed", { rootId: id, error: message });
-      this.broadcast({ type: "error", rootId: id, error: message });
-    }));
-    return result;
+    return this.taskQueue.enqueueResult(id, callback);
   }
 
   private broadcast(event: unknown): void {

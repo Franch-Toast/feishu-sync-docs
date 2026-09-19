@@ -4,7 +4,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp -R public dist/public",
+    "build": "tsc -p tsconfig.json && if [ -d public ]; then rm -rf dist/public && cp -R public dist/public; fi",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "NODE_ENV=test tsx --test test/*.test.ts",
     "dev": "tsx watch src/index.ts",

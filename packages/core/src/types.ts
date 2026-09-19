@@ -421,4 +421,9 @@ export interface MetaStorage {
   /** Delete specific operation records by id, backing the task center's
    *  「忽略」 (dismiss a failed task without touching the entry itself). */
   deleteOperations(ids: string[]): Promise<number>;
+  /** Cancel in-flight work left behind by a crash. The runtime's task queue is
+   *  in-memory, so a `queued`/`running` operation record that survives a restart
+   *  can never complete and would linger as a ghost in the task center. Called
+   *  once per root at startup; returns how many records were cancelled. */
+  recoverStaleOperations(rootId: string): Promise<number>;
 }
